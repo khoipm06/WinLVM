@@ -19,6 +19,8 @@ constexpr std::uint32_t kMappingTableMagic = 0x4C564D4D;  // "LVMM" in little-en
 constexpr std::size_t kMaxVgNameLength = 127;
 constexpr std::size_t kMaxLvNameLength = 127;
 constexpr std::size_t kMaxSegmentCount = 512;  // Reasonable upper limit for segments
+constexpr std::size_t kMaxPvHandleCount = 512;
+constexpr std::size_t kMaxSourcePathLength = 511;
 
 // GUID-like UUID representation (128-bit)
 #pragma pack(push, 1)
@@ -94,6 +96,9 @@ struct MappingSegment {
 // ============================================================================
 struct MappingPvHandle {
   MappingUuid pv_uuid;
+  char source_path[kMaxSourcePathLength + 1];  // Supplied Windows image/device path, NUL-terminated.
+  std::uint64_t source_size_bytes;
+  std::uint64_t pv_base_offset_bytes;
   std::uint64_t pv_size_bytes;
   std::uint32_t logical_sector_size;   // Usually 512 or 4096
   std::uint32_t physical_sector_size;  // Usually 512, 4096, or 8192
@@ -144,7 +149,7 @@ inline bool validate_mapping_table_header(const MappingTableHeader& hdr) {
   return hdr.magic == kMappingTableMagic && hdr.version == kMappingTableVersion &&
          hdr.total_size_bytes > sizeof(MappingTableHeader) &&
          hdr.segment_count > 0 && hdr.segment_count <= kMaxSegmentCount &&
-         hdr.pv_handle_count > 0;
+         hdr.pv_handle_count > 0 && hdr.pv_handle_count <= kMaxPvHandleCount;
 }
 
 }  // namespace winlvm

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <sstream>
+#include <vector>
 #include <windows.h>
 #include <setupapi.h>
 #include <winioctl.h>
@@ -123,6 +124,73 @@ bool is_removable_media(HANDLE disk_handle) {
   return false;
 }
 
+std::string trim_trailing_backslash(std::string value) {
+  if (!value.empty() && value.back() == '\\') {
+    value.pop_back();
+  }
+  return value;
+}
+
+Result<std::vector<std::uint32_t>> query_volume_disk_numbers(const std::string& volume_path) {
+  const std::string open_path = trim_trailing_backslash(volume_path);
+  HANDLE volume = CreateFileA(
+    open_path.c_str(),
+    0,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    nullptr,
+    OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL,
+    nullptr
+  );
+  if (volume == INVALID_HANDLE_VALUE) {
+    return Result<std::vector<std::uint32_t>>::failure("cannot open volume for disk extent query");
+  }
+
+  std::vector<std::uint8_t> buffer(sizeof(VOLUME_DISK_EXTENTS) + 15 * sizeof(DISK_EXTENT), 0);
+  DWORD bytes_returned = 0;
+  const BOOL ok = DeviceIoControl(
+    volume,
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+    nullptr,
+    0,
+    buffer.data(),
+    static_cast<DWORD>(buffer.size()),
+    &bytes_returned,
+    nullptr
+  );
+  const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+  CloseHandle(volume);
+
+  if (!ok) {
+    std::ostringstream message;
+    message << "cannot query volume disk extents, GetLastError=" << error;
+    return Result<std::vector<std::uint32_t>>::failure(message.str());
+  }
+  if (bytes_returned < sizeof(VOLUME_DISK_EXTENTS)) {
+    return Result<std::vector<std::uint32_t>>::failure("volume disk extent query returned a short buffer");
+  }
+
+  const VOLUME_DISK_EXTENTS* extents = reinterpret_cast<const VOLUME_DISK_EXTENTS*>(buffer.data());
+  std::vector<std::uint32_t> disk_numbers;
+  for (DWORD i = 0; i < extents->NumberOfDiskExtents; ++i) {
+    const std::uint32_t disk_number = extents->Extents[i].DiskNumber;
+    if (std::find(disk_numbers.begin(), disk_numbers.end(), disk_number) == disk_numbers.end()) {
+      disk_numbers.push_back(disk_number);
+    }
+  }
+  return Result<std::vector<std::uint32_t>>::success(disk_numbers);
+}
+
+Result<bool> drive_letter_is_on_disk(char drive_letter, std::uint32_t disk_number) {
+  std::string path = "\\\\.\\A:";
+  path[4] = drive_letter;
+  auto disks = query_volume_disk_numbers(path);
+  if (!disks) {
+    return Result<bool>::failure(disks.status.message);
+  }
+  return Result<bool>::success(std::find(disks.value.begin(), disks.value.end(), disk_number) != disks.value.end());
+}
+
 }  // namespace
 
 // ============================================================================
@@ -148,9 +216,12 @@ Result<std::vector<WindowsPhysicalDisk>> enumerate_physical_disks() {
     disk.total_size_bytes = get_disk_size(disk_handle);
     disk.removable = is_removable_media(disk_handle);
 
-    // TODO: Set is_system_disk and is_boot_disk via registry/WMI checks
-    disk.is_system_disk = false;
-    disk.is_boot_disk = false;
+    auto system_disk = is_system_disk(disk_num);
+    auto boot_disk = is_boot_disk(disk_num);
+    auto mounted_volumes = disk_has_mounted_volumes(disk_num);
+    disk.is_system_disk = !system_disk || system_disk.value;
+    disk.is_boot_disk = !boot_disk || boot_disk.value;
+    disk.has_mounted_volumes = !mounted_volumes || mounted_volumes.value;
 
     if (disk.total_size_bytes > 0) {
       disks.push_back(disk);
@@ -285,25 +356,86 @@ Result<std::vector<WindowsPhysicalPartition>> enumerate_partitions(
 }
 
 Result<bool> is_system_disk(std::uint32_t disk_number) {
-  (void)disk_number;
-  // TODO: Check via registry (HKLM\SYSTEM\CurrentControlSet\Services\disk)
-  // or via WMI (Win32_DiskDrive.Index matching Windows system disk)
-  // For now, return false (safe default)
-  return Result<bool>::success(false);
+  std::array<char, MAX_PATH> system_dir{};
+  const UINT length = GetSystemDirectoryA(system_dir.data(), static_cast<UINT>(system_dir.size()));
+  if (length == 0 || length >= system_dir.size() || system_dir[1] != ':') {
+    return Result<bool>::failure("cannot determine Windows system drive");
+  }
+  return drive_letter_is_on_disk(system_dir[0], disk_number);
 }
 
 Result<bool> is_boot_disk(std::uint32_t disk_number) {
-  (void)disk_number;
-  // TODO: Check via GetDriveLayout and compare with boot loader location
-  // For now, return false (safe default)
-  return Result<bool>::success(false);
+  std::array<char, MAX_PATH> windows_dir{};
+  const UINT length = GetWindowsDirectoryA(windows_dir.data(), static_cast<UINT>(windows_dir.size()));
+  if (length == 0 || length >= windows_dir.size() || windows_dir[1] != ':') {
+    return Result<bool>::failure("cannot determine Windows boot drive");
+  }
+  return drive_letter_is_on_disk(windows_dir[0], disk_number);
 }
 
 Result<bool> disk_has_mounted_volumes(std::uint32_t disk_number) {
-  (void)disk_number;
-  // TODO: Enumerate mount points and check if any belong to this disk
-  // For now, return false (conservative, won't activate mounted disks)
+  std::array<char, MAX_PATH> volume_name{};
+  HANDLE find = FindFirstVolumeA(volume_name.data(), static_cast<DWORD>(volume_name.size()));
+  if (find == INVALID_HANDLE_VALUE) {
+    return Result<bool>::failure("cannot enumerate mounted volumes");
+  }
+
+  bool found_mounted_volume = false;
+  while (true) {
+    DWORD path_chars = 0;
+    GetVolumePathNamesForVolumeNameA(volume_name.data(), nullptr, 0, &path_chars);
+    if (path_chars > 1) {
+      std::vector<char> paths(path_chars, '\0');
+      if (GetVolumePathNamesForVolumeNameA(volume_name.data(), paths.data(), path_chars, &path_chars) &&
+          paths[0] != '\0') {
+        auto disks = query_volume_disk_numbers(volume_name.data());
+        if (disks) {
+          if (std::find(disks.value.begin(), disks.value.end(), disk_number) != disks.value.end()) {
+            found_mounted_volume = true;
+            break;
+          }
+        } else {
+          FindVolumeClose(find);
+          return Result<bool>::failure(disks.status.message);
+        }
+      }
+    }
+
+    if (!FindNextVolumeA(find, volume_name.data(), static_cast<DWORD>(volume_name.size()))) {
+      const DWORD error = GetLastError();
+      FindVolumeClose(find);
+      if (error == ERROR_NO_MORE_FILES) {
+        return Result<bool>::success(found_mounted_volume);
+      }
+      std::ostringstream message;
+      message << "cannot enumerate next mounted volume, GetLastError=" << error;
+      return Result<bool>::failure(message.str());
+    }
+  }
+
+  FindVolumeClose(find);
+  if (found_mounted_volume) {
+    return Result<bool>::success(true);
+  }
   return Result<bool>::success(false);
+}
+
+std::vector<std::string> implicit_scan_skip_reasons(const WindowsPhysicalDisk& disk) {
+  std::vector<std::string> reasons;
+  if (disk.is_system_disk) {
+    reasons.push_back("system disk");
+  }
+  if (disk.is_boot_disk) {
+    reasons.push_back("boot disk");
+  }
+  if (disk.has_mounted_volumes) {
+    reasons.push_back("mounted Windows volume");
+  }
+  return reasons;
+}
+
+bool is_safe_for_implicit_scan(const WindowsPhysicalDisk& disk) {
+  return implicit_scan_skip_reasons(disk).empty();
 }
 
 }  // namespace winlvm

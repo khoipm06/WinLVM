@@ -1,11 +1,13 @@
 #include "winlvm/activation.h"
 #include "winlvm/activation_policy.h"
+#include "winlvm/driver_client.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <span>
 #include <sstream>
 
 namespace winlvm {
@@ -13,29 +15,25 @@ namespace winlvm {
 namespace {
 
 // ============================================================================
-// Helper: Convert UUID string (hyphenated or compact) to MappingUuid
+// Helper: Convert LVM UUID text to a deterministic 128-bit driver token.
+//
+// LVM UUIDs are not Windows GUID text and may contain non-hex characters. The
+// driver only needs stable equality tokens inside one validated mapping table,
+// so hash the original text instead of dropping characters or padding.
 // ============================================================================
 MappingUuid string_to_mapping_uuid(const std::string& uuid_str) {
   MappingUuid mu{};
-  std::string normalized;
-  // Remove hyphens
-  for (char c : uuid_str) {
-    if (std::isxdigit(c)) {
-      normalized += static_cast<char>(std::tolower(c));
-    }
+  std::uint64_t first = 14695981039346656037ULL;
+  std::uint64_t second = 1099511628211ULL;
+  for (unsigned char c : uuid_str) {
+    first ^= c;
+    first *= 1099511628211ULL;
+    second ^= static_cast<unsigned char>(c + 0x9dU);
+    second *= 14029467366897019727ULL;
   }
-
-  // Pad or truncate to 32 chars (16 bytes)
-  if (normalized.size() < 32) {
-    normalized.append(32 - normalized.size(), '0');
-  } else if (normalized.size() > 32) {
-    normalized = normalized.substr(0, 32);
-  }
-
-  // Parse hex bytes
-  for (std::size_t i = 0; i < 16; ++i) {
-    std::string byte_str = normalized.substr(i * 2, 2);
-    mu.bytes[i] = static_cast<std::uint8_t>(std::stoul(byte_str, nullptr, 16));
+  for (std::size_t i = 0; i < 8; ++i) {
+    mu.bytes[i] = static_cast<std::uint8_t>((first >> (i * 8U)) & 0xffU);
+    mu.bytes[i + 8] = static_cast<std::uint8_t>((second >> (i * 8U)) & 0xffU);
   }
   return mu;
 }
@@ -222,7 +220,17 @@ class ActivationManagerImpl : public ActivationManager {
     MappingPvHandle* pv_array = reinterpret_cast<MappingPvHandle*>(abibuf.data() + hdr->pv_handles_offset);
     for (std::size_t i = 0; i < pv_count; ++i) {
       const auto& pv = mapped_pvs[i];
+      if (pv.source_path.empty() || pv.source_path.size() > kMaxSourcePathLength) {
+        return Result<ActivationResponse>::failure("Physical Volume source path is missing or too long for mapping table ABI");
+      }
+      if (pv.source_size_bytes == 0 || pv.device_size_bytes == 0) {
+        return Result<ActivationResponse>::failure("Physical Volume source size is invalid for mapping table ABI");
+      }
       pv_array[i].pv_uuid = string_to_mapping_uuid(pv.uuid);
+      std::memcpy(pv_array[i].source_path, pv.source_path.data(),
+                  pv.source_path.size());
+      pv_array[i].source_size_bytes = pv.source_size_bytes;
+      pv_array[i].pv_base_offset_bytes = pv.pv_base_offset_bytes;
       pv_array[i].pv_size_bytes = pv.device_size_bytes;
       pv_array[i].logical_sector_size = 512;
       pv_array[i].physical_sector_size = 4096;
@@ -331,14 +339,41 @@ class ActivationManagerImpl : public ActivationManager {
   std::uint64_t simulated_driver_activate(const std::vector<std::uint8_t>& abibuf) {
     const MappingTableHeader* hdr = reinterpret_cast<const MappingTableHeader*>(abibuf.data());
 
+#ifdef _WIN32
+    auto client = DriverClient::open_default();
+    if (client) {
+      auto mapping = client.value.create_mapping(
+          std::span<const std::uint8_t>(abibuf.data(), abibuf.size()));
+      if (!mapping) {
+        std::cerr << "  [winlvm] Real driver activation failed: "
+                  << mapping.status.message << "\n";
+        return 0;
+      }
+      std::cout << "  [winlvm] Real driver activation succeeded. mappingId="
+                << mapping.value << "\n";
+      return mapping.value;
+    }
+#endif
+
     // Simulate Windows IOCTL Device Creation.
     // During production driver development, this writes to `\\.\lvmdm` control device.
     // Here we generate a unique handle from magic and size
-    std::uint64_t handle = 0xABCD0000ULL + abibuf.size() + hdr->lv_size_bytes;
+    std::uint64_t handle = 0xABCD000000000000ULL + abibuf.size() + hdr->lv_size_bytes;
     return handle;
   }
 
   bool simulated_driver_deactivate(std::uint64_t handle) {
+#ifdef _WIN32
+    // If this is a real driver handle, deactivate it via IOCTL
+    if ((handle & 0xFFFF000000000000ULL) != 0xABCD000000000000ULL) {
+      auto client = DriverClient::open_default();
+      if (client) {
+        return client.value.delete_mapping(handle).ok;
+      }
+      return false;
+    }
+#endif
+
     // In production, transmits IOCTL_LVMDM_REMOVE_DEVICE to physical driver.
     return (handle != 0);
   }

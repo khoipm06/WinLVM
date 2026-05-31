@@ -22,6 +22,7 @@ struct WindowsPhysicalDisk {
   bool removable;                     // Is removable/USB
   bool is_system_disk;                // Windows system disk
   bool is_boot_disk;                  // Boot disk
+  bool has_mounted_volumes;           // Any mounted Windows volumes on disk
 };
 
 struct WindowsPhysicalPartition {
@@ -53,6 +54,10 @@ Result<bool> is_system_disk(std::uint32_t disk_number);
 Result<bool> is_boot_disk(std::uint32_t disk_number);
 
 Result<bool> disk_has_mounted_volumes(std::uint32_t disk_number);
+
+std::vector<std::string> implicit_scan_skip_reasons(const WindowsPhysicalDisk& disk);
+
+bool is_safe_for_implicit_scan(const WindowsPhysicalDisk& disk);
 
 #endif  // _WIN32
 
