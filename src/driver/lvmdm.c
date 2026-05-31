@@ -23,16 +23,16 @@ typedef struct _LVMDM_DEVICE_EXTENSION {
   UNICODE_STRING SymbolicLink;
   KSPIN_LOCK MappingLock;
   LIST_ENTRY MappingList;
-  ULONG NextMappingId;
+  ULONGLONG NextMappingId;
 } LVMDM_DEVICE_EXTENSION, *PLVMDM_DEVICE_EXTENSION;
 
 typedef struct _LVMDM_MAPPING_ENTRY {
   LIST_ENTRY ListEntry;
-  ULONG MappingId;
+  ULONGLONG MappingId;
   PVOID MappingTableBuffer;
   SIZE_T MappingTableSize;
   PDEVICE_OBJECT VirtualDiskDevice;
-  ULONG IoCount;
+  ULONGLONG IoCount;
 } LVMDM_MAPPING_ENTRY, *PLVMDM_MAPPING_ENTRY;
 
 // ============================================================================
@@ -53,12 +53,27 @@ NTSTATUS LvmdmCreateMapping(
   PLVMDM_DEVICE_EXTENSION DeviceExtension,
   PVOID InputBuffer,
   ULONG InputBufferLength,
-  PULONG MappingId
+  PULONGLONG MappingId
 );
 
 NTSTATUS LvmdmDeleteMapping(
   PLVMDM_DEVICE_EXTENSION DeviceExtension,
-  ULONG MappingId
+  ULONGLONG MappingId
+);
+
+NTSTATUS LvmdmQueryMapping(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  ULONGLONG MappingId,
+  PLVMDM_QUERY_MAPPING_OUTPUT OutputBuffer,
+  ULONG OutputBufferLength,
+  PULONG Information
+);
+
+NTSTATUS LvmdmListMappings(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  PVOID OutputBuffer,
+  ULONG OutputBufferLength,
+  PULONG Information
 );
 
 // ============================================================================
@@ -145,7 +160,14 @@ VOID LvmdmUnload(_In_ PDRIVER_OBJECT DriverObject) {
     // Clean up symbolic link
     IoDeleteSymbolicLink(&deviceExtension->SymbolicLink);
 
-    // TODO: Clean up all active mappings
+    while (!IsListEmpty(&deviceExtension->MappingList)) {
+      PLIST_ENTRY entry = RemoveHeadList(&deviceExtension->MappingList);
+      PLVMDM_MAPPING_ENTRY mapping = CONTAINING_RECORD(entry, LVMDM_MAPPING_ENTRY, ListEntry);
+      if (mapping->MappingTableBuffer) {
+        ExFreePoolWithTag(mapping->MappingTableBuffer, 'mLvL');
+      }
+      ExFreePoolWithTag(mapping, 'mLvL');
+    }
 
     // Delete device
     IoDeleteDevice(deviceObject);
@@ -198,16 +220,18 @@ NTSTATUS LvmdmDeviceControl(
 
   switch (ioControlCode) {
     case IOCTL_LVMDM_CREATE_MAPPING: {
-      ULONG mappingId = 0;
+      ULONGLONG mappingId = 0;
       status = LvmdmCreateMapping(
         deviceExtension,
         inputBuffer,
         inputBufferLength,
         &mappingId
       );
-      if (NT_SUCCESS(status) && outputBufferLength >= sizeof(ULONG)) {
-        *(PULONG)outputBuffer = mappingId;
-        information = sizeof(ULONG);
+      if (NT_SUCCESS(status) && outputBufferLength >= sizeof(ULONGLONG)) {
+        *(PULONGLONG)outputBuffer = mappingId;
+        information = sizeof(ULONGLONG);
+      } else if (NT_SUCCESS(status)) {
+        status = STATUS_BUFFER_TOO_SMALL;
       }
       break;
     }
@@ -215,10 +239,37 @@ NTSTATUS LvmdmDeviceControl(
     case IOCTL_LVMDM_DELETE_MAPPING: {
       if (inputBufferLength >= sizeof(LVMDM_DELETE_MAPPING_INPUT)) {
         PLVMDM_DELETE_MAPPING_INPUT input = (PLVMDM_DELETE_MAPPING_INPUT)inputBuffer;
-        status = LvmdmDeleteMapping(deviceExtension, (ULONG)input->mapping_id);
+        status = LvmdmDeleteMapping(deviceExtension, input->mapping_id);
       } else {
         status = STATUS_BUFFER_TOO_SMALL;
       }
+      break;
+    }
+
+    case IOCTL_LVMDM_QUERY_MAPPING: {
+      if (inputBufferLength >= sizeof(LVMDM_QUERY_MAPPING_INPUT) &&
+          outputBufferLength >= sizeof(LVMDM_QUERY_MAPPING_OUTPUT)) {
+        PLVMDM_QUERY_MAPPING_INPUT input = (PLVMDM_QUERY_MAPPING_INPUT)inputBuffer;
+        status = LvmdmQueryMapping(
+          deviceExtension,
+          input->mapping_id,
+          (PLVMDM_QUERY_MAPPING_OUTPUT)outputBuffer,
+          outputBufferLength,
+          &information
+        );
+      } else {
+        status = STATUS_BUFFER_TOO_SMALL;
+      }
+      break;
+    }
+
+    case IOCTL_LVMDM_LIST_MAPPINGS: {
+      status = LvmdmListMappings(
+        deviceExtension,
+        outputBuffer,
+        outputBufferLength,
+        &information
+      );
       break;
     }
 
@@ -234,38 +285,314 @@ NTSTATUS LvmdmDeviceControl(
 }
 
 // ============================================================================
-// Mapping Management (Stubs)
+// Mapping Management
 // ============================================================================
+
+BOOLEAN LvmdmAddOverflows(ULONGLONG a, ULONGLONG b) {
+  return b > (MAXULONGLONG - a);
+}
+
+BOOLEAN LvmdmRangeFits(ULONGLONG offset, ULONGLONG length, ULONGLONG limit) {
+  if (LvmdmAddOverflows(offset, length)) {
+    return FALSE;
+  }
+  return offset + length <= limit;
+}
+
+BOOLEAN LvmdmUuidEquals(
+  const LVMDM_MAPPING_UUID* Left,
+  const LVMDM_MAPPING_UUID* Right
+) {
+  return RtlCompareMemory(Left->bytes, Right->bytes, sizeof(Left->bytes)) == sizeof(Left->bytes);
+}
+
+const LVMDM_MAPPING_PV_HANDLE* LvmdmFindPvHandle(
+  const LVMDM_MAPPING_PV_HANDLE* PvHandles,
+  ULONG PvHandleCount,
+  const LVMDM_MAPPING_UUID* PvUuid
+) {
+  ULONG i;
+  for (i = 0; i < PvHandleCount; ++i) {
+    if (LvmdmUuidEquals(&PvHandles[i].pv_uuid, PvUuid)) {
+      return &PvHandles[i];
+    }
+  }
+  return NULL;
+}
+
+NTSTATUS LvmdmValidateMappingTable(
+  PVOID InputBuffer,
+  ULONG InputBufferLength
+) {
+  const LVMDM_MAPPING_TABLE_HEADER* header;
+  const LVMDM_MAPPING_SEGMENT* segments;
+  const LVMDM_MAPPING_PV_HANDLE* pvHandles;
+  ULONGLONG segmentsSize;
+  ULONGLONG pvHandlesSize;
+  ULONGLONG segmentsEnd;
+  ULONGLONG pvHandlesEnd;
+  ULONGLONG expectedLvOffset = 0;
+  ULONG i;
+
+  if (!InputBuffer || InputBufferLength < sizeof(LVMDM_MAPPING_TABLE_HEADER)) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  header = (const LVMDM_MAPPING_TABLE_HEADER*)InputBuffer;
+  if (header->magic != LVMDM_MAPPING_TABLE_MAGIC ||
+      header->version != LVMDM_MAPPING_TABLE_VERSION) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (header->total_size_bytes != InputBufferLength ||
+      header->total_size_bytes < sizeof(LVMDM_MAPPING_TABLE_HEADER)) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  if (header->segment_count == 0 ||
+      header->segment_count > LVMDM_MAX_SEGMENT_COUNT ||
+      header->pv_handle_count == 0 ||
+      header->pv_handle_count > LVMDM_MAX_PV_HANDLE_COUNT ||
+      header->lv_size_bytes == 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if ((header->flags & ~(LVMDM_MAPPING_FLAG_READONLY |
+                         LVMDM_MAPPING_FLAG_FORCE |
+                         LVMDM_MAPPING_FLAG_SHARED)) != 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (header->exposed_logical_sector_size == 0 ||
+      header->exposed_physical_sector_size == 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (header->vg_name[LVMDM_MAX_VG_NAME_LENGTH] != '\0' ||
+      header->lv_name[LVMDM_MAX_LV_NAME_LENGTH] != '\0') {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  segmentsSize = (ULONGLONG)header->segment_count * sizeof(LVMDM_MAPPING_SEGMENT);
+  pvHandlesSize = (ULONGLONG)header->pv_handle_count * sizeof(LVMDM_MAPPING_PV_HANDLE);
+  if (LvmdmAddOverflows(header->segments_offset, segmentsSize) ||
+      LvmdmAddOverflows(header->pv_handles_offset, pvHandlesSize)) {
+    return STATUS_INTEGER_OVERFLOW;
+  }
+  segmentsEnd = header->segments_offset + segmentsSize;
+  pvHandlesEnd = header->pv_handles_offset + pvHandlesSize;
+  if (header->segments_offset < sizeof(LVMDM_MAPPING_TABLE_HEADER) ||
+      header->pv_handles_offset < sizeof(LVMDM_MAPPING_TABLE_HEADER) ||
+      segmentsEnd > header->total_size_bytes ||
+      pvHandlesEnd > header->total_size_bytes) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  if (header->segments_offset != sizeof(LVMDM_MAPPING_TABLE_HEADER) ||
+      header->pv_handles_offset != segmentsEnd) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  segments = (const LVMDM_MAPPING_SEGMENT*)((const UCHAR*)InputBuffer + header->segments_offset);
+  pvHandles = (const LVMDM_MAPPING_PV_HANDLE*)((const UCHAR*)InputBuffer + header->pv_handles_offset);
+
+  for (i = 0; i < header->pv_handle_count; ++i) {
+    if (pvHandles[i].source_path[0] == '\0' ||
+        pvHandles[i].source_path[LVMDM_MAX_SOURCE_PATH_LENGTH] != '\0' ||
+        pvHandles[i].source_size_bytes == 0 ||
+        pvHandles[i].pv_size_bytes == 0 ||
+        pvHandles[i].logical_sector_size == 0 ||
+        pvHandles[i].physical_sector_size == 0) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    if (!LvmdmRangeFits(
+          pvHandles[i].pv_base_offset_bytes,
+          pvHandles[i].pv_size_bytes,
+          pvHandles[i].source_size_bytes)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+  }
+
+  for (i = 0; i < header->segment_count; ++i) {
+    const LVMDM_MAPPING_SEGMENT* segment = &segments[i];
+    const LVMDM_MAPPING_LINEAR_SEGMENT* linear = &segment->data.linear;
+    const LVMDM_MAPPING_PV_HANDLE* pv;
+
+    if (segment->type != LvmdmSegmentLinear) {
+      return STATUS_NOT_SUPPORTED;
+    }
+    if (linear->length_bytes == 0 ||
+        linear->lv_start_bytes != expectedLvOffset ||
+        !LvmdmRangeFits(linear->lv_start_bytes, linear->length_bytes, header->lv_size_bytes) ||
+        LvmdmAddOverflows(linear->pv_start_bytes, linear->length_bytes)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    pv = LvmdmFindPvHandle(pvHandles, header->pv_handle_count, &linear->pv_uuid);
+    if (!pv || !LvmdmRangeFits(linear->pv_start_bytes, linear->length_bytes, pv->pv_size_bytes)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    expectedLvOffset += linear->length_bytes;
+  }
+
+  if (expectedLvOffset != header->lv_size_bytes) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  return STATUS_SUCCESS;
+}
+
+PLVMDM_MAPPING_ENTRY LvmdmFindMappingLocked(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  ULONGLONG MappingId
+) {
+  PLIST_ENTRY current;
+  for (current = DeviceExtension->MappingList.Flink;
+       current != &DeviceExtension->MappingList;
+       current = current->Flink) {
+    PLVMDM_MAPPING_ENTRY mapping = CONTAINING_RECORD(current, LVMDM_MAPPING_ENTRY, ListEntry);
+    if (mapping->MappingId == MappingId) {
+      return mapping;
+    }
+  }
+  return NULL;
+}
 
 NTSTATUS LvmdmCreateMapping(
   PLVMDM_DEVICE_EXTENSION DeviceExtension,
   PVOID InputBuffer,
   ULONG InputBufferLength,
-  PULONG MappingId
+  PULONGLONG MappingId
 ) {
-  // TODO: Validate mapping table
+  NTSTATUS status;
+  PLVMDM_MAPPING_ENTRY entry;
+  PVOID tableCopy;
+  KIRQL oldIrql;
+
+  if (!MappingId) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  status = LvmdmValidateMappingTable(InputBuffer, InputBufferLength);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+
   // TODO: Create virtual disk device
-  // TODO: Register mapping entry
+  entry = (PLVMDM_MAPPING_ENTRY)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(LVMDM_MAPPING_ENTRY), 'mLvL');
+  if (!entry) {
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
+  RtlZeroMemory(entry, sizeof(*entry));
 
-  UNREFERENCED_PARAMETER(InputBuffer);
-  UNREFERENCED_PARAMETER(InputBufferLength);
+  tableCopy = ExAllocatePool2(POOL_FLAG_NON_PAGED, InputBufferLength, 'mLvL');
+  if (!tableCopy) {
+    ExFreePoolWithTag(entry, 'mLvL');
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
+  RtlCopyMemory(tableCopy, InputBuffer, InputBufferLength);
 
-  *MappingId = DeviceExtension->NextMappingId++;
+  KeAcquireSpinLock(&DeviceExtension->MappingLock, &oldIrql);
+  entry->MappingId = DeviceExtension->NextMappingId++;
+  entry->MappingTableBuffer = tableCopy;
+  entry->MappingTableSize = InputBufferLength;
+  InsertTailList(&DeviceExtension->MappingList, &entry->ListEntry);
+  *MappingId = entry->MappingId;
+  KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
 
-  KdPrint(("LVMDM: Created mapping ID %lu (STUB)\n", *MappingId));
+  KdPrint(("LVMDM: Created mapping ID %I64u\n", *MappingId));
   return STATUS_SUCCESS;
 }
 
 NTSTATUS LvmdmDeleteMapping(
   PLVMDM_DEVICE_EXTENSION DeviceExtension,
-  ULONG MappingId
+  ULONGLONG MappingId
 ) {
-  // TODO: Find mapping entry
+  PLVMDM_MAPPING_ENTRY mapping;
+  KIRQL oldIrql;
+
   // TODO: Delete virtual disk device
-  // TODO: Free resources
+  KeAcquireSpinLock(&DeviceExtension->MappingLock, &oldIrql);
+  mapping = LvmdmFindMappingLocked(DeviceExtension, MappingId);
+  if (!mapping) {
+    KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+    return STATUS_NOT_FOUND;
+  }
+  RemoveEntryList(&mapping->ListEntry);
+  KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
 
-  UNREFERENCED_PARAMETER(DeviceExtension);
+  if (mapping->MappingTableBuffer) {
+    ExFreePoolWithTag(mapping->MappingTableBuffer, 'mLvL');
+  }
+  ExFreePoolWithTag(mapping, 'mLvL');
 
-  KdPrint(("LVMDM: Deleted mapping ID %lu (STUB)\n", MappingId));
+  KdPrint(("LVMDM: Deleted mapping ID %I64u\n", MappingId));
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS LvmdmQueryMapping(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  ULONGLONG MappingId,
+  PLVMDM_QUERY_MAPPING_OUTPUT OutputBuffer,
+  ULONG OutputBufferLength,
+  PULONG Information
+) {
+  PLVMDM_MAPPING_ENTRY mapping;
+  KIRQL oldIrql;
+
+  if (!OutputBuffer || OutputBufferLength < sizeof(LVMDM_QUERY_MAPPING_OUTPUT) || !Information) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  KeAcquireSpinLock(&DeviceExtension->MappingLock, &oldIrql);
+  mapping = LvmdmFindMappingLocked(DeviceExtension, MappingId);
+  if (!mapping) {
+    KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+    return STATUS_NOT_FOUND;
+  }
+  RtlZeroMemory(OutputBuffer, sizeof(*OutputBuffer));
+  OutputBuffer->mapping_id = mapping->MappingId;
+  OutputBuffer->status = 0;
+  OutputBuffer->io_count = mapping->IoCount;
+  OutputBuffer->mapping_table_size = mapping->MappingTableSize;
+  KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+
+  *Information = sizeof(LVMDM_QUERY_MAPPING_OUTPUT);
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS LvmdmListMappings(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  PVOID OutputBuffer,
+  ULONG OutputBufferLength,
+  PULONG Information
+) {
+  PLVMDM_LIST_MAPPINGS_OUTPUT output;
+  PLIST_ENTRY current;
+  ULONG count = 0;
+  ULONG capacity;
+  ULONGLONG* ids;
+  KIRQL oldIrql;
+
+  if (!OutputBuffer || OutputBufferLength < sizeof(LVMDM_LIST_MAPPINGS_OUTPUT) || !Information) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  RtlZeroMemory(OutputBuffer, OutputBufferLength);
+  output = (PLVMDM_LIST_MAPPINGS_OUTPUT)OutputBuffer;
+  capacity = (OutputBufferLength - sizeof(LVMDM_LIST_MAPPINGS_OUTPUT)) / sizeof(ULONGLONG);
+  ids = (ULONGLONG*)((UCHAR*)OutputBuffer + sizeof(LVMDM_LIST_MAPPINGS_OUTPUT));
+
+  KeAcquireSpinLock(&DeviceExtension->MappingLock, &oldIrql);
+  for (current = DeviceExtension->MappingList.Flink;
+       current != &DeviceExtension->MappingList;
+       current = current->Flink) {
+    PLVMDM_MAPPING_ENTRY mapping = CONTAINING_RECORD(current, LVMDM_MAPPING_ENTRY, ListEntry);
+    if (count < capacity) {
+      ids[count] = mapping->MappingId;
+    }
+    ++count;
+  }
+  KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+
+  output->count = count;
+  if (count > capacity) {
+    *Information = sizeof(LVMDM_LIST_MAPPINGS_OUTPUT) + (capacity * sizeof(ULONGLONG));
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  *Information = sizeof(LVMDM_LIST_MAPPINGS_OUTPUT) + (count * sizeof(ULONGLONG));
   return STATUS_SUCCESS;
 }
