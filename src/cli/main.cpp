@@ -8,6 +8,7 @@
 
 #include "winlvm/activation.h"
 #include "winlvm/device_enum.h"
+#include "winlvm/driver_client.h"
 #include "winlvm/exporter.h"
 #include "winlvm/hash.h"
 #include "winlvm/json.h"
@@ -32,6 +33,8 @@ struct CliOptions {
   bool deactivate = false;  // lvchange -an flag
   bool force = false;  // Force flag
   std::string lv_target;  // lvchange target: vg/lv
+  std::uint64_t driver_mapping_id = 0;
+  bool has_driver_mapping_id = false;
 };
 
 std::string lower(std::string value) {
@@ -56,7 +59,8 @@ bool is_known_command(const std::string& command) {
   static const std::vector<std::string> commands = {
       "pvs",       "vgs",       "lvs",       "pvscan",  "vgscan", "lvscan", "pvdisplay",
       "vgdisplay", "lvdisplay", "lvchange",  "vgchange", "lvcreate", "lvremove", "lvresize",
-      "vgextend", "vgreduce", "pvcreate", "pvremove", "version", "dump", "export", "hash", "verify"};
+      "vgextend", "vgreduce", "pvcreate", "pvremove", "version", "dump", "export", "hash", "verify",
+      "driver-status", "driver-delete"};
   return std::find(commands.begin(), commands.end(), command) != commands.end();
 }
 
@@ -170,6 +174,9 @@ CliOptions parse_args(int argc, char** argv) {
       } else if ((options.command == "lvchange" || is_mutating_command(options.command)) && options.lv_target.empty() &&
                  arg.rfind("-", 0) != 0) {
         options.lv_target = arg;
+      } else if (options.command == "driver-delete" && !options.has_driver_mapping_id && arg.rfind("-", 0) != 0) {
+        options.driver_mapping_id = parse_u64(arg, "driver-delete mapping id");
+        options.has_driver_mapping_id = true;
       } else {
         throw std::runtime_error("unsupported argument: " + arg);
       }
@@ -209,6 +216,16 @@ void print_help(const std::string& command) {
     std::cout << "       Note: Activation service (lvmd) must be running.\n";
     return;
   }
+  if (command == "driver-status") {
+    std::cout << "Usage: lvm driver-status\n";
+    std::cout << "       lists active lvmdm control-device mappings and queries each mapping.\n";
+    return;
+  }
+  if (command == "driver-delete") {
+    std::cout << "Usage: lvm driver-delete <mapping-id>\n";
+    std::cout << "       diagnostic cleanup for loaded-driver CREATE/LIST/QUERY/DELETE smoke tests.\n";
+    return;
+  }
   std::cout << "Usage: " << command << " (--image <path> | --device <path>) [--reportformat json]\n";
   std::cout << "       lvm export <vg/lv> (--image <path> | --device <path>) --output <path> --readonly\n";
   std::cout << "                  [--offset <bytes>] [--length <bytes>]\n";
@@ -244,13 +261,23 @@ int run_scan(const CliOptions& options, winlvm::ScanResult& result) {
     auto disks = winlvm::enumerate_physical_disks();
     if (disks) {
       for (const auto& disk : disks.value) {
-        // Skip system/boot disks for safety
-        if (disk.is_system_disk || disk.is_boot_disk) {
+        const auto skip_reasons = winlvm::implicit_scan_skip_reasons(disk);
+        if (!skip_reasons.empty()) {
+          std::cerr << "warning: skipping PhysicalDrive" << disk.disk_number << " during implicit scan: ";
+          for (std::size_t reason_index = 0; reason_index < skip_reasons.size(); ++reason_index) {
+            if (reason_index != 0) {
+              std::cerr << ", ";
+            }
+            std::cerr << skip_reasons[reason_index];
+          }
+          std::cerr << " (use --device explicitly for bounded read-only validation)\n";
           continue;
         }
         scan_options.device_paths.push_back(
           "\\\\.\\PhysicalDrive" + std::to_string(disk.disk_number));
       }
+    } else {
+      std::cerr << "warning: cannot enumerate physical disks for implicit scan: " << disks.status.message << '\n';
     }
 #endif
   }
@@ -497,6 +524,73 @@ int run_lvchange(const CliOptions& options) {
   return 2;
 }
 
+int run_driver_status(const CliOptions& options) {
+  (void)options;
+#ifdef _WIN32
+  auto client = winlvm::DriverClient::open_default();
+  if (client) {
+    std::cout << "Kernel driver (lvmdm.sys) is loaded and running.\n";
+
+    auto mappings = client.value.list_mappings();
+    if (!mappings) {
+      std::cerr << "Failed to list driver mappings: " << mappings.status.message << '\n';
+      return 2;
+    }
+
+    std::cout << "Active logical volume mappings: " << mappings.value.size() << "\n";
+    for (std::uint64_t mapping_id : mappings.value) {
+      auto mapping = client.value.query_mapping(mapping_id);
+      if (!mapping) {
+        std::cout << "  - Mapping ID: " << mapping_id
+                  << " (query failed: " << mapping.status.message << ")\n";
+        continue;
+      }
+      std::cout << "  - Mapping ID: " << mapping.value.mapping_id
+                << " status=" << mapping.value.status
+                << " io_count=" << mapping.value.io_count
+                << " mapping_table_size=" << mapping.value.mapping_table_size << "\n";
+    }
+    return 0;
+  }
+#endif
+
+  std::cout << "Kernel driver (lvmdm.sys) is NOT running or not loaded.\n\n";
+  std::cout << "To build and install the driver on a WDK-enabled machine:\n";
+  std::cout << "  1. Open WDK Developer Command Prompt\n";
+  std::cout << "  2. Run: msbuild src\\driver\\lvmdm.vcxproj /p:Configuration=Debug /p:Platform=x64\n";
+  std::cout << "  3. To install and start:\n";
+  std::cout << "     sc create lvmdm binPath= C:\\path\\to\\lvmdm.sys type= kernel\n";
+  std::cout << "     sc start lvmdm\n";
+  return 1;
+}
+
+int run_driver_delete(const CliOptions& options) {
+  if (!options.has_driver_mapping_id) {
+    std::cerr << "driver-delete requires a mapping id\n";
+    return 2;
+  }
+#ifdef _WIN32
+  auto client = winlvm::DriverClient::open_default();
+  if (!client) {
+    std::cerr << "Kernel driver (lvmdm.sys) is NOT running or not loaded: "
+              << client.status.message << '\n';
+    return 1;
+  }
+
+  const auto deleted = client.value.delete_mapping(options.driver_mapping_id);
+  if (!deleted.ok) {
+    std::cerr << "Failed to delete mapping " << options.driver_mapping_id
+              << ": " << deleted.message << '\n';
+    return 3;
+  }
+  std::cout << "Deleted mapping " << options.driver_mapping_id << "\n";
+  return 0;
+#else
+  std::cerr << "driver-delete is only available on Windows\n";
+  return 1;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -520,6 +614,12 @@ int main(int argc, char** argv) {
     }
     if (options.command == "lvchange") {
       return run_lvchange(options);
+    }
+    if (options.command == "driver-status") {
+      return run_driver_status(options);
+    }
+    if (options.command == "driver-delete") {
+      return run_driver_delete(options);
     }
     if (is_mutating_command(options.command)) {
       return unsupported_mutating_command(options.command);
