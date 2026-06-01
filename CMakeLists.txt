@@ -14,6 +14,7 @@ add_library(winlvm_core
   src/lvmcore/block_mapper.cpp
   src/lvmcore/crc32.cpp
   src/lvmcore/device_enum.cpp
+  src/lvmcore/driver_client.cpp
   src/lvmcore/exporter.cpp
   src/lvmcore/hash.cpp
   src/lvmcore/image_reader.cpp
@@ -54,6 +55,8 @@ set(WINLVM_COMMANDS
   lvdisplay
   lvchange
   vgchange
+  driver-status
+  driver-delete
   lvcreate
   lvremove
   lvresize
