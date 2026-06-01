@@ -487,8 +487,15 @@ NTSTATUS LvmdmValidateMappingTable(
                          LVMDM_MAPPING_FLAG_SHARED)) != 0) {
     return STATUS_INVALID_PARAMETER;
   }
-  if (header->exposed_logical_sector_size == 0 ||
-      header->exposed_physical_sector_size == 0) {
+  if (header->exposed_logical_sector_size != 512 &&
+      header->exposed_logical_sector_size != 4096) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (header->exposed_physical_sector_size != 512 &&
+      header->exposed_physical_sector_size != 4096) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (header->exposed_logical_sector_size > header->exposed_physical_sector_size) {
     return STATUS_INVALID_PARAMETER;
   }
   if (header->vg_name[LVMDM_MAX_VG_NAME_LENGTH] != '\0' ||

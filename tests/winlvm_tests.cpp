@@ -683,6 +683,8 @@ void mapping_table_abi_validates() {
   hdr.total_size_bytes = sizeof(winlvm::MappingTableHeader) + sizeof(winlvm::MappingSegment);
   hdr.segment_count = 1;
   hdr.pv_handle_count = 1;
+  hdr.exposed_logical_sector_size = 512;
+  hdr.exposed_physical_sector_size = 4096;
 
   assert(winlvm::validate_mapping_table_header(hdr));
 
@@ -693,6 +695,15 @@ void mapping_table_abi_validates() {
   // Test magic mismatch
   hdr.version = winlvm::kMappingTableVersion;
   hdr.magic = 0xDEADBEEF;
+  assert(!winlvm::validate_mapping_table_header(hdr));
+
+  hdr.magic = winlvm::kMappingTableMagic;
+  hdr.exposed_logical_sector_size = 65536;
+  hdr.exposed_physical_sector_size = 65536;
+  assert(!winlvm::validate_mapping_table_header(hdr));
+
+  hdr.exposed_logical_sector_size = 4096;
+  hdr.exposed_physical_sector_size = 512;
   assert(!winlvm::validate_mapping_table_header(hdr));
 }
 

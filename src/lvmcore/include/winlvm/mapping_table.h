@@ -149,7 +149,10 @@ inline bool validate_mapping_table_header(const MappingTableHeader& hdr) {
   return hdr.magic == kMappingTableMagic && hdr.version == kMappingTableVersion &&
          hdr.total_size_bytes > sizeof(MappingTableHeader) &&
          hdr.segment_count > 0 && hdr.segment_count <= kMaxSegmentCount &&
-         hdr.pv_handle_count > 0 && hdr.pv_handle_count <= kMaxPvHandleCount;
+         hdr.pv_handle_count > 0 && hdr.pv_handle_count <= kMaxPvHandleCount &&
+         (hdr.exposed_logical_sector_size == 512 || hdr.exposed_logical_sector_size == 4096) &&
+         (hdr.exposed_physical_sector_size == 512 || hdr.exposed_physical_sector_size == 4096) &&
+         hdr.exposed_logical_sector_size <= hdr.exposed_physical_sector_size;
 }
 
 }  // namespace winlvm
