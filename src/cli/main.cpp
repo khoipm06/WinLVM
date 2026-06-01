@@ -60,7 +60,7 @@ bool is_known_command(const std::string& command) {
       "pvs",       "vgs",       "lvs",       "pvscan",  "vgscan", "lvscan", "pvdisplay",
       "vgdisplay", "lvdisplay", "lvchange",  "vgchange", "lvcreate", "lvremove", "lvresize",
       "vgextend", "vgreduce", "pvcreate", "pvremove", "version", "dump", "export", "hash", "verify",
-      "driver-status", "driver-delete"};
+      "driver-status", "driver-delete", "driver-translate"};
   return std::find(commands.begin(), commands.end(), command) != commands.end();
 }
 
@@ -143,16 +143,18 @@ CliOptions parse_args(int argc, char** argv) {
     } else if (arg == "-f" || arg == "--force") {
       options.force = true;
     } else if (arg == "--offset") {
-      if (options.command != "export" && options.command != "hash" && options.command != "verify") {
-        throw std::runtime_error("--offset is only supported with lvm export/hash/verify");
+      if (options.command != "export" && options.command != "hash" && options.command != "verify" &&
+          options.command != "driver-translate") {
+        throw std::runtime_error("--offset is only supported with lvm export/hash/verify/driver-translate");
       }
       if (i + 1 >= argc) {
         throw std::runtime_error("--offset requires a byte value");
       }
       options.export_offset = parse_u64(argv[++i], "--offset");
     } else if (arg == "--length") {
-      if (options.command != "export" && options.command != "hash" && options.command != "verify") {
-        throw std::runtime_error("--length is only supported with lvm export/hash/verify");
+      if (options.command != "export" && options.command != "hash" && options.command != "verify" &&
+          options.command != "driver-translate") {
+        throw std::runtime_error("--length is only supported with lvm export/hash/verify/driver-translate");
       }
       if (i + 1 >= argc) {
         throw std::runtime_error("--length requires a byte value");
@@ -176,6 +178,9 @@ CliOptions parse_args(int argc, char** argv) {
         options.lv_target = arg;
       } else if (options.command == "driver-delete" && !options.has_driver_mapping_id && arg.rfind("-", 0) != 0) {
         options.driver_mapping_id = parse_u64(arg, "driver-delete mapping id");
+        options.has_driver_mapping_id = true;
+      } else if (options.command == "driver-translate" && !options.has_driver_mapping_id && arg.rfind("-", 0) != 0) {
+        options.driver_mapping_id = parse_u64(arg, "driver-translate mapping id");
         options.has_driver_mapping_id = true;
       } else {
         throw std::runtime_error("unsupported argument: " + arg);
@@ -224,6 +229,11 @@ void print_help(const std::string& command) {
   if (command == "driver-delete") {
     std::cout << "Usage: lvm driver-delete <mapping-id>\n";
     std::cout << "       diagnostic cleanup for loaded-driver CREATE/LIST/QUERY/DELETE smoke tests.\n";
+    return;
+  }
+  if (command == "driver-translate") {
+    std::cout << "Usage: lvm driver-translate <mapping-id> --offset <bytes> --length <bytes>\n";
+    std::cout << "       asks lvmdm to translate an LV byte range to the first backing source range.\n";
     return;
   }
   std::cout << "Usage: " << command << " (--image <path> | --device <path>) [--reportformat json]\n";
@@ -591,6 +601,43 @@ int run_driver_delete(const CliOptions& options) {
 #endif
 }
 
+int run_driver_translate(const CliOptions& options) {
+  if (!options.has_driver_mapping_id) {
+    std::cerr << "driver-translate requires a mapping id\n";
+    return 2;
+  }
+  if (!options.has_export_length) {
+    std::cerr << "driver-translate requires --length\n";
+    return 2;
+  }
+#ifdef _WIN32
+  auto client = winlvm::DriverClient::open_default();
+  if (!client) {
+    std::cerr << "Kernel driver (lvmdm.sys) is NOT running or not loaded: "
+              << client.status.message << '\n';
+    return 1;
+  }
+
+  const auto translated = client.value.translate_range(
+      options.driver_mapping_id, options.export_offset, options.export_length);
+  if (!translated) {
+    std::cerr << "Failed to translate mapping " << options.driver_mapping_id
+              << ": " << translated.status.message << '\n';
+    return 3;
+  }
+
+  std::cout << "Mapping ID:       " << translated.value.mapping_id << "\n";
+  std::cout << "Source path:      " << translated.value.source_path << "\n";
+  std::cout << "Source offset:    " << translated.value.source_offset_bytes << "\n";
+  std::cout << "PV offset:        " << translated.value.pv_offset_bytes << "\n";
+  std::cout << "Translated bytes: " << translated.value.length_bytes << "\n";
+  return 0;
+#else
+  std::cerr << "driver-translate is only available on Windows\n";
+  return 1;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -620,6 +667,9 @@ int main(int argc, char** argv) {
     }
     if (options.command == "driver-delete") {
       return run_driver_delete(options);
+    }
+    if (options.command == "driver-translate") {
+      return run_driver_translate(options);
     }
     if (is_mutating_command(options.command)) {
       return unsupported_mutating_command(options.command);
