@@ -80,6 +80,32 @@ Result<DriverMappingStatus> parse_driver_mapping_query(
 #endif
 }
 
+Result<DriverTranslatedRange> parse_driver_translate_range(
+    std::span<const std::uint8_t> bytes) {
+#ifdef _WIN32
+  if (bytes.size() < sizeof(LVMDM_TRANSLATE_RANGE_OUTPUT)) {
+    return Result<DriverTranslatedRange>::failure("driver translate response is too short");
+  }
+
+  LVMDM_TRANSLATE_RANGE_OUTPUT output{};
+  std::memcpy(&output, bytes.data(), sizeof(output));
+  if (output.source_path[LVMDM_MAX_SOURCE_PATH_LENGTH] != '\0') {
+    return Result<DriverTranslatedRange>::failure("driver translate response source path is unterminated");
+  }
+
+  DriverTranslatedRange range{};
+  range.mapping_id = output.mapping_id;
+  range.source_path = output.source_path;
+  range.source_offset_bytes = output.source_offset_bytes;
+  range.pv_offset_bytes = output.pv_offset_bytes;
+  range.length_bytes = output.length_bytes;
+  return Result<DriverTranslatedRange>::success(std::move(range));
+#else
+  (void)bytes;
+  return Result<DriverTranslatedRange>::failure("lvmdm driver client is only available on Windows");
+#endif
+}
+
 DriverClient::DriverClient(void* handle) : handle_(handle) {}
 
 DriverClient::~DriverClient() {
@@ -239,6 +265,41 @@ Result<DriverMappingStatus> DriverClient::query_mapping(std::uint64_t mapping_id
 #else
   (void)mapping_id;
   return Result<DriverMappingStatus>::failure("lvmdm driver client is only available on Windows");
+#endif
+}
+
+Result<DriverTranslatedRange> DriverClient::translate_range(
+    std::uint64_t mapping_id,
+    std::uint64_t lv_offset_bytes,
+    std::uint64_t length_bytes) {
+#ifdef _WIN32
+  LVMDM_TRANSLATE_RANGE_INPUT input{};
+  input.mapping_id = mapping_id;
+  input.lv_offset_bytes = lv_offset_bytes;
+  input.length_bytes = length_bytes;
+  LVMDM_TRANSLATE_RANGE_OUTPUT output{};
+  DWORD bytes_returned = 0;
+  const BOOL ok = DeviceIoControl(
+      static_cast<HANDLE>(handle_),
+      IOCTL_LVMDM_TRANSLATE_RANGE,
+      &input,
+      sizeof(input),
+      &output,
+      sizeof(output),
+      &bytes_returned,
+      nullptr);
+  if (!ok) {
+    return Result<DriverTranslatedRange>::failure(
+        windows_error_message("IOCTL_LVMDM_TRANSLATE_RANGE", GetLastError()));
+  }
+
+  const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&output);
+  return parse_driver_translate_range(std::span<const std::uint8_t>(bytes, bytes_returned));
+#else
+  (void)mapping_id;
+  (void)lv_offset_bytes;
+  (void)length_bytes;
+  return Result<DriverTranslatedRange>::failure("lvmdm driver client is only available on Windows");
 #endif
 }
 

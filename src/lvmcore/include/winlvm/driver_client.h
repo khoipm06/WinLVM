@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace winlvm {
@@ -15,9 +16,19 @@ struct DriverMappingStatus {
   std::uint64_t mapping_table_size = 0;
 };
 
+struct DriverTranslatedRange {
+  std::uint64_t mapping_id = 0;
+  std::string source_path;
+  std::uint64_t source_offset_bytes = 0;
+  std::uint64_t pv_offset_bytes = 0;
+  std::uint64_t length_bytes = 0;
+};
+
 Result<std::vector<std::uint64_t>> parse_driver_mapping_list(
     std::span<const std::uint8_t> bytes);
 Result<DriverMappingStatus> parse_driver_mapping_query(
+    std::span<const std::uint8_t> bytes);
+Result<DriverTranslatedRange> parse_driver_translate_range(
     std::span<const std::uint8_t> bytes);
 
 class DriverClient {
@@ -37,6 +48,10 @@ class DriverClient {
   Status delete_mapping(std::uint64_t mapping_id);
   Result<std::vector<std::uint64_t>> list_mappings();
   Result<DriverMappingStatus> query_mapping(std::uint64_t mapping_id);
+  Result<DriverTranslatedRange> translate_range(
+      std::uint64_t mapping_id,
+      std::uint64_t lv_offset_bytes,
+      std::uint64_t length_bytes);
 
  private:
   explicit DriverClient(void* handle);
