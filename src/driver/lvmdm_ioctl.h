@@ -29,6 +29,9 @@
 #define IOCTL_LVMDM_LIST_MAPPINGS \
   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_DATA)
 
+#define IOCTL_LVMDM_TRANSLATE_RANGE \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_DATA)
+
 // ============================================================================
 // Mapping Table ABI Constants
 //
@@ -148,5 +151,21 @@ typedef struct _LVMDM_LIST_MAPPINGS_OUTPUT {
   UINT32 reserved;
   // Followed by array of UINT64 mapping_ids
 } LVMDM_LIST_MAPPINGS_OUTPUT, *PLVMDM_LIST_MAPPINGS_OUTPUT;
+
+typedef struct _LVMDM_TRANSLATE_RANGE_INPUT {
+  UINT64 mapping_id;
+  UINT64 lv_offset_bytes;
+  UINT64 length_bytes;
+} LVMDM_TRANSLATE_RANGE_INPUT, *PLVMDM_TRANSLATE_RANGE_INPUT;
+
+typedef struct _LVMDM_TRANSLATE_RANGE_OUTPUT {
+  UINT64 mapping_id;
+  CHAR source_path[LVMDM_MAX_SOURCE_PATH_LENGTH + 1];
+  LVMDM_MAPPING_UUID pv_uuid;
+  UINT64 source_offset_bytes;
+  UINT64 pv_offset_bytes;
+  UINT64 length_bytes;
+  UINT64 reserved;
+} LVMDM_TRANSLATE_RANGE_OUTPUT, *PLVMDM_TRANSLATE_RANGE_OUTPUT;
 
 #endif  // WINLVM_DRIVER_IOCTL_H
