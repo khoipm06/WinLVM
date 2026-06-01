@@ -35,6 +35,13 @@ typedef struct _LVMDM_MAPPING_ENTRY {
   ULONGLONG IoCount;
 } LVMDM_MAPPING_ENTRY, *PLVMDM_MAPPING_ENTRY;
 
+typedef struct _LVMDM_TRANSLATED_RANGE {
+  const LVMDM_MAPPING_PV_HANDLE* PvHandle;
+  ULONGLONG SourceOffsetBytes;
+  ULONGLONG PvOffsetBytes;
+  ULONGLONG LengthBytes;
+} LVMDM_TRANSLATED_RANGE, *PLVMDM_TRANSLATED_RANGE;
+
 // ============================================================================
 // Forward Declarations
 // ============================================================================
@@ -45,6 +52,10 @@ DRIVER_UNLOAD LvmdmUnload;
 _Dispatch_type_(IRP_MJ_CREATE)
 _Dispatch_type_(IRP_MJ_CLOSE)
 DRIVER_DISPATCH LvmdmCreateClose;
+
+_Dispatch_type_(IRP_MJ_READ)
+_Dispatch_type_(IRP_MJ_WRITE)
+DRIVER_DISPATCH LvmdmUnsupportedReadWrite;
 
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH LvmdmDeviceControl;
@@ -72,6 +83,14 @@ NTSTATUS LvmdmQueryMapping(
 NTSTATUS LvmdmListMappings(
   PLVMDM_DEVICE_EXTENSION DeviceExtension,
   PVOID OutputBuffer,
+  ULONG OutputBufferLength,
+  PULONG Information
+);
+
+NTSTATUS LvmdmTranslateRange(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  const LVMDM_TRANSLATE_RANGE_INPUT* Input,
+  PLVMDM_TRANSLATE_RANGE_OUTPUT OutputBuffer,
   ULONG OutputBufferLength,
   PULONG Information
 );
@@ -135,6 +154,8 @@ NTSTATUS DriverEntry(
   // Set dispatch routines
   DriverObject->MajorFunction[IRP_MJ_CREATE] = LvmdmCreateClose;
   DriverObject->MajorFunction[IRP_MJ_CLOSE] = LvmdmCreateClose;
+  DriverObject->MajorFunction[IRP_MJ_READ] = LvmdmUnsupportedReadWrite;
+  DriverObject->MajorFunction[IRP_MJ_WRITE] = LvmdmUnsupportedReadWrite;
   DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = LvmdmDeviceControl;
   DriverObject->DriverUnload = LvmdmUnload;
 
@@ -190,6 +211,18 @@ NTSTATUS LvmdmCreateClose(
   Irp->IoStatus.Information = 0;
   IoCompleteRequest(Irp, IO_NO_INCREMENT);
   return STATUS_SUCCESS;
+}
+
+NTSTATUS LvmdmUnsupportedReadWrite(
+  _In_ PDEVICE_OBJECT DeviceObject,
+  _In_ PIRP Irp
+) {
+  UNREFERENCED_PARAMETER(DeviceObject);
+
+  Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+  Irp->IoStatus.Information = 0;
+  IoCompleteRequest(Irp, IO_NO_INCREMENT);
+  return STATUS_NOT_SUPPORTED;
 }
 
 // ============================================================================
@@ -273,6 +306,24 @@ NTSTATUS LvmdmDeviceControl(
       break;
     }
 
+    case IOCTL_LVMDM_TRANSLATE_RANGE: {
+      if (inputBufferLength >= sizeof(LVMDM_TRANSLATE_RANGE_INPUT) &&
+          outputBufferLength >= sizeof(LVMDM_TRANSLATE_RANGE_OUTPUT)) {
+        LVMDM_TRANSLATE_RANGE_INPUT input;
+        RtlCopyMemory(&input, inputBuffer, sizeof(input));
+        status = LvmdmTranslateRange(
+          deviceExtension,
+          &input,
+          (PLVMDM_TRANSLATE_RANGE_OUTPUT)outputBuffer,
+          outputBufferLength,
+          &information
+        );
+      } else {
+        status = STATUS_BUFFER_TOO_SMALL;
+      }
+      break;
+    }
+
     default:
       status = STATUS_INVALID_DEVICE_REQUEST;
       break;
@@ -318,6 +369,83 @@ const LVMDM_MAPPING_PV_HANDLE* LvmdmFindPvHandle(
     }
   }
   return NULL;
+}
+
+NTSTATUS LvmdmTranslateLogicalRange(
+  PVOID MappingTableBuffer,
+  ULONGLONG LvOffsetBytes,
+  ULONGLONG LengthBytes,
+  PLVMDM_TRANSLATED_RANGE Translation
+) {
+  const LVMDM_MAPPING_TABLE_HEADER* header;
+  const LVMDM_MAPPING_SEGMENT* segments;
+  const LVMDM_MAPPING_PV_HANDLE* pvHandles;
+  ULONG i;
+
+  if (!MappingTableBuffer || !Translation || LengthBytes == 0 ||
+      LvmdmAddOverflows(LvOffsetBytes, LengthBytes)) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  header = (const LVMDM_MAPPING_TABLE_HEADER*)MappingTableBuffer;
+  if (LvOffsetBytes >= header->lv_size_bytes ||
+      LvOffsetBytes + LengthBytes > header->lv_size_bytes) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  segments = (const LVMDM_MAPPING_SEGMENT*)((const UCHAR*)MappingTableBuffer + header->segments_offset);
+  pvHandles = (const LVMDM_MAPPING_PV_HANDLE*)((const UCHAR*)MappingTableBuffer + header->pv_handles_offset);
+
+  for (i = 0; i < header->segment_count; ++i) {
+    const LVMDM_MAPPING_SEGMENT* segment = &segments[i];
+    const LVMDM_MAPPING_LINEAR_SEGMENT* linear = &segment->data.linear;
+    ULONGLONG segmentEnd;
+    ULONGLONG withinSegment;
+    ULONGLONG pvOffset;
+    ULONGLONG sourceOffset;
+    ULONGLONG available;
+    ULONGLONG translatedLength;
+    const LVMDM_MAPPING_PV_HANDLE* pv;
+
+    if (segment->type != LvmdmSegmentLinear ||
+        LvmdmAddOverflows(linear->lv_start_bytes, linear->length_bytes)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+
+    segmentEnd = linear->lv_start_bytes + linear->length_bytes;
+    if (LvOffsetBytes < linear->lv_start_bytes ||
+        LvOffsetBytes >= segmentEnd) {
+      continue;
+    }
+
+    withinSegment = LvOffsetBytes - linear->lv_start_bytes;
+    if (LvmdmAddOverflows(linear->pv_start_bytes, withinSegment)) {
+      return STATUS_INTEGER_OVERFLOW;
+    }
+    pvOffset = linear->pv_start_bytes + withinSegment;
+
+    pv = LvmdmFindPvHandle(pvHandles, header->pv_handle_count, &linear->pv_uuid);
+    if (!pv || !LvmdmRangeFits(pvOffset, 1, pv->pv_size_bytes) ||
+        LvmdmAddOverflows(pv->pv_base_offset_bytes, pvOffset)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    sourceOffset = pv->pv_base_offset_bytes + pvOffset;
+
+    available = segmentEnd - LvOffsetBytes;
+    translatedLength = LengthBytes < available ? LengthBytes : available;
+    if (!LvmdmRangeFits(sourceOffset, translatedLength, pv->source_size_bytes)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Translation, sizeof(*Translation));
+    Translation->PvHandle = pv;
+    Translation->SourceOffsetBytes = sourceOffset;
+    Translation->PvOffsetBytes = pvOffset;
+    Translation->LengthBytes = translatedLength;
+    return STATUS_SUCCESS;
+  }
+
+  return STATUS_INVALID_PARAMETER;
 }
 
 NTSTATUS LvmdmValidateMappingTable(
@@ -594,5 +722,54 @@ NTSTATUS LvmdmListMappings(
   }
 
   *Information = sizeof(LVMDM_LIST_MAPPINGS_OUTPUT) + (count * sizeof(ULONGLONG));
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS LvmdmTranslateRange(
+  PLVMDM_DEVICE_EXTENSION DeviceExtension,
+  const LVMDM_TRANSLATE_RANGE_INPUT* Input,
+  PLVMDM_TRANSLATE_RANGE_OUTPUT OutputBuffer,
+  ULONG OutputBufferLength,
+  PULONG Information
+) {
+  PLVMDM_MAPPING_ENTRY mapping;
+  LVMDM_TRANSLATED_RANGE translation;
+  NTSTATUS status;
+  KIRQL oldIrql;
+
+  if (!Input || !OutputBuffer || OutputBufferLength < sizeof(LVMDM_TRANSLATE_RANGE_OUTPUT) || !Information) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  KeAcquireSpinLock(&DeviceExtension->MappingLock, &oldIrql);
+  mapping = LvmdmFindMappingLocked(DeviceExtension, Input->mapping_id);
+  if (!mapping) {
+    KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+    return STATUS_NOT_FOUND;
+  }
+
+  RtlZeroMemory(&translation, sizeof(translation));
+  status = LvmdmTranslateLogicalRange(
+    mapping->MappingTableBuffer,
+    Input->lv_offset_bytes,
+    Input->length_bytes,
+    &translation
+  );
+  if (!NT_SUCCESS(status)) {
+    KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+    return status;
+  }
+
+  RtlZeroMemory(OutputBuffer, sizeof(*OutputBuffer));
+  OutputBuffer->mapping_id = Input->mapping_id;
+  RtlCopyMemory(OutputBuffer->source_path, translation.PvHandle->source_path, sizeof(OutputBuffer->source_path));
+  OutputBuffer->pv_uuid = translation.PvHandle->pv_uuid;
+  OutputBuffer->source_offset_bytes = translation.SourceOffsetBytes;
+  OutputBuffer->pv_offset_bytes = translation.PvOffsetBytes;
+  OutputBuffer->length_bytes = translation.LengthBytes;
+  mapping->IoCount++;
+
+  KeReleaseSpinLock(&DeviceExtension->MappingLock, oldIrql);
+  *Information = sizeof(LVMDM_TRANSLATE_RANGE_OUTPUT);
   return STATUS_SUCCESS;
 }
