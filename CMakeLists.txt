@@ -57,6 +57,7 @@ set(WINLVM_COMMANDS
   vgchange
   driver-status
   driver-delete
+  driver-translate
   lvcreate
   lvremove
   lvresize
