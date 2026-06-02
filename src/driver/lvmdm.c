@@ -879,10 +879,15 @@ NTSTATUS LvmdmCreateVirtualDisk(
   NTSTATUS status;
   PDEVICE_OBJECT deviceObject = NULL;
   PLVMDM_DEVICE_EXTENSION volumeExtension;
+  const LVMDM_MAPPING_TABLE_HEADER* header;
 
   if (!DeviceExtension || !Mapping) {
     return STATUS_INVALID_PARAMETER;
   }
+  if (!Mapping->MappingTableBuffer) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  header = (const LVMDM_MAPPING_TABLE_HEADER*)Mapping->MappingTableBuffer;
 
   status = RtlStringCchPrintfW(
     Mapping->VirtualDeviceNameBuffer,
@@ -927,7 +932,8 @@ NTSTATUS LvmdmCreateVirtualDisk(
   volumeExtension->SymbolicLink = Mapping->VirtualSymbolicLink;
   volumeExtension->Mapping = Mapping;
 
-  deviceObject->Flags |= DO_BUFFERED_IO;
+  deviceObject->Flags |= DO_DIRECT_IO;
+  deviceObject->SectorSize = (USHORT)header->exposed_logical_sector_size;
   deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 
   status = IoCreateSymbolicLink(&Mapping->VirtualSymbolicLink, &Mapping->VirtualDeviceName);
@@ -1221,7 +1227,7 @@ NTSTATUS LvmdmReadVirtualDisk(
 ) {
   NTSTATUS status = STATUS_SUCCESS;
   PLVMDM_MAPPING_ENTRY mapping = DeviceExtension->Mapping;
-  PVOID systemBuffer = Irp->AssociatedIrp.SystemBuffer;
+  PVOID systemBuffer = NULL;
   LARGE_INTEGER byteOffset = IrpStack->Parameters.Read.ByteOffset;
   ULONG length = IrpStack->Parameters.Read.Length;
   ULONG bytesDone = 0;
@@ -1237,6 +1243,11 @@ NTSTATUS LvmdmReadVirtualDisk(
   if (length == 0) {
     status = STATUS_SUCCESS;
     goto Complete;
+  }
+  if (Irp->MdlAddress) {
+    systemBuffer = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+  } else if (Irp->RequestorMode == KernelMode) {
+    systemBuffer = Irp->UserBuffer;
   }
   if (!systemBuffer) {
     status = STATUS_INVALID_USER_BUFFER;
