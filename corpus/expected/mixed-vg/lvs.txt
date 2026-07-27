@@ -1,0 +1,6 @@
+  VG    LV      LV UUID                                LSize    Start SSize Type      #Str Stripe PE Ranges                               Devices                              
+  vgmix lvplain eAgzxO-GlGf-0T1u-k68E-vYHW-NCz2-Jp70zy  8388608     0     2 linear       1      0 /dev/loop10:0-1                         /dev/loop10(0)                       
+  vgmix lvraid  dzQqRB-5VyA-oTM4-vkXQ-3V5A-0Lpb-ddm0rh  8388608     0     2 raid1        2      0 lvraid_rimage_0:0-1 lvraid_rimage_1:0-1 lvraid_rimage_0(0),lvraid_rimage_1(0)
+  vgmix lvsnap  2a4nIW-26z1-N4oI-cc2Y-xvyz-CNuE-VC83R3  4194304     0     1 linear       1      0 /dev/loop10:14-14                       /dev/loop10(14)                      
+  vgmix lvthin  rzpYVq-oI0L-Btkq-J6cE-kbSc-4Sxl-f9ywu6  8388608     0     2 thin         0      0                                                                              
+  vgmix tpool   sD51B3-3dec-Md12-BpOK-NbIZ-NJ0s-va8JA3 33554432     0     8 thin-pool    1      0 tpool_tdata:0-7                         tpool_tdata(0)                       

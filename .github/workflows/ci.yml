@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Install zstd
+      run: |
+        choco install zstandard -y
+        # Add to PATH immediately for this step just in case
+        echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
+
+    - name: Configure CMake
+      run: >
+        cmake -B build
+        -G Ninja
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_CXX_COMPILER=cl
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Test
+      run: ctest --test-dir build --output-on-failure -C Release

@@ -1,0 +1,2 @@
+vgspan-lvspan: 0 253952 linear 7:4 2048
+vgspan-lvspan: 253952 73728 linear 7:5 2048

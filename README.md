@@ -1,74 +1,70 @@
 # winlvm
 
-Native Windows LVM2-compatible tooling for existing Linux-created LVM disks.
+Native Windows access to Linux LVM2 volumes — with the longer-term goal of
+booting Windows from NTFS on an LVM2 logical volume inside a LUKS2 container.
 
-This repository is intentionally starting with a metadata/image-mode prototype. It does not expose Windows block
-devices yet, does not write LVM metadata, and does not activate real disks. The first production-quality slice is a
-read-only scanner that can consume Linux-created disk/PV images, parse LVM2 metadata, reconstruct supported linear
-logical-volume mappings, and emit deterministic JSON for oracle tests.
+> **Status: clean slate. There is no implementation in this repository yet.**
+>
+> The previous prototype was deleted deliberately (see below). What remains is
+> the analysis that says what to build, and the ground-truth corpus that says
+> whether it is correct.
 
-## Current Scope
+## Start here
 
-- C++20, CMake, and CTest.
-- LVM-style command names: `lvm`, `pvs`, `vgs`, `lvs`, `pvscan`, `vgscan`, `lvscan`, `pvdisplay`, `vgdisplay`,
-  `lvdisplay`, `lvchange`, and `vgchange`.
-- Image-mode only through repeated `--image <path>`.
-- Explicit read-only Windows source devices through repeated `--device <path>`.
-- JSON debug output with `--reportformat json` or `lvm dump --image <path> --json`.
-- Raw read-only LV export with `lvm export <vg/lv> --image <path> --output <path> --readonly`.
-- Bounded SHA-256 LV range validation with `lvm hash <vg/lv> --offset <bytes> --length <bytes>`.
-- Expected-hash comparison with `lvm verify <vg/lv> --offset <bytes> --length <bytes> --expected-hash <hex>`.
-- Direct-PV and GPT/primary-MBR whole-disk image candidate scanning.
-- LVM2 PV label, metadata area, raw metadata location, metadata CRC, and simple text metadata parsing.
-- Linear mappings represented by LVM metadata as `type = "linear"` or single-stripe `type = "striped"`.
-- Fail-closed diagnostics for duplicate PV UUIDs, missing PVs, ambiguous newest metadata, unsupported segment types,
-  hidden/internal LVs, and out-of-bounds mappings.
+| Document | What it is |
+|---|---|
+| [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md) | Whether the boot goal is achievable, the boot-chain analysis, prior art worth deriving from, effort estimates, and go/no-go gates with kill criteria. |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | What to build, in what order, and the decisions that block starting. |
+| [`corpus/README.md`](corpus/README.md) | The ground-truth corpus: real Linux-created LVM2/LUKS2 images with oracle files. |
 
-## Explicit Deferrals
+## Goals
 
-Physical disk scanning, activation services, the Windows kernel mapping driver, WinBtrfs integration, read/write support,
-metadata mutation, VG `system_id` claiming, striped multi-PV mappings, snapshots, thin provisioning, RAID, mirrors,
-cache/writecache, LUKS, discard/TRIM, and concurrent access policy enforcement are deferred.
+1. **Full-featured LVM2 on Windows** — read *and* write access to volumes
+   created on Linux, not a read-only viewer.
+2. **Boot Windows from an LVM2 logical volume.**
+3. **With the physical volume inside a LUKS2 container.**
 
-## Build
+## Why the prototype was deleted
 
-```powershell
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
+The earlier `src/` tree contained a user-mode LVM2 metadata scanner that worked
+for single-PV linear volumes, and a kernel driver that could never work. Rather
+than build on it, it was removed at commit `6bbbe7a` — recoverable from git
+history if ever needed.
+
+The reasons, in short:
+
+- The driver was a legacy non-PnP design with no INF. It never registered a
+  volume interface, so Windows could not treat its output as a real volume, and
+  it reopened the backing device with `ZwCreateFile` **on every read IRP**. That
+  is unusable for a data volume and categorically impossible on a boot path.
+- Whole subsystems were unreachable: `stripe_support.cpp` was fully implemented
+  but no code path could call it, `image_reader.cpp` was a 9-line stub, and the
+  "activation service" was a `Sleep` loop nothing talked to.
+- Activation fabricated a fake handle when the driver was absent and printed
+  success indistinguishable from the real thing.
+- Nothing had ever been validated against a real Linux-created LVM image.
+
+The correct architecture — a winmd-shaped WDM volume manager — differs from that
+design at essentially every layer. `docs/FEASIBILITY.md` §5.1 covers it.
+
+## What exists now
+
+```
+corpus/     ground truth: 12 real LVM2/LUKS2 images + oracle files from Linux
+docs/       the feasibility assessment and the roadmap
+shared/     transfer area for the Linux corpus-generation VM (normally empty)
+third_party/  reference source only (LVM2, WinBtrfs) — not built
 ```
 
-## Examples
+## Working agreement
 
-```powershell
-build\pvs.exe --image .\single-pv-linear.img
-build\vgs.exe --image .\single-pv-linear.img
-build\lvs.exe --image .\single-pv-linear.img
-build\lvm.exe dump --image .\single-pv-linear.img --json
-build\lvm.exe export vg0/home --image .\single-pv-linear.img --output .\home.raw --readonly
-build\lvm.exe export vg0/home --image .\single-pv-linear.img --output .\home-head.raw --readonly --offset 0 --length 131072
-build\lvm.exe hash vg0/home --image .\single-pv-linear.img --offset 0 --length 131072
-build\lvm.exe verify vg0/home --image .\single-pv-linear.img --offset 0 --length 131072 --expected-hash <linux-sha256>
-build\lvm.exe dump --device \\.\Harddisk1Partition1 --json
-build\Debug\lvm.exe hash myVG/myLV --device \\.\Harddisk1Partition1 --offset 0 --length 131072
-```
+The rule that matters, because the previous iteration broke it and left behind
+documentation nobody could trust:
 
-All image and device inputs are opened read-only. Linux metadata `device = "/dev/..."` paths are never trusted as
-backing devices. Export refuses to overwrite an existing output file.
+**No claim without a committed artifact.** If a test passed, commit the log. If
+a driver loaded, commit the evidence. If it isn't in the repository, it didn't
+happen.
 
-For large real LVs, validate bounded ranges before attempting full export. Example Linux oracle:
-
-```bash
-dd if=/dev/vg0/home bs=1 skip=0 count=131072 status=none | sha256sum
-```
-
-Compare that hash with a bounded Windows hash of the same offset and length:
-
-```powershell
-build\Debug\lvm.exe hash vg0/home --device \\.\Harddisk1Partition1 --offset 0 --length 131072
-build\Debug\lvm.exe verify vg0/home --device \\.\Harddisk1Partition1 --offset 0 --length 131072 --expected-hash <linux-sha256>
-```
-
-`lvm hash` and `lvm verify` require `--length` so real-device validation remains intentionally bounded. Bounded
-`lvm export` plus `Get-FileHash` remains useful when a raw range file is needed for inspection, but hashing in-process is
-preferred for oracle checks because it avoids writing LV bytes to disk.
+The corpus in `corpus/expected/` is what that looks like in practice: every
+number the Windows side will be asked to reproduce came out of Linux and is
+checked in.

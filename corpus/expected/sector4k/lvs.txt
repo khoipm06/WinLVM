@@ -1,0 +1,2 @@
+  VG   LV   LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges      Devices      
+  vg4k lv4k 1aSucP-GAPQ-HEsc-Z3Im-5wJm-QHjf-yODiv6 16777216     0     4 linear    1      0 /dev/loop8:0-3 /dev/loop8(0)

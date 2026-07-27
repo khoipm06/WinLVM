@@ -1,0 +1,2 @@
+  VG     VG UUID                                Ext     #Ext Seq System ID #PV #LV
+  vgbase FGqDUy-tyD0-xEtg-UN0A-hTt2-1GzX-jjZncT 4194304   31   2             1   1

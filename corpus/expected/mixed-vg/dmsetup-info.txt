@@ -1,0 +1,140 @@
+Name:              vgmix-lvplain
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWeAgzxOGlGf0T1uk68EvYHWNCz2Jp70zy
+
+Name:              vgmix-lvplain-real
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        2
+Event number:      0
+Major, minor:      252, 11
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWeAgzxOGlGf0T1uk68EvYHWNCz2Jp70zy-real
+
+Name:              vgmix-lvraid
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      2
+Major, minor:      252, 10
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWdzQqRB5VyAoTM4vkXQ3V5A0Lpbddm0rh
+
+Name:              vgmix-lvraid_rimage_0
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 7
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWff59lMc1Pa6D9pEbEP0njDykyxnMynxZ-real
+
+Name:              vgmix-lvraid_rimage_1
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 9
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWT7v0QUoVQpywPAiPGpUwxB6n8oj0edJW-real
+
+Name:              vgmix-lvraid_rmeta_0
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 6
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWMgrazip9qXOeGXDluzRiqAdE3IZ2I8oL-real
+
+Name:              vgmix-lvraid_rmeta_1
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 8
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWpXhzNV0IkDqj0D1a2hjEAqEL602XK4lA-real
+
+Name:              vgmix-lvsnap
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 13
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDW2a4nIW26z1N4oIcc2YxvyzCNuEVC83R3
+
+Name:              vgmix-lvsnap-cow
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 12
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDW2a4nIW26z1N4oIcc2YxvyzCNuEVC83R3-cow
+
+Name:              vgmix-lvthin
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 5
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWrzpYVqoI0LBtkqJ6cEkbSc4Sxlf9ywu6
+
+Name:              vgmix-tpool
+State:             ACTIVE (READ-ONLY)
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 4
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWsD51B33decMd12BpOKNbIZNJ0sva8JA3-pool
+
+Name:              vgmix-tpool-tpool
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        2
+Event number:      0
+Major, minor:      252, 3
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDWsD51B33decMd12BpOKNbIZNJ0sva8JA3-tpool
+
+Name:              vgmix-tpool_tdata
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 2
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDW669K1wo2EioW7IlarxImAkiInBAluUuF-tdata
+
+Name:              vgmix-tpool_tmeta
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 1
+Number of targets: 1
+UUID: LVM-Obj4Yt9FU2lRWKl9GLQFocq1nxwSjsDW7p6vvzpPDNP8cxngauFQk08XoW1tKhv3-tmeta
+

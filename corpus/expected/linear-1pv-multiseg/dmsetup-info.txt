@@ -1,0 +1,30 @@
+Name:              vgseg-lvA
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 3
+UUID: LVM-HU0UsW9ThtY1faOtClxYMcJ15xw37ZoASmYG9BvCTpBcY3hi9yByRKeebfmjFWEh
+
+Name:              vgseg-lvB
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 1
+Number of targets: 1
+UUID: LVM-HU0UsW9ThtY1faOtClxYMcJ15xw37ZoA2oMve1kmCMCzbdbiUExlLoM98YqsQWPa
+
+Name:              vgseg-lvC
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 2
+Number of targets: 1
+UUID: LVM-HU0UsW9ThtY1faOtClxYMcJ15xw37ZoAKqvqNKHMQALqHnm3MPhw939ppWqcplGE
+

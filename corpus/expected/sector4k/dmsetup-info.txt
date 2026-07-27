@@ -1,0 +1,10 @@
+Name:              vg4k-lv4k
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: LVM-YY8TpPV4I23KxOuotgfbt3U7bdfSepRi1aSucPGAPQHEscZ3Im5wJmQHjfyODiv6
+

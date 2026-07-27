@@ -1,0 +1,6 @@
+  PV         PV UUID                                VG     PSize     1st PE  PE  Alloc #PMda
+  /dev/loop1 40papu-YTYe-jfI0-Z2ie-4KKg-qVTj-H9SkKq vgbase 130023424 1048576  31     4     1
+  /dev/loop2 JjLuDZ-YD8T-uES8-86y6-IWUS-XJXJ-exfUzt vgseg  130023424 1048576  31    13     1
+  /dev/loop3 4kwTKB-4OMo-bT1E-KDfP-s39G-Xn19-H9ik1Q         67108864 1048576   0     0     1
+  /dev/loop4 16usBo-oQe8-adxk-EFkw-pbrk-qgxU-LSHthl vgspan 130023424 1048576  31    31     1
+  /dev/loop5 zDjbfL-Wrbc-bfoi-LhWY-h5ij-44CQ-YXV0vE vgspan 130023424 1048576  31     9     1

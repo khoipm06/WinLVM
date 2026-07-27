@@ -1,0 +1,10 @@
+Name:              vgstripe-lvstr
+State:             ACTIVE
+Read Ahead:        512
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: LVM-2heIz9FU7G3mMcC0MYYiD98KRQoxBCKlwFcgzmRgFOlHU3gTvpVc5BvFOJCBxV23
+

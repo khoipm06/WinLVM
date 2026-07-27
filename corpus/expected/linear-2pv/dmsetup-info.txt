@@ -1,0 +1,10 @@
+Name:              vgspan-lvspan
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 2
+UUID: LVM-jnKCvzlH7UwL8B5u4mX4g5ndZUf8n00c8mC2AhpBH3jSdlD4tH3KCvsWdvNfkPMp
+

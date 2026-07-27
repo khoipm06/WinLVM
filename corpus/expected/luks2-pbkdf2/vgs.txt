@@ -1,0 +1,2 @@
+  VG     VG UUID                                Ext     #Ext Seq System ID #PV #LV
+  vgboot aEuZzy-RNYa-2Ll2-x4bL-tFn6-me3c-kih3Gn 4194304   27   2             1   1

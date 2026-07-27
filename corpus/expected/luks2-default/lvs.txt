@@ -1,0 +1,2 @@
+  VG     LV      LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges                Devices                
+  vgluks lvcrypt mqkif6-rgR4-IPIr-QWLo-C5aW-jEw8-XgaNE5 16777216     0     4 linear    1      0 /dev/mapper/wl_luks1:0-3 /dev/mapper/wl_luks1(0)

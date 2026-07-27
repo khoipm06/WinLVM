@@ -1,0 +1,2 @@
+  VG    VG UUID                                Ext     #Ext Seq System ID #PV #LV
+  vgmix Obj4Yt-9FU2-lRWK-l9GL-QFoc-q1nx-wSjsDW 4194304   62  11             2   5

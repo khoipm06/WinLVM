@@ -1,0 +1,20 @@
+Name:              vgluks-lvcrypt
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 1
+Number of targets: 1
+UUID: LVM-XvIvoVK5x9lxtQSIWSm2iW9YH8ur79wImqkif6rgR4IPIrQWLoC5aWjEw8XgaNE5
+
+Name:              wl_luks1
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: CRYPT-LUKS2-4425cb933121499c8b62b8b49b5d8682-wl_luks1
+
