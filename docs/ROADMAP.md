@@ -231,7 +231,7 @@ the Linux oracle both committed. No `sc create` anywhere.
 
 ---
 
-### Phase 3 — Write path _(Stage 3)_
+### Phase 3 — Write path _(Stage 3)_ — ✅ **DONE**
 
 Data writes only. **No LVM2 metadata mutation yet.**
 

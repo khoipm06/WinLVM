@@ -123,6 +123,7 @@ typedef struct {
 typedef struct {
     char     name[64];
     char     id[33];
+    char     system_id[64];
     uint64_t seqno;
     uint64_t extent_size_sectors;
     winlvm_physical_volume pvs[16];

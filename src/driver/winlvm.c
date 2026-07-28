@@ -29,6 +29,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = WinLvmCreateClose;
     DriverObject->MajorFunction[IRP_MJ_READ]           = WinLvmRead;
     DriverObject->MajorFunction[IRP_MJ_WRITE]          = WinLvmWrite;
+    DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS]  = WinLvmFlush;
+    DriverObject->MajorFunction[IRP_MJ_SHUTDOWN]       = WinLvmShutdown;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = WinLvmDeviceControl;
     DriverObject->MajorFunction[IRP_MJ_PNP]            = WinLvmPnp;
     DriverObject->DriverExtension->AddDevice           = WinLvmAddDevice;
@@ -79,11 +81,108 @@ NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    /* Phase 3 territory. */
-    Irp->IoStatus.Status = STATUS_MEDIA_WRITE_PROTECTED;
-    Irp->IoStatus.Information = 0;
+    /* Phase 3 territory. We now actually write through to the backing PV. */
+    if (DeviceObject == g_cdo) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+    if (ext->vg->vg.seqno == 0 && !IsListEmpty(&ext->vg->volume_ifname)) {
+        /* Defensive check: if we have not parsed a VG (seqno==0 is the
+         * value zero-initialised CDO extension falls back to), refuse. */
+        Irp->IoStatus.Status = STATUS_NO_MEDIA;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_NO_MEDIA;
+    }
+
+    if (irpSp->Parameters.Write.Length == 0) {
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
+
+    if ((ULONGLONG)irpSp->Parameters.Write.ByteOffset.QuadPart >= ext->byte_size) {
+        Irp->IoStatus.Status = STATUS_END_OF_FILE;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_END_OF_FILE;
+    }
+
+    if ((ULONGLONG)irpSp->Parameters.Write.ByteOffset.QuadPart + irpSp->Parameters.Write.Length > ext->byte_size) {
+        irpSp->Parameters.Write.Length = (ULONG)(ext->byte_size - irpSp->Parameters.Write.ByteOffset.QuadPart);
+    }
+
+    winlvm_logical_volume *lv = &ext->vg->vg.lvs[ext->lv_index];
+
+    /* Honor LVM2 system_id. If the VG has a system_id, it is owned by a
+     * specific host (likely the Linux machine). We refuse to write to it. */
+    if (ext->vg->vg.system_id[0] != '\0') {
+        Irp->IoStatus.Status = STATUS_MEDIA_WRITE_PROTECTED;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    }
+
+    if (lv->segment_count == 1 && lv->segments[0].type == WINLVM_SEG_STRIPED) {
+        PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
+        *nextSp = *irpSp;
+
+        uint64_t pv_ext_offset = lv->segments[0].stripes[0].start_extent;
+        uint64_t bytes_per_ext = ext->vg->vg.extent_size_sectors * 512;
+        uint64_t pv_byte_offset = ext->vg->vg.pvs[0].pe_start * 512 + (pv_ext_offset * bytes_per_ext);
+
+        nextSp->Parameters.Write.ByteOffset.QuadPart += pv_byte_offset;
+
+        IoSetCompletionRoutine(Irp, NULL, NULL, FALSE, FALSE, FALSE);
+        return IoCallDriver(ext->backing_pdo, Irp);
+    }
+
+    Irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_MEDIA_WRITE_PROTECTED;
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    /* FLUSH_BUFFERS must propagate to the backing PV so that NTFS's
+     * own consistency guarantees are preserved. We pass the IRP down
+     * to the backing_pdo with no changes (no completion routine needed). */
+    if (DeviceObject == g_cdo) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
+    *nextSp = *irpSp;
+
+    IoSetCompletionRoutine(Irp, NULL, NULL, FALSE, FALSE, FALSE);
+    return IoCallDriver(ext->backing_pdo, Irp);
+}
+
+NTSTATUS WinLvmShutdown(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    /* SHUTDOWN is the same idea: ensure all dirty writes are persisted
+     * before Windows turns the machine off. Pass to the backing_pdo. */
+    if (DeviceObject == g_cdo) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
+    *nextSp = *irpSp;
+
+    IoSetCompletionRoutine(Irp, NULL, NULL, FALSE, FALSE, FALSE);
+    return IoCallDriver(ext->backing_pdo, Irp);
 }
 
 NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {

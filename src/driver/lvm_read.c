@@ -608,6 +608,7 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
                     ps.pos++;
                     p_skip(&ps);
                     if (wl_streq(child, "id"))            { char v[64]; if (p_string(&ps, v, sizeof(v))) { wl_strip_dashes(v); wl_strcpy(id, sizeof(id), v); has_id = 1; } }
+                    else if (wl_streq(child, "system_id")) { p_string(&ps, vg->system_id, sizeof(vg->system_id)); }
                     else if (wl_streq(child, "seqno"))     { p_int(&ps, &seqno); }
                     else if (wl_streq(child, "extent_size")){ p_int(&ps, &extent_size); has_extent = 1; }
                     else {
