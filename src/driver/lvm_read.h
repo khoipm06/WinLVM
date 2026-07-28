@@ -94,7 +94,7 @@ typedef struct {
     uint64_t      extent_count;   /* number of extents in this segment */
     winlvm_seg_type type;
     uint64_t      stripe_count;
-    winlvm_stripe stripes[8];     /* LVM supports up to a handful in practice */
+    winlvm_stripe stripes[4];     /* LVM supports up to a handful in practice */
     size_t        stripe_count_used;
 } winlvm_segment;
 
@@ -105,7 +105,7 @@ typedef struct {
     int      visible;        /* status contains VISIBLE */
     int      mappable;       /* 0 if any segment is not WINLVM_SEG_STRIPED */
     char     unsupported_reason[64];
-    winlvm_segment segments[64];
+    winlvm_segment segments[16];
     size_t   segment_count;
 } winlvm_logical_volume;
 
@@ -126,9 +126,9 @@ typedef struct {
     char     system_id[64];
     uint64_t seqno;
     uint64_t extent_size_sectors;
-    winlvm_physical_volume pvs[16];
+    winlvm_physical_volume pvs[8];
     size_t   pv_count;
-    winlvm_logical_volume lvs[64];
+    winlvm_logical_volume lvs[8];
     size_t   lv_count;
 } winlvm_volume_group;
 

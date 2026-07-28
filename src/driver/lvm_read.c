@@ -14,6 +14,7 @@
  * the compiler's intrinsics resolve them to ntoskrnl's exports; that's fine.
  */
 #include "lvm_read.h"
+#include <stdio.h>
 
 #ifndef _KERNEL_MODE
 /* User-mode test build: use real mem*. */
@@ -571,6 +572,8 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
                     winlvm_pv_label *label, char *md_text,
                     size_t *parsed_vg) {
     (void)md_text; (void)parsed_vg;
+    /* Zero the caller's vg directly so writes during parsing are well-defined. */
+    wl_zero(vg, sizeof(*vg));
     parser ps; p_init(&ps, text, text_len);
     int found_vg = 0;
     while (!p_eof(&ps)) {
@@ -582,9 +585,7 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
         if (ps.pos < ps.len && ps.p[ps.pos] == '{') {
             ps.pos++;
             /* tentatively mark this as the VG if it has id= and extent_size= */
-            winlvm_volume_group tmp;
-            wl_zero(&tmp, sizeof(tmp));
-            wl_strcpy(tmp.name, sizeof(tmp.name), sec_name);
+            wl_strcpy(vg->name, sizeof(vg->name), sec_name);
 
             /* slow scan: we use a nested parser only to detect id+extent_size
              * at the top of this section body. Simpler: walk the whole body
@@ -696,13 +697,19 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
                 wl_strcpy(vg->id, sizeof(vg->id), id);
                 vg->seqno = seqno;
                 vg->extent_size_sectors = extent_size;
-                if (vg->name[0] == '\0') wl_strcpy(vg->name, sizeof(vg->name), sec_name);
                 vg->pv_count = pvs_seen;
                 vg->lv_count = lvs_seen;
                 found_vg = 1;
+                fprintf(stderr, "DEBUG: found_vg=1\n");
+                fflush(stderr);
                 return 1;
             }
-            /* Not the VG. Continue; we consumed its body above. */
+            /* Not the VG. Continue; we consumed its body above. Reset arrays. */
+            pvs_seen = 0;
+            lvs_seen = 0;
+            wl_zero(vg, sizeof(*vg));
+            fprintf(stderr, "DEBUG: wl_zero vg done\n");
+            fflush(stderr);
         } else {
             /* key = value at root (preamble). skip it. */
             if (ps.pos < ps.len && ps.p[ps.pos] == '=') {
@@ -736,6 +743,8 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
     if (!err) return 0;
     err->failed = 0;
     wl_zero(vg, sizeof(*vg));
+    fprintf(stderr, "DEBUG: zeroed vg\n");
+    fflush(stderr);
 
     /* Step 1: label. */
     winlvm_pv_label label;
@@ -743,6 +752,8 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
     if (!read_pv_label(src, &label, err)) return 0;
 
     /* Step 2/3: walk every metadata area, take the first readable one. */
+    fprintf(stderr, "DEBUG: about to alloc text_buf\n");
+    fflush(stderr);
     char *text = (char *)0;
     /* Static buffer is fine for the test build; the driver allocates from
      * nonpaged pool and passes its own via a wrapper if it needs more. We
@@ -770,6 +781,8 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
         return 0;
     }
 
+    fprintf(stderr, "DEBUG: parsing step\n");
+    fflush(stderr);
     /* Step 4: parse. */
     if (!parse_vg(text, text_len, vg, &label, 0, 0)) {
         wl_set_err(err, "no volume group section in metadata");

@@ -265,9 +265,16 @@ void WinLvmProbeWorker(PVOID context) {
     src.read = winlvm_disk_source_read;
 
     /* Parse LVM */
-    winlvm_volume_group vg;
+    winlvm_volume_group *vg = ExAllocatePoolZero(NonPagedPool, sizeof(winlvm_volume_group), WINLVM_WIN_TAG);
+    if (!vg) {
+        ObDereferenceObject(work->target_disk);
+        ObDereferenceObject(work->target_file);
+        ExFreePoolWithTag(work, WINLVM_WIN_TAG);
+        return;
+    }
+
     winlvm_lvm_err err;
-    if (winlvm_read_vg(&src, &vg, &err)) {
+    if (winlvm_read_vg(&src, vg, &err)) {
         /* Cache the first VG found. */
         KIRQL oldIrql;
         KeAcquireSpinLock(&cdo_ext->lock, &oldIrql);
@@ -277,7 +284,7 @@ void WinLvmProbeWorker(PVOID context) {
         if (insert) {
             WINLVM_VG_RECORD *records = ExAllocatePoolZero(NonPagedPool, sizeof(WINLVM_VG_RECORD), WINLVM_WIN_TAG);
             if (records) {
-                records->vg = vg;
+                records->vg = *vg;
                 records->backing_pdos = ExAllocatePoolZero(NonPagedPool, sizeof(PDEVICE_OBJECT), WINLVM_WIN_TAG);
                 if (records->backing_pdos) {
                     records->backing_pdos[0] = work->target_disk;
@@ -298,8 +305,8 @@ void WinLvmProbeWorker(PVOID context) {
         KeReleaseSpinLock(&cdo_ext->lock, oldIrql);
 
         if (record) {
-            for (size_t i = 0; i < vg.lv_count; i++) {
-                if (!vg.lvs[i].mappable) continue;
+            for (size_t i = 0; i < vg->lv_count; i++) {
+                if (!vg->lvs[i].mappable) continue;
 
                 PDEVICE_OBJECT lv_pdo = NULL;
                 NTSTATUS status = IoCreateDevice(work->cdo->DriverObject, sizeof(WINLVM_LV_EXT),
@@ -315,8 +322,8 @@ void WinLvmProbeWorker(PVOID context) {
                 lv_ext->backing_pdo = work->target_disk;
 
                 lv_ext->byte_size = 0;
-                for (size_t s = 0; s < vg.lvs[i].segment_count; s++) {
-                    lv_ext->byte_size += vg.lvs[i].segments[s].extent_count * vg.extent_size_sectors * 512;
+                for (size_t s = 0; s < vg->lvs[i].segment_count; s++) {
+                    lv_ext->byte_size += vg->lvs[i].segments[s].extent_count * vg->extent_size_sectors * 512;
                 }
 
                 lv_pdo->Flags |= DO_DIRECT_IO;
@@ -333,6 +340,7 @@ void WinLvmProbeWorker(PVOID context) {
         }
     }
 
+    ExFreePoolWithTag(vg, WINLVM_WIN_TAG);
     ObDereferenceObject(work->target_disk);
     ObDereferenceObject(work->target_file);
     ExFreePoolWithTag(work, WINLVM_WIN_TAG);
