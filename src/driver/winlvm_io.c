@@ -3,46 +3,32 @@
 
 extern PDEVICE_OBJECT g_cdo;
 
-typedef struct {
-    KEVENT event;
-    IO_STATUS_BLOCK io_status;
-} WINLVM_READ_CONTEXT;
-
-static NTSTATUS WinLvmReadCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
-    WINLVM_READ_CONTEXT *ctx = (WINLVM_READ_CONTEXT *)Context;
-    ctx->io_status = Irp->IoStatus;
-    KeSetEvent(&ctx->event, IO_NO_INCREMENT, FALSE);
-    return STATUS_MORE_PROCESSING_REQUIRED;
-}
-
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) {
     WINLVM_DISK_SOURCE *src = (WINLVM_DISK_SOURCE *)impl;
 
     LARGE_INTEGER offset;
     offset.QuadPart = off;
 
-    WINLVM_READ_CONTEXT ctx;
-    KeInitializeEvent(&ctx.event, NotificationEvent, FALSE);
+    KEVENT event;
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+    IO_STATUS_BLOCK io_status = {0};
 
-    PIRP irp = IoBuildSynchronousFsdRequest(IRP_MJ_READ, src->disk_pdo, buf, (ULONG)len, &offset, &ctx.event, &ctx.io_status);
+    PIRP irp = IoBuildSynchronousFsdRequest(IRP_MJ_READ, src->disk_pdo, buf, (ULONG)len, &offset, &event, &io_status);
     if (!irp) return 0;
 
     PIO_STACK_LOCATION irpSp = IoGetNextIrpStackLocation(irp);
     irpSp->FileObject = src->file;
 
-    IoSetCompletionRoutine(irp, WinLvmReadCompletion, &ctx, TRUE, TRUE, TRUE);
-
     NTSTATUS status = IoCallDriver(src->disk_pdo, irp);
     if (status == STATUS_PENDING) {
-        KeWaitForSingleObject(&ctx.event, Executive, KernelMode, FALSE, NULL);
-        status = ctx.io_status.Status;
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        status = io_status.Status;
     }
 
-    /* We took ownership of completion via STATUS_MORE_PROCESSING_REQUIRED */
-    IoFreeIrp(irp);
+    /* IoBuildSynchronousFsdRequest IRPs are freed by the I/O manager. Do not IoFreeIrp. */
 
     if (NT_SUCCESS(status)) {
-        return ctx.io_status.Information;
+        return io_status.Information;
     }
     return 0;
 }

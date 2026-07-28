@@ -22,6 +22,11 @@
 
 #include <ntddk.h>
 #include <wdm.h>
+#include <ntdddisk.h>
+#include <mountmgr.h>
+#include <mountdev.h>
+#include <ntddvol.h>
+#include <wdmguid.h>
 #include "lvm_read.h"
 
 #define WINLVM_WIN_TAG ((unsigned long)'WMLV')
