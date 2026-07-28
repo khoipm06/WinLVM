@@ -264,7 +264,7 @@ corpus, in CI.
 
 ---
 
-### Phase 5 — LUKS2, user mode first _(Stage 4)_
+### Phase 5 — LUKS2, user mode first _(Stage 4)_ — 🟡 **in progress**
 
 Build `luksfmt` + `crypto` as portable libraries, validated in user mode before
 they ever enter the kernel.
