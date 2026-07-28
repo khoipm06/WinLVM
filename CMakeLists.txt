@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(winlvm LANGUAGES CXX)
+project(winlvm LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,8 +73,21 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Tests
+# Driver parser test — validates the freestanding C parser matches lvmfmt.
 # ---------------------------------------------------------------------------
+if(ZSTD_EXE)
+  add_executable(winlvm_driver_parser_tests
+    tests/lvm_read/test_driver_parser.c
+    src/driver/lvm_read.c
+  )
+  target_link_libraries(winlvm_driver_parser_tests PRIVATE zstd)
+  target_include_directories(winlvm_driver_parser_tests PRIVATE src/driver)
+  if(TARGET corpus)
+    add_dependencies(winlvm_driver_parser_tests corpus)
+  endif()
+  # Pass the raw corpus directory so the test can decompress images directly
+  add_test(NAME winlvm_driver_parser_tests COMMAND winlvm_driver_parser_tests "${CORPUS_SRC}")
+endif()
 enable_testing()
 
 add_executable(winlvm_tests
