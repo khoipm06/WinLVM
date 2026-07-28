@@ -203,7 +203,7 @@ Parsed-and-rejected: `mirror`, `raid*`, `thin*`, `cache*`, `snapshot`,
 
 ---
 
-### Phase 2 — `winlvm.sys`: the volume manager, read-only _(Stage 2)_
+### Phase 2 — `winlvm.sys`: the volume manager, read-only _(Stage 2)_ — 🟡 **in progress**
 
 **The single most important phase.** Transcribe winmd's architecture
 (`FEASIBILITY.md` §5.1), substituting LVM2 for md RAID.

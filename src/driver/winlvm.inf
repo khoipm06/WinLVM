@@ -1,0 +1,59 @@
+; winlvm.inf
+;
+; Installation file for the winlvm Volume Manager driver.
+; This driver is root-enumerated as a bus driver (the control device)
+; and enumerates physical LVs as volume PDOs.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Volume
+ClassGuid={71A27CDD-812A-11D0-BEC7-08002BE2092F}
+Provider=%ProviderString%
+DriverVer=07/26/2026,1.0.0.0
+CatalogFile=winlvm.cat
+PnpLockdown=1
+
+[Manufacturer]
+%ManufacturerString%=Standard,NTamd64
+
+[Standard.NTamd64]
+%WinLvmDeviceDesc%=WinLvm_Install,ROOT\winlvm
+
+[WinLvm_Install.NT]
+CopyFiles=WinLvm.Files
+
+[WinLvm.Files]
+winlvm.sys
+
+[WinLvm_Install.NT.Services]
+AddService=winlvm,0x00000002,WinLvm_Service_Inst
+
+[WinLvm_Service_Inst]
+DisplayName    = %WinLvmServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 1               ; SERVICE_SYSTEM_START (Load after boot drivers)
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\winlvm.sys
+LoadOrderGroup = System Bus Extender
+AddReg         = WinLvm_AddReg
+
+[WinLvm_AddReg]
+; Any registry parameters live under the Parameters subkey so InfVerif is
+; satisfied that they cannot be tampered with by arbitrary apps.
+HKR,"Parameters","DebugFlags",0x00010001,0x0
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+winlvm.sys  = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12 ; Drivers directory
+
+[Strings]
+ProviderString = "winlvm"
+ManufacturerString = "winlvm"
+WinLvmDeviceDesc = "winlvm Logical Volume Manager Bus"
+WinLvmServiceDesc = "winlvm Volume Manager Service"
+DiskId1 = "winlvm Installation Disk"
