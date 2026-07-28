@@ -55,9 +55,6 @@ if(ZSTD_EXE)
   foreach(zst ${CORPUS_ZST})
     get_filename_component(zname "${zst}" NAME)
     string(REGEX REPLACE "\\.zst$" "" iname "${zname}")
-    if(iname MATCHES "^luks2-")
-      continue()
-    endif()
     set(out "${CORPUS_OUT}/${iname}")
     add_custom_command(
       OUTPUT "${out}"
@@ -87,6 +84,16 @@ if(ZSTD_EXE)
   endif()
   # Pass the raw corpus directory so the test can decompress images directly
   add_test(NAME winlvm_driver_parser_tests COMMAND winlvm_driver_parser_tests "${CORPUS_SRC}")
+
+  add_executable(winlvm_luks_tests
+    tests/luks_read/test_luks_read.c
+    src/luksfmt/luks_read.c
+  )
+  target_include_directories(winlvm_luks_tests PRIVATE src/luksfmt)
+  if(TARGET corpus)
+    add_dependencies(winlvm_luks_tests corpus)
+  endif()
+  add_test(NAME winlvm_luks_tests COMMAND winlvm_luks_tests "${CORPUS_OUT}/luks2-default.img")
 endif()
 enable_testing()
 
