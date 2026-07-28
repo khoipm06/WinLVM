@@ -7,6 +7,12 @@
 
 #include "luks_read.h"
 
+static size_t file_read(void *impl, uint64_t offset, void *buf, size_t len) {
+    FILE *f = (FILE *)impl;
+    if (_fseeki64(f, (int64_t)offset, SEEK_SET) != 0) return 0;
+    return fread(buf, 1, len, f);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <luks-image>\n", argv[0]);
@@ -19,32 +25,47 @@ int main(int argc, char **argv) {
         perror(img_path);
         return 1;
     }
+    _fseeki64(f, 0, SEEK_END);
+    uint64_t image_size = (uint64_t)_ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
 
-    unsigned char buf[4096];
-    if (fread(buf, 1, sizeof(buf), f) != sizeof(buf)) {
-        fprintf(stderr, "failed to read 4096 bytes\n");
+    winlvm_byte_source src = {
+        .impl = f,
+        .size = image_size,
+        .read = file_read,
+    };
+
+    winlvm_luks_metadata md;
+    winlvm_luks_err err = {0};
+    if (!winlvm_luks_read_metadata(&src, &md, &err)) {
+        fprintf(stderr, "LUKS2 read failed: %s\n", err.message);
         fclose(f);
         return 1;
     }
     fclose(f);
 
-    winlvm_luks_header hdr;
-    winlvm_luks_err err;
-    if (!winlvm_luks_read_header(buf, sizeof(buf), &hdr, &err)) {
-        fprintf(stderr, "LUKS2 parse failed: %s\n", err.message);
-        return 1;
+    printf("LUKS2 metadata parsed OK.\n");
+    printf("Segments: %d\n", md.segment_count);
+    for (int i = 0; i < md.segment_count; i++) {
+        winlvm_luks_segment *s = &md.segments[i];
+        printf("  [%d] type=%s offset=%llu size=%llu iv_tweak=%llu sector_size=%llu encryption=%s\n",
+               i, s->type, (unsigned long long)s->offset, (unsigned long long)s->size,
+               (unsigned long long)s->iv_tweak, (unsigned long long)s->sector_size,
+               s->encryption);
     }
-
-    printf("LUKS2 Header:\n");
-    printf("  Magic: %.*s\n", 6, hdr.magic);
-    printf("  Version: %u\n", hdr.version);
-    printf("  Header Size: %llu\n", (unsigned long long)hdr.hdr_size);
-    printf("  Seq ID: %llu\n", (unsigned long long)hdr.seqid);
-    printf("  Label: %s\n", hdr.label);
-    printf("  Subsystem: %s\n", hdr.subsystem);
-    printf("  UUID: %s\n", hdr.uuid);
-    printf("  Checksum Alg: %s\n", hdr.checksum_alg);
-    printf("  Offset: %llu\n", (unsigned long long)hdr.hdr_offset);
-
+    printf("Digests: %d\n", md.digest_count);
+    for (int i = 0; i < md.digest_count; i++) {
+        winlvm_luks_digest *d = &md.digests[i];
+        printf("  [%d] type=%s hash=%s iterations=%llu\n",
+               i, d->type, d->kdf.hash, (unsigned long long)d->kdf.iterations);
+    }
+    printf("Keyslots: %d\n", md.keyslot_count);
+    for (int i = 0; i < md.keyslot_count; i++) {
+        winlvm_luks_keyslot *k = &md.keyslots[i];
+        printf("  [%d] type=%s priority=%llu kdf.type=%s kdf.hash=%s area_offset=%llu area_size=%llu\n",
+               i, k->type, (unsigned long long)k->priority,
+               k->kdf.type, k->kdf.hash,
+               (unsigned long long)k->area_offset, (unsigned long long)k->area_size);
+    }
     return 0;
 }
