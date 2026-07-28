@@ -77,13 +77,12 @@ if(ZSTD_EXE)
     tests/lvm_read/test_driver_parser.c
     src/driver/lvm_read.c
   )
-  target_link_libraries(winlvm_driver_parser_tests PRIVATE zstd)
   target_include_directories(winlvm_driver_parser_tests PRIVATE src/driver)
   if(TARGET corpus)
     add_dependencies(winlvm_driver_parser_tests corpus)
   endif()
-  # Pass the raw corpus directory so the test can decompress images directly
-  add_test(NAME winlvm_driver_parser_tests COMMAND winlvm_driver_parser_tests "${CORPUS_SRC}")
+  # Pass the raw corpus images directory
+  add_test(NAME winlvm_driver_parser_tests COMMAND winlvm_driver_parser_tests "${CORPUS_OUT}")
 
   add_executable(winlvm_luks_tests
     tests/luks_read/test_luks_read.c

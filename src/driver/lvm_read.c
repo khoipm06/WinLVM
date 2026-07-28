@@ -283,6 +283,9 @@ static void p_skip(parser *ps) {
     }
 }
 
+/* memmove forward declaration — kernel exports this; user mode has it. */
+static void wl_memmove(void *dst, const void *src, size_t n);
+
 static int p_ident(parser *ps, char *out, size_t cap) {
     p_skip(ps);
     size_t start = ps->pos;
@@ -305,7 +308,6 @@ static void wl_strip_dashes(char *s) {
     *d = '\0';
 }
 
-/* memmove forward declaration — kernel exports this; user mode has it. */
 static void wl_memmove(void *dst, const void *src, size_t n) {
     char *d = (char *)dst; const char *s = (const char *)src;
     if (d < s) { while (n--) *d++ = *s++; }

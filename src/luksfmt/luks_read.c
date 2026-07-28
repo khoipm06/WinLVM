@@ -57,7 +57,7 @@ int winlvm_luks_read_header(const void *buf, size_t bufsz,
     }
 
     const unsigned char *p = (const unsigned char *)buf;
-    const char magic[6] = { 'L','U','K','S', (char)0xba, (char)0xbe };
+    const char magic[6] = { 'L','U','K','S', (char)(unsigned char)0xba, (char)(unsigned char)0xbe };
 
     if (WL_MEMCMP(p, magic, 6) != 0) {
         wl_set_err(err, "not a LUKS header (magic mismatch)");
