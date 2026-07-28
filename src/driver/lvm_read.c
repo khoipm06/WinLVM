@@ -14,7 +14,6 @@
  * the compiler's intrinsics resolve them to ntoskrnl's exports; that's fine.
  */
 #include "lvm_read.h"
-#include <stdio.h>
 
 #ifndef _KERNEL_MODE
 /* User-mode test build: use real mem*. */
@@ -200,8 +199,10 @@ static int read_mda_header(winlvm_byte_source *src, const winlvm_disk_area *area
     if (WL_MEMCMP(buf + 4, MDA_MAGIC, sizeof(MDA_MAGIC)) != 0) { wl_set_err(err, "mda_header magic mismatch"); return 0; }
     if (le32(buf + 20) != 1) { wl_set_err(err, "unsupported mda_header version"); return 0; }
 
-    /* raw_locn[0] == committed metadata. */
-    out->commit_offset = le64(buf + 40);  /* absolute on-disk offset */
+    /* raw_locn[0] == committed metadata.
+     * Per the LVM2 on-disk format, raw_locn.offset is RELATIVE to the
+     * metadata area start (mda.start), not an absolute disk offset. */
+    out->commit_offset = le64(buf + 40);  /* offset relative to mda.start */
     out->commit_size   = le64(buf + 48);
     out->commit_checksum = le32(buf + 56);
 
@@ -222,16 +223,17 @@ static int read_metadata_text(winlvm_byte_source *src, const winlvm_disk_area *a
                               size_t *text_len, winlvm_lvm_err *err) {
     /* The ring buffer occupies [area->offset + 512, area->offset + area->size).
      * A record that runs off the end wraps back to the start of that region.
-     * commit_offset is absolute on-disk; rel is its offset into the ring. */
+     * mda->commit_offset is relative to area->offset (the metadata area start). */
     uint64_t ring_begin = area->offset + MDA_HEADER_SIZE;
     uint64_t ring_size  = area->size - MDA_HEADER_SIZE;
-    uint64_t rel = mda->commit_offset - ring_begin;
+    uint64_t abs_commit_offset = area->offset + mda->commit_offset;
+    uint64_t rel = mda->commit_offset - MDA_HEADER_SIZE;
     if (mda->commit_size > ring_size) { wl_set_err(err, "metadata larger than the metadata area"); return 0; }
     uint64_t first = (mda->commit_size < ring_size - rel) ? mda->commit_size : (ring_size - rel);
     uint64_t wrapped = mda->commit_size - first;
 
     char *buf = text_out;
-    if (!src_read_full(src, mda->commit_offset, buf, (size_t)first)) {
+    if (!src_read_full(src, abs_commit_offset, buf, (size_t)first)) {
         wl_set_err(err, "failed reading metadata text"); return 0;
     }
     if (wrapped &&
@@ -700,16 +702,12 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
                 vg->pv_count = pvs_seen;
                 vg->lv_count = lvs_seen;
                 found_vg = 1;
-                fprintf(stderr, "DEBUG: found_vg=1\n");
-                fflush(stderr);
                 return 1;
             }
             /* Not the VG. Continue; we consumed its body above. Reset arrays. */
             pvs_seen = 0;
             lvs_seen = 0;
             wl_zero(vg, sizeof(*vg));
-            fprintf(stderr, "DEBUG: wl_zero vg done\n");
-            fflush(stderr);
         } else {
             /* key = value at root (preamble). skip it. */
             if (ps.pos < ps.len && ps.p[ps.pos] == '=') {
@@ -743,8 +741,6 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
     if (!err) return 0;
     err->failed = 0;
     wl_zero(vg, sizeof(*vg));
-    fprintf(stderr, "DEBUG: zeroed vg\n");
-    fflush(stderr);
 
     /* Step 1: label. */
     winlvm_pv_label label;
@@ -752,8 +748,6 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
     if (!read_pv_label(src, &label, err)) return 0;
 
     /* Step 2/3: walk every metadata area, take the first readable one. */
-    fprintf(stderr, "DEBUG: about to alloc text_buf\n");
-    fflush(stderr);
     char *text = (char *)0;
     /* Static buffer is fine for the test build; the driver allocates from
      * nonpaged pool and passes its own via a wrapper if it needs more. We
@@ -781,8 +775,6 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
         return 0;
     }
 
-    fprintf(stderr, "DEBUG: parsing step\n");
-    fflush(stderr);
     /* Step 4: parse. */
     if (!parse_vg(text, text_len, vg, &label, 0, 0)) {
         wl_set_err(err, "no volume group section in metadata");

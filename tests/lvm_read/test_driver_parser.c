@@ -64,7 +64,6 @@ int main(int argc, char **argv) {
 
         winlvm_volume_group vg;
         winlvm_lvm_err err = {0};
-        fprintf(stderr, "TEST DEBUG: Before winlvm_read_vg\n");
         if (!winlvm_read_vg(&src, &vg, &err)) {
             fprintf(stderr, "[%s] parser failed: %s\n", c->case_name, err.message);
             fail++;
@@ -72,7 +71,6 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        fprintf(stderr, "TEST DEBUG: After winlvm_read_vg\n");
         printf("[%s] VG=%s seqno=%lu extents=%lu PVs=%lu LVs=%lu\n",
                c->case_name, vg.name, (unsigned long)vg.seqno,
                (unsigned long)vg.extent_size_sectors,
