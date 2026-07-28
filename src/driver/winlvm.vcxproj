@@ -51,17 +51,21 @@
     <ClCompile>
       <WppEnabled>false</WppEnabled>
       <LanguageStandard>stdcpp14</LanguageStandard>
-      <PreprocessorDefinitions>_KERNEL_MODE;%(PreprocessorDefinitions</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
    </ClCompile>
     <Link>
-      <AdditionalDependencies>ntoskrnl.lib;hal.lib;%(AdditionalDependencies</AdditionalDependencies>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;%(AdditionalDependencies)</AdditionalDependencies>
    </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
    </DriverSign>
  </ItemDefinitionGroup>
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
+ </ItemGroup>
   <ItemGroup>
     <Inf Include="winlvm.inf" />
  </ItemGroup>

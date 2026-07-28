@@ -754,6 +754,7 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
     text = (char *)text_buf;
 
     winlvm_lvm_err local_err;
+    wl_zero(&local_err, sizeof(local_err));
     int got_text = 0;
     size_t text_len = 0;
     for (size_t i = 0; i < WINLVM_MAX_MD_AREAS && label.metadata_areas[i].size != 0; i++) {

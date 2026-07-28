@@ -1,6 +1,7 @@
 /*
  * winlvm.c — DriverEntry, CDO, PnP notification, and LV PDO creation.
  */
+#include <initguid.h>
 #include "winlvm.h"
 
 PDEVICE_OBJECT g_cdo = NULL;
@@ -91,7 +92,7 @@ NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 
-    if (ext->vg->vg.seqno == 0 && !IsListEmpty(&ext->vg->volume_ifname)) {
+    if (ext->vg->vg.seqno == 0 && ext->vg->volume_ifname.Length == 0) {
         /* Defensive check: if we have not parsed a VG (seqno==0 is the
          * value zero-initialised CDO extension falls back to), refuse. */
         Irp->IoStatus.Status = STATUS_NO_MEDIA;
