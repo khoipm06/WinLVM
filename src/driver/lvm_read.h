@@ -31,6 +31,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../winlvm_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,17 +40,6 @@ extern "C" {
 /* Pool tag driver side uses for metadata buffers. mirrored from the C++
  * library's own kPoolTag constant. */
 #define WINLVM_LVM_TAG ((unsigned long)'WMLV')
-
-/* A read-only, randomly-addressable byte source. The driver backs this with
- * IRP_MJ_READ down to the physical disk; the user-mode test backs it with
- * CreateFile/ReadFile. read() returns the number of bytes read, or 0 on
- * short read / failure. */
-typedef struct winlvm_byte_source {
-    /* opaque handle the impl dereferences in read() */
-    void *impl;
-    uint64_t size;                       /* total bytes available */
-    size_t (*read)(void *impl, uint64_t offset, void *buf, size_t len);
-} winlvm_byte_source;
 
 /* On-disk size limits we refuse to exceed. LVM's default MDA is 1 MiB. */
 #define WINLVM_MAX_MD_AREAS    64

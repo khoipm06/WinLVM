@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../winlvm_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -79,11 +81,15 @@ typedef struct {
     char     encryption[64];
 } winlvm_luks_segment;
 
+#define WL_LUKS_B64_MAX 128   /* base64 chars we store per field */
+
 /* LUKS2 digest entry. From luks2_digest.c: type/segments/keyslots.
  * Subtype (pbkdf2, etc.) carries hash/iterations/salt/digest. */
 typedef struct {
     char     type[64];
     winlvm_luks_kdf kdf;
+    char     salt_b64[WL_LUKS_B64_MAX];
+    char     digest_b64[WL_LUKS_B64_MAX];
 } winlvm_luks_digest;
 
 /* LUKS2 keyslot. From luks2_keyslot.c: type/priority/kdf/area(offset,size) */
@@ -93,6 +99,12 @@ typedef struct {
     winlvm_luks_kdf kdf;
     uint64_t area_offset;
     uint64_t area_size;
+    uint64_t key_size;            /* volume-key bytes (64 for XTS-AES-256) */
+    char     kdf_salt_b64[WL_LUKS_B64_MAX];
+    /* Anti-forensic splitter, af: { type, stripes, hash } */
+    char     af_type[64];         /* "luks1" */
+    uint64_t af_stripes;          /* 4000 by default */
+    char     af_hash[64];         /* "sha256" */
 } winlvm_luks_keyslot;
 
 /* Top-level parsed metadata. */
@@ -108,11 +120,6 @@ typedef struct {
 /* Read & validate the primary 4096-byte binary header.
  * Returns 1 on success, 0 on error.
  * Bytes are read using the caller-supplied src. */
-typedef struct {
-    void *impl;
-    uint64_t size;
-    size_t (*read)(void *impl, uint64_t offset, void *buf, size_t len);
-} winlvm_byte_source;
 
 int winlvm_luks_read_header(winlvm_byte_source *src,
                             uint64_t hdr_offset,

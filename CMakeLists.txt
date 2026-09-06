@@ -93,6 +93,49 @@ if(ZSTD_EXE)
     add_dependencies(winlvm_luks_tests corpus)
   endif()
   add_test(NAME winlvm_luks_tests COMMAND winlvm_luks_tests "${CORPUS_OUT}/luks2-default.img")
+
+  # LUKS2 full-chain unlock test (Stage 4): PBKDF2 keyslot + AF merge +
+  # digest verify + XTS sector decrypt against the pbkdf2 corpus image.
+  add_executable(winlvm_luks_unlock_tests
+    tests/luks_read/test_luks_unlock.c
+    src/luksfmt/luks_read.c
+    src/luksfmt/luks_unlock.c
+    src/crypto/wl_sha256.c
+    src/crypto/wl_aes_xts.c
+  )
+  target_include_directories(winlvm_luks_unlock_tests PRIVATE src/luksfmt src/crypto)
+  if(TARGET corpus)
+    add_dependencies(winlvm_luks_unlock_tests corpus)
+  endif()
+  add_test(NAME winlvm_luks_unlock_tests COMMAND winlvm_luks_unlock_tests "${CORPUS_OUT}/luks2-pbkdf2.img")
+
+  # LUKS+LVM integration: unlock container, parse PV, hash LV vs oracle.
+  add_executable(winlvm_luks_lvm_chain_tests
+    tests/luks_read/test_luks_lvm_chain.c
+    src/luksfmt/luks_read.c
+    src/luksfmt/luks_unlock.c
+    src/driver/lvm_read.c
+    src/crypto/wl_sha256.c
+    src/crypto/wl_aes_xts.c
+  )
+  target_include_directories(winlvm_luks_lvm_chain_tests PRIVATE
+    src/luksfmt src/crypto src/driver)
+  if(TARGET corpus)
+    add_dependencies(winlvm_luks_lvm_chain_tests corpus)
+  endif()
+  add_test(NAME winlvm_luks_lvm_chain_tests
+    COMMAND winlvm_luks_lvm_chain_tests
+            "${CORPUS_OUT}/luks2-pbkdf2.img"
+            "${CORPUS_SRC}/expected")
+
+  # Crypto known-answer tests (SHA-256/HMAC/PBKDF2/AES/XTS).
+  add_executable(winlvm_crypto_tests
+    tests/crypto/test_crypto.c
+    src/crypto/wl_sha256.c
+    src/crypto/wl_aes_xts.c
+  )
+  target_include_directories(winlvm_crypto_tests PRIVATE src/crypto)
+  add_test(NAME winlvm_crypto_tests COMMAND winlvm_crypto_tests)
 endif()
 enable_testing()
 

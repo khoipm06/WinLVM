@@ -210,6 +210,28 @@ static int jp_read_int(json_parser *jp, uint64_t *out) {
     return 1;
 }
 
+/* LUKS2 JSON encodes several integers as strings — segment offset/size
+ * ("16777216", "dynamic"), keyslot area offset/size, iv_tweak — while
+ * sector_size and iterations are plain numbers. cryptsetup's
+ * luks2_json_bias_number_* accept both forms; so must we. */
+static int jp_read_int_or_string(json_parser *jp, uint64_t *out) {
+    jp_skip_ws(jp);
+    if (jp->pos < jp->len && jp->p[jp->pos] == '"') {
+        char tmp[32];
+        if (!jp_read_string(jp, tmp, sizeof(tmp))) return 0;
+        /* "dynamic" and other non-numeric strings decode to 0; the caller
+         * treats size==0 as whole-device per luks2_segment.c. */
+        uint64_t v = 0;
+        for (size_t i = 0; tmp[i]; i++) {
+            if (tmp[i] < '0' || tmp[i] > '9') return 1;
+            v = v * 10 + (uint64_t)(tmp[i] - '0');
+        }
+        *out = v;
+        return 1;
+    }
+    return jp_read_int(jp, out);
+}
+
 /* Skip a JSON value of any shape. */
 static int jp_skip_value(json_parser *jp) {
     jp_skip_ws(jp);
@@ -272,8 +294,11 @@ static int jp_next_kv(json_parser *jp, char *out_key, size_t out_cap) {
 }
 
 /* Parse a kdf sub-object, which holds type/hash/iterations/time/memory/cpus.
- * Per luks2_keyslot.c / luks2_digest.c. */
+ * Per luks2_keyslot.c / luks2_digest.c. Consumes the opening '{' itself. */
 static void parse_kdf(json_parser *jp, winlvm_luks_kdf *kdf) {
+    jp_skip_ws(jp);
+    if (jp->pos >= jp->len || jp->p[jp->pos] != '{') return;
+    jp->pos++;
     char key[64];
     while (jp_next_kv(jp, key, sizeof(key))) {
         if (!strcmp(key, "type")) jp_read_string(jp, kdf->type, sizeof(kdf->type));
@@ -282,44 +307,85 @@ static void parse_kdf(json_parser *jp, winlvm_luks_kdf *kdf) {
         else if (!strcmp(key, "time")) jp_read_int(jp, &kdf->time);
         else if (!strcmp(key, "memory")) jp_read_int(jp, &kdf->memory);
         else if (!strcmp(key, "cpus")) jp_read_int(jp, &kdf->cpus);
+        else if (!strcmp(key, "salt")) jp_skip_value(jp);
         else jp_skip_value(jp);
     }
     if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
 }
 
 /* Parse a segment object: { type, offset, size, iv_tweak, encryption,
- * sector_size }. Per luks2_segment.c. */
+ * sector_size }. Per luks2_segment.c. Consumes the opening '{' itself. */
 static void parse_segment(json_parser *jp, winlvm_luks_segment *seg) {
+    jp_skip_ws(jp);
+    if (jp->pos >= jp->len || jp->p[jp->pos] != '{') return;
+    jp->pos++;
     char key[64];
     while (jp_next_kv(jp, key, sizeof(key))) {
         if (!strcmp(key, "type")) jp_read_string(jp, seg->type, sizeof(seg->type));
-        else if (!strcmp(key, "offset")) jp_read_int(jp, &seg->offset);
-        else if (!strcmp(key, "size")) jp_read_int(jp, &seg->size);
-        else if (!strcmp(key, "iv_tweak")) jp_read_int(jp, &seg->iv_tweak);
+        else if (!strcmp(key, "offset")) jp_read_int_or_string(jp, &seg->offset);
+        else if (!strcmp(key, "size")) jp_read_int_or_string(jp, &seg->size);
+        else if (!strcmp(key, "iv_tweak")) jp_read_int_or_string(jp, &seg->iv_tweak);
         else if (!strcmp(key, "encryption")) jp_read_string(jp, seg->encryption, sizeof(seg->encryption));
-        else if (!strcmp(key, "sector_size")) jp_read_int(jp, &seg->sector_size);
+        else if (!strcmp(key, "sector_size")) jp_read_int_or_string(jp, &seg->sector_size);
         else jp_skip_value(jp);
     }
     if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
 }
 
-/* Parse a keyslot object: { type, priority, kdf: {...}, area: {...} }. */
+/* Parse a kdf sub-object. The keyslot flavor captures the KDF salt (needed
+ * for keyslot unlock); the digest flavor captures salt+digest. */
+static void parse_keyslot_kdf(json_parser *jp, winlvm_luks_keyslot *ks) {
+    jp_skip_ws(jp);
+    if (jp->pos >= jp->len || jp->p[jp->pos] != '{') return;
+    jp->pos++;
+    char key[64];
+    while (jp_next_kv(jp, key, sizeof(key))) {
+        if (!strcmp(key, "type")) jp_read_string(jp, ks->kdf.type, sizeof(ks->kdf.type));
+        else if (!strcmp(key, "hash")) jp_read_string(jp, ks->kdf.hash, sizeof(ks->kdf.hash));
+        else if (!strcmp(key, "iterations")) jp_read_int(jp, &ks->kdf.iterations);
+        else if (!strcmp(key, "time")) jp_read_int(jp, &ks->kdf.time);
+        else if (!strcmp(key, "memory")) jp_read_int(jp, &ks->kdf.memory);
+        else if (!strcmp(key, "cpus")) jp_read_int(jp, &ks->kdf.cpus);
+        else if (!strcmp(key, "salt")) jp_read_string(jp, ks->kdf_salt_b64, sizeof(ks->kdf_salt_b64));
+        else jp_skip_value(jp);
+    }
+    if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
+}
+
+/* Parse a keyslot object: { type, priority, kdf: {...}, area: {...} }.
+ * Consumes the opening '{' itself. */
 static void parse_keyslot(json_parser *jp, winlvm_luks_keyslot *ks) {
+    jp_skip_ws(jp);
+    if (jp->pos >= jp->len || jp->p[jp->pos] != '{') return;
+    jp->pos++;
     char key[64];
     while (jp_next_kv(jp, key, sizeof(key))) {
         if (!strcmp(key, "type")) jp_read_string(jp, ks->type, sizeof(ks->type));
         else if (!strcmp(key, "priority")) jp_read_int(jp, &ks->priority);
+        else if (!strcmp(key, "key_size")) jp_read_int(jp, &ks->key_size);
         else if (!strcmp(key, "kdf")) {
+            parse_keyslot_kdf(jp, ks);
+        } else if (!strcmp(key, "af")) {
             jp_skip_ws(jp);
-            if (jp->pos < jp->len && jp->p[jp->pos] == '{') { jp->pos++; parse_kdf(jp, &ks->kdf); }
+            if (jp->pos < jp->len && jp->p[jp->pos] == '{') {
+                jp->pos++;
+                char k2[64];
+                while (jp_next_kv(jp, k2, sizeof(k2))) {
+                    if (!strcmp(k2, "type")) jp_read_string(jp, ks->af_type, sizeof(ks->af_type));
+                    else if (!strcmp(k2, "stripes")) jp_read_int(jp, &ks->af_stripes);
+                    else if (!strcmp(k2, "hash")) jp_read_string(jp, ks->af_hash, sizeof(ks->af_hash));
+                    else jp_skip_value(jp);
+                }
+                if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
+            }
         } else if (!strcmp(key, "area")) {
             jp_skip_ws(jp);
             if (jp->pos < jp->len && jp->p[jp->pos] == '{') {
                 jp->pos++;
                 char k2[64];
                 while (jp_next_kv(jp, k2, sizeof(k2))) {
-                    if (!strcmp(k2, "offset")) jp_read_int(jp, &ks->area_offset);
-                    else if (!strcmp(k2, "size")) jp_read_int(jp, &ks->area_size);
+                    if (!strcmp(k2, "offset")) jp_read_int_or_string(jp, &ks->area_offset);
+                    else if (!strcmp(k2, "size")) jp_read_int_or_string(jp, &ks->area_size);
                     else jp_skip_value(jp);
                 }
                 if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
@@ -329,17 +395,19 @@ static void parse_keyslot(json_parser *jp, winlvm_luks_keyslot *ks) {
     if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
 }
 
-/* Parse a digest object: { type, keyslots: [...], segments: [...], ... }. */
+/* Parse a digest object: { type, keyslots: [...], segments: [...], ... }.
+ * Consumes the opening '{' itself. */
 static void parse_digest(json_parser *jp, winlvm_luks_digest *d) {
+    jp_skip_ws(jp);
+    if (jp->pos >= jp->len || jp->p[jp->pos] != '{') return;
+    jp->pos++;
     char key[64];
     while (jp_next_kv(jp, key, sizeof(key))) {
         if (!strcmp(key, "type")) jp_read_string(jp, d->type, sizeof(d->type));
         else if (!strcmp(key, "hash")) jp_read_string(jp, d->kdf.hash, sizeof(d->kdf.hash));
         else if (!strcmp(key, "iterations")) jp_read_int(jp, &d->kdf.iterations);
-        else if (!strcmp(key, "salt")) jp_skip_value(jp);
-        else if (!strcmp(key, "digest")) jp_skip_value(jp);
-        else if (!strcmp(key, "keyslots")) jp_skip_value(jp);
-        else if (!strcmp(key, "segments")) jp_skip_value(jp);
+        else if (!strcmp(key, "salt")) jp_read_string(jp, d->salt_b64, sizeof(d->salt_b64));
+        else if (!strcmp(key, "digest")) jp_read_string(jp, d->digest_b64, sizeof(d->digest_b64));
         else jp_skip_value(jp);
     }
     if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
@@ -393,7 +461,6 @@ int winlvm_luks_read_metadata(winlvm_byte_source *src,
     char key[64];
     while (jp_next_kv(&jp, key, sizeof(key))) {
         if (!strcmp(key, "segments")) {
-            /* "{ "0": { ... }, "1": { ... } }" */
             jp_skip_ws(&jp);
             if (jp.pos < jp.len && jp.p[jp.pos] == '{') { jp.pos++;
                 char sub[64];
