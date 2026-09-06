@@ -392,6 +392,7 @@ static void p_stripes(parser *ps, winlvm_segment *seg) {
                 }
                 i++;
             } else {
+                seg->stripe_overflow = 1;
                 /* drain the rest */
                 while (ps->pos < ps->len && ps->p[ps->pos] != ']') ps->pos++;
                 if (ps->pos < ps->len) ps->pos++;
@@ -422,9 +423,15 @@ static void parse_segment(parser *ps, winlvm_segment *seg) {
             else if (wl_streq(key, "extent_count")) p_int(ps, &seg->extent_count);
             else if (wl_streq(key, "stripe_count")) p_int(ps, &seg->stripe_count);
             else if (wl_streq(key, "stripe_size")) { uint64_t v; p_int(ps, &v); }
+            else if (wl_streq(key, "origin")) p_string(ps, seg->origin, sizeof(seg->origin));
             else if (wl_streq(key, "type")) {
+                /* On-disk LVM2 metadata writes segment types as quoted
+                 * strings ("thin", "raid1", "striped", ...). Accept a bare
+                 * identifier too for vgcfgbackup-style text. Fail closed:
+                 * anything unrecognized stays WINLVM_SEG_OTHER and the LV
+                 * is refused rather than mapped as linear. */
                 char t[32];
-                if (p_ident(ps, t, sizeof(t))) {
+                if (p_string(ps, t, sizeof(t)) || p_ident(ps, t, sizeof(t))) {
                     if (wl_streq(t, "striped") || wl_streq(t, "linear"))
                         seg->type = WINLVM_SEG_STRIPED;
                     else
@@ -472,7 +479,7 @@ static void parse_lv_body(parser *ps, winlvm_logical_volume *lv) {
         if (ps->pos < ps->len && ps->p[ps->pos] == '=') {
             ps->pos++;
             p_skip(ps);
-            if (wl_streq(key, "segment_count")) { uint64_t v; p_int(ps, &v); }
+            if (wl_streq(key, "segment_count")) { uint64_t v; p_int(ps, &v); lv->declared_segment_count = v; }
             else if (wl_streq(key, "status")) {
                 /* status = ["READ", "WRITE", "VISIBLE"] */
                 if (ps->pos < ps->len && ps->p[ps->pos] == '[') {
@@ -509,11 +516,14 @@ static void parse_lv_body(parser *ps, winlvm_logical_volume *lv) {
             if (lv->segment_count < (sizeof(lv->segments) / sizeof(lv->segments[0]))) {
                 winlvm_segment *seg = &lv->segments[lv->segment_count];
                 wl_zero(seg, sizeof(*seg));
-                seg->type = WINLVM_SEG_STRIPED;
+                /* Fail closed: an unreadable or missing type key must leave
+                 * the segment unmappable, never silently linear. */
+                seg->type = WINLVM_SEG_OTHER;
                 seg->stripe_count = 1;
                 parse_segment(ps, seg);
                 lv->segment_count++;
             } else {
+                lv->segment_overflow = 1;
                 p_skip_section(ps);
             }
         } else {
@@ -647,6 +657,7 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
                                     wl_strcpy(pv->key, sizeof(pv->key), pvkey);
                                     parse_pv_body(&ps, pv);
                                 } else {
+                                    vg->pv_overflow = 1;
                                     p_skip_section(&ps);
                                 }
                             } else {
@@ -669,12 +680,17 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
                                     parse_lv_body(&ps, lv);
                                     /* mark mappable: visible + all segments striped + has segments */
                                     lv->mappable = 1;
-                                    if (!lv->visible) lv->mappable = 0;
+                                    if (!lv->visible) { lv->mappable = 0; wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "hidden internal LV"); }
                                     if (lv->segment_count == 0) { lv->mappable = 0; wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "no segments"); }
+                                    if (lv->segment_overflow) { lv->mappable = 0; wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "too many segments"); }
                                     for (size_t k = 0; k < lv->segment_count && lv->mappable; k++) {
                                         if (lv->segments[k].type != WINLVM_SEG_STRIPED) { lv->mappable = 0; wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "unsupported segment type"); }
+                                        else if (lv->segments[k].stripe_overflow) { lv->mappable = 0; wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "too many stripes"); }
                                     }
                                 } else {
+                                    /* Record the overflow and still consume the
+                                     * body so the parse position stays valid. */
+                                    vg->lv_overflow = 1;
                                     p_skip_section(&ps);
                                 }
                             } else {
@@ -696,6 +712,38 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
             }
 
             if (has_id && has_extent) {
+                /* Second pass, mirroring lvmfmt's collect_references: an LV
+                 * named as some segment's 'origin' is a snapshot origin. Its
+                 * extents describe the origin device, but the live mapping is
+                 * a snapshot-origin target — mapping the extents directly
+                 * bypasses copy-on-write and would destroy the snapshot. */
+                for (size_t a = 0; a < lvs_seen; a++) {
+                    if (!vg->lvs[a].mappable) continue;
+                    for (size_t b = 0; b < lvs_seen; b++) {
+                        for (size_t s = 0; s < vg->lvs[b].segment_count; s++) {
+                            if (vg->lvs[b].segments[s].origin[0] &&
+                                wl_streq(vg->lvs[b].segments[s].origin, vg->lvs[a].name)) {
+                                vg->lvs[a].mappable = 0;
+                                wl_strcpy(vg->lvs[a].unsupported_reason,
+                                          sizeof(vg->lvs[a].unsupported_reason),
+                                          "logical volume is the origin of a snapshot");
+                            }
+                        }
+                    }
+                }
+                /* A dropped LV could have been a snapshot origin or an
+                 * internal sub-volume; mapping anything from a truncated VG
+                 * is unsafe. Refuse every LV, keep the reason on each. */
+                if (vg->lv_overflow || vg->pv_overflow) {
+                    for (size_t a = 0; a < lvs_seen; a++) {
+                        if (vg->lvs[a].mappable) {
+                            vg->lvs[a].mappable = 0;
+                            wl_strcpy(vg->lvs[a].unsupported_reason,
+                                      sizeof(vg->lvs[a].unsupported_reason),
+                                      vg->lv_overflow ? "volume group has too many LVs" : "volume group has too many PVs");
+                        }
+                    }
+                }
                 wl_strcpy(vg->id, sizeof(vg->id), id);
                 vg->seqno = seqno;
                 vg->extent_size_sectors = extent_size;

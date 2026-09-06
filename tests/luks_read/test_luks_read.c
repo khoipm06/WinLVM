@@ -5,11 +5,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WL_FSEEK64 _fseeki64
+#define WL_FTELL64 _ftelli64
+#else
+#define WL_FSEEK64 fseeko
+#define WL_FTELL64 ftello
+#endif
+
 #include "luks_read.h"
 
 static size_t file_read(void *impl, uint64_t offset, void *buf, size_t len) {
     FILE *f = (FILE *)impl;
-    if (_fseeki64(f, (int64_t)offset, SEEK_SET) != 0) return 0;
+    if (WL_FSEEK64(f, (int64_t)offset, SEEK_SET) != 0) return 0;
     return fread(buf, 1, len, f);
 }
 
@@ -25,9 +33,9 @@ int main(int argc, char **argv) {
         perror(img_path);
         return 1;
     }
-    _fseeki64(f, 0, SEEK_END);
-    uint64_t image_size = (uint64_t)_ftelli64(f);
-    _fseeki64(f, 0, SEEK_SET);
+    WL_FSEEK64(f, 0, SEEK_END);
+    uint64_t image_size = (uint64_t)WL_FTELL64(f);
+    WL_FSEEK64(f, 0, SEEK_SET);
 
     winlvm_byte_source src = {
         .impl = f,

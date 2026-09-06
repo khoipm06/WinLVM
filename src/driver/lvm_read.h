@@ -96,6 +96,8 @@ typedef struct {
     uint64_t      stripe_count;
     winlvm_stripe stripes[4];     /* LVM supports up to a handful in practice */
     size_t        stripe_count_used;
+    char          origin[64];     /* snapshot segments: name of the origin LV */
+    int           stripe_overflow;   /* more stripes than stripes[] holds */
 } winlvm_segment;
 
 /* Per-LV in-memory record. */
@@ -107,6 +109,8 @@ typedef struct {
     char     unsupported_reason[64];
     winlvm_segment segments[16];
     size_t   segment_count;
+    uint64_t declared_segment_count;  /* segment_count = N from metadata */
+    int      segment_overflow;        /* more segments than segments[] holds */
 } winlvm_logical_volume;
 
 /* Per-PV record. */
@@ -128,8 +132,10 @@ typedef struct {
     uint64_t extent_size_sectors;
     winlvm_physical_volume pvs[8];
     size_t   pv_count;
-    winlvm_logical_volume lvs[8];
+    winlvm_logical_volume lvs[16];
     size_t   lv_count;
+    int      lv_overflow;            /* more LVs than lvs[] holds */
+    int      pv_overflow;            /* more PVs than pvs[] holds */
 } winlvm_volume_group;
 
 /* Error reporting. 0 = OK; non-zero = failure with a short message. */
