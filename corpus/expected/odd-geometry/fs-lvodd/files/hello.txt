@@ -1,0 +1,5 @@
+Hello from WinLVM corpus generator
+LV: lvodd
+VG: vgodd
+Case: odd-geometry
+This file is verification data for the WinLVM driver.

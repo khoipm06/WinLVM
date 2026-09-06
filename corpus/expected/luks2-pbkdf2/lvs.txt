@@ -1,2 +1,2 @@
   VG     LV     LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges                Devices                
-  vgboot lvboot dOqpfZ-rtyM-hUqN-2q1E-24NT-nXJR-7Tn2kT 16777216     0     4 linear    1      0 /dev/mapper/wl_luks2:0-3 /dev/mapper/wl_luks2(0)
+  vgboot lvboot Onj47j-Vtdt-enJP-EMYO-D8eZ-Ctah-p84yPJ 16777216     0     4 linear    1      0 /dev/mapper/wl_luks2:0-3 /dev/mapper/wl_luks2(0)

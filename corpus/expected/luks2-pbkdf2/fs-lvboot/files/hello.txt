@@ -1,0 +1,5 @@
+Hello from WinLVM corpus generator
+LV: lvboot
+VG: vgboot
+Case: luks2-pbkdf2
+This file is verification data for the WinLVM driver.

@@ -1,1 +1,1 @@
-vgboot-lvboot: 0 32768 linear 252:0 2048
+vgboot-lvboot: 0 32768 linear 252:3 2048

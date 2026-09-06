@@ -1,1 +1,1 @@
-vg4k-lv4k: 0 32768 linear 7:8 2048
+vg4k-lv4k: 0 32768 linear 7:6 2048

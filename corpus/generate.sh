@@ -12,9 +12,9 @@
 # devices backed by files in its own images/ directory. It will not disturb
 # anything else on the machine.
 #
-# Requires: lvm2, cryptsetup, python3, zstd, coreutils, util-linux.
+# Requires: lvm2, cryptsetup, python3, zstd, coreutils, util-linux, e2fsprogs.
 # On SystemRescue / Arch everything is present. On Ubuntu live:
-#   sudo apt update && sudo apt install -y lvm2 cryptsetup-bin zstd
+#   sudo apt update && sudo apt install -y lvm2 cryptsetup-bin zstd e2fsprogs
 
 set -Eeuo pipefail
 
@@ -24,7 +24,7 @@ ORIGINAL_HOME=$(eval echo "~$ORIGINAL_USER")
 
 OUT="${1:-$(dirname "$(readlink -f "$0")")}"
 if [[ -n "${WORK:-}" ]]; then
-    : 
+    :
 elif [[ -d "$ORIGINAL_HOME/disk" && -w "$ORIGINAL_HOME/disk" ]]; then
     WORK="$ORIGINAL_HOME/disk/winlvm-corpus-work"
 else
@@ -62,7 +62,7 @@ LVMCONF
 SMALL=128M
 # Ciphertext is incompressible, so LUKS images dominate the corpus size: a
 # stock LUKS2 header wipes a 16 MiB keyslots area with random data, and every
-# stamped byte of the LV becomes ciphertext. Keep these lean.
+# written byte of the LV becomes ciphertext. Keep these lean.
 LUKS_SZ=128M
 LUKS_LV=16M
 
@@ -148,7 +148,7 @@ cleanup_and_exit() {
 trap cleanup_and_exit EXIT
 
 [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
-for t in lvm cryptsetup python3 zstd losetup blockdev; do
+for t in lvm cryptsetup python3 zstd losetup blockdev mkfs.ext4; do
   command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }
 done
 
@@ -177,56 +177,108 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# Sector stamping.
+# Example data.
 #
-# Each 512-byte sector of an LV gets: magic, the LV's own sector index, and the
-# LV name. A Windows-side read of LV sector N can then assert it actually
-# landed on sector N, which localises mapping bugs instead of merely detecting
-# them.
+# Each LV gets an ext4 filesystem with a known set of files. This serves as
+# verification data: the Windows driver reads the LV and checks whether these
+# files are intact. If the read path works, the mapping must be correct.
+#
+# Files written:
+#   hello.txt          — text identification (LV/VG/case name)
+#   pattern-1k.bin     — 1024 bytes of repeating LV name
+#   pattern-4k.bin     — 4096 bytes of repeating LV name (page-aligned)
+#   random-1m.bin      — 1 MiB of deterministic pseudo-random data (SHA-256
+#                         chain seeded by LV name, reproducible across runs)
+#   subdir/nested/deep.txt — nested directory structure
 # ---------------------------------------------------------------------------
-stamp() {
-  local dev="$1" name="$2"
-  python3 - "$dev" "$name" <<'PY'
-import os, struct, sys
-dev, name = sys.argv[1], sys.argv[2].encode()[:32]
-SEC = 512
+write_example_data() {
+  local dev="$1" lv_name="$2" vg_name="$3" case_name="$4"
+  local mnt
+  mnt=$(mktemp -d)
 
-def rec(s):
-    return (b'WINLVMS\x00' + struct.pack('<Q', s) + name).ljust(SEC, b'\x00')
+  # -F: force (skip "is a whole device" prompt)
+  # -m 0: no reserved blocks (not needed for test data)
+  mkfs.ext4 -q -F -m 0 -L "wl-$lv_name" "$dev" >/dev/null 2>&1
+  mount "$dev" "$mnt"
 
-fd = os.open(dev, os.O_WRONLY)
-try:
-    total = os.lseek(fd, 0, os.SEEK_END); os.lseek(fd, 0, os.SEEK_SET)
-    n = total // SEC
-    CHUNK = 4096
-    for base in range(0, n, CHUNK):
-        buf = bytearray()
-        for s in range(base, min(base + CHUNK, n)):
-            buf += rec(s)
-        os.write(fd, bytes(buf))
-    os.fsync(fd)
-finally:
-    os.close(fd)
+  python3 - "$mnt" "$lv_name" "$vg_name" "$case_name" <<'PY'
+import os, sys, hashlib
 
-# Read back through a freshly-opened descriptor so the check goes to the device
-# rather than page cache we just wrote. Without this a case can "pass" having
-# verified nothing at all.
-fd = os.open(dev, os.O_RDONLY | getattr(os, 'O_DIRECT', 0) & 0)
-try:
-    bad = []
-    for s in (0, n // 3, n // 2, n - 1):
-        if s < 0: continue
-        os.lseek(fd, s * SEC, os.SEEK_SET)
-        got = os.read(fd, SEC)
-        if got != rec(s):
-            bad.append(s)
-finally:
-    os.close(fd)
-if bad:
-    print(f"    !! stamp readback MISMATCH at sectors {bad} on {dev}", file=sys.stderr)
-    sys.exit(1)
-print(f"    stamped + verified {n} sectors ({n*SEC} bytes) on {dev}")
+mnt, lv, vg, case_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+# 1. hello.txt — human-readable identification
+with open(os.path.join(mnt, 'hello.txt'), 'w') as f:
+    f.write('Hello from WinLVM corpus generator\n')
+    f.write(f'LV: {lv}\n')
+    f.write(f'VG: {vg}\n')
+    f.write(f'Case: {case_name}\n')
+    f.write('This file is verification data for the WinLVM driver.\n')
+
+# 2. pattern-1k.bin — 1024 bytes of repeating LV name
+name = lv.encode()
+with open(os.path.join(mnt, 'pattern-1k.bin'), 'wb') as f:
+    f.write((name * ((1024 // len(name)) + 1))[:1024])
+
+# 3. pattern-4k.bin — 4096 bytes of repeating LV name (page-aligned boundary)
+with open(os.path.join(mnt, 'pattern-4k.bin'), 'wb') as f:
+    f.write((name * ((4096 // len(name)) + 1))[:4096])
+
+# 4. random-1m.bin — deterministic pseudo-random via SHA-256 chain
+block = f'winlvm-{lv}-seed'.encode()
+data = bytearray()
+for _ in range(32768):  # 32768 * 32 bytes = 1,048,576 = 1 MiB
+    block = hashlib.sha256(block).digest()
+    data.extend(block)
+with open(os.path.join(mnt, 'random-1m.bin'), 'wb') as f:
+    f.write(bytes(data[:1048576]))
+
+# 5. Directory structure
+nested = os.path.join(mnt, 'subdir', 'nested')
+os.makedirs(nested)
+with open(os.path.join(nested, 'deep.txt'), 'w') as f:
+    f.write(f'nested file in {lv}\n')
 PY
+
+  sync
+  umount "$mnt"
+  rmdir "$mnt"
+  echo "    wrote example data on ext4 ($lv_name)"
+}
+
+# ---------------------------------------------------------------------------
+# Filesystem oracle capture. Mounts the LV read-only and records what files
+# are present and their checksums, so the Windows test harness has an exact
+# specification of what to expect.
+# ---------------------------------------------------------------------------
+capture_fs_oracles() {  # case_name vg lv
+  local case_name="$1" vg="$2" lv="$3"
+  local dev="/dev/$vg/$lv"
+  local d="$EXP_DIR/$case_name/fs-$lv"
+  mkdir -p "$d/files"
+
+  local mnt
+  mnt=$(mktemp -d)
+  mount -o ro "$dev" "$mnt"
+
+  # File listing (relative paths, sorted)
+  (cd "$mnt" && find . \( -type f -o -type d \) ! -path './lost+found' ! -path './lost+found/*' | sort) > "$d/listing.txt"
+
+  # SHA-256 checksums of all regular files
+  (cd "$mnt" && find . -type f ! -path './lost+found/*' | sort | while read -r f; do
+    sha256sum "$f"
+  done) > "$d/checksums.txt"
+
+  # Copy small files for byte-exact comparison on the Windows side
+  cp "$mnt/hello.txt" "$d/files/" 2>/dev/null || true
+  cp "$mnt/pattern-1k.bin" "$d/files/" 2>/dev/null || true
+  if [[ -f "$mnt/subdir/nested/deep.txt" ]]; then
+    mkdir -p "$d/files/subdir/nested"
+    cp "$mnt/subdir/nested/deep.txt" "$d/files/subdir/nested/"
+  fi
+
+  umount "$mnt"
+  rmdir "$mnt"
+  echo "    captured fs oracles -> expected/$case_name/fs-$lv/"
 }
 
 # Assert the oracle files a case is supposed to produce actually exist and are
@@ -243,40 +295,35 @@ verify_oracles() {
   return 0
 }
 
-# Read-only stamp check against a device.
-check_stamp() {
-  local dev="$1" name="$2"
-  python3 - "$dev" "$name" <<'PY'
-import os, struct, sys
-dev, name = sys.argv[1], sys.argv[2].encode()[:32]
-SEC = 512
-def rec(s): return (b'WINLVMS\x00' + struct.pack('<Q', s) + name).ljust(SEC, b'\x00')
-fd = os.open(dev, os.O_RDONLY)
-try:
-    n = os.lseek(fd, 0, os.SEEK_END) // SEC
-    bad = []
-    for s in (0, n // 2, n - 1):
-        os.lseek(fd, s * SEC, os.SEEK_SET)
-        if os.read(fd, SEC) != rec(s): bad.append(s)
-finally:
-    os.close(fd)
-if bad:
-    print(f"    !! stamp mismatch at sectors {bad}", file=sys.stderr); sys.exit(1)
-print(f"    stamp verified on {dev} ({n} sectors)")
-PY
-}
-
 # Close everything, then re-open the LUKS container from scratch and confirm the
-# LV inside is still readable and correctly stamped. Without this, a LUKS case
-# reports success having only proven that writing worked once, in-process.
+# LV inside is still readable and the ext4 filesystem is intact. Without this, a
+# LUKS case reports success having only proven that writing worked once,
+# in-process.
 verify_luks_roundtrip() { # loopdev vg lv mapname
   local dev="$1" vg="$2" lv="$3" map="$4"
   echo "    re-opening container to verify round-trip"
   cryptsetup open --key-file "$PASSFILE" "$dev" "$map"
   vgchange -ay "$vg" >/dev/null
-  check_stamp "/dev/$vg/$lv" "$lv"
+
+  local mnt ok=1
+  mnt=$(mktemp -d)
+  mount -o ro "/dev/$vg/$lv" "$mnt"
+  [[ -f "$mnt/hello.txt" ]] || ok=0
+  if (( ok )); then
+    grep -q "LV: $lv" "$mnt/hello.txt" || ok=0
+  fi
+  umount "$mnt"
+  rmdir "$mnt"
+
   vgchange -an "$vg" >/dev/null
   cryptsetup close "$map"
+
+  if (( ok )); then
+    echo "    roundtrip verified: ext4 readable, hello.txt intact"
+  else
+    echo "    !! roundtrip FAILED: filesystem or hello.txt corrupted" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -322,8 +369,8 @@ capture() {
   # Authoritative text metadata, exactly as stored on disk.
   vgcfgbackup -f "$d/vg-metadata.txt" "$vg" >/dev/null
 
-  # Per-LV range hashes. bs=1 with a large count is pathologically slow, so use
-  # byte-granular skip/count with a sane block size instead.
+  # Per-LV range hashes. Now reflects ext4 filesystem content (the data that
+  # actually ships in the image), not the old raw stamp pattern.
   : > "$d/lv-hashes.txt"
   local lv dev sz off h
   for lv in $(lvs --noheadings -o lv_name "$vg" | tr -d ' '); do
@@ -405,8 +452,9 @@ case_linear_1pv() {
   pvcreate -y -ff "$L" >/dev/null
   vgcreate vgbase "$L" >/dev/null
   lvcreate -y -L 16M -n lvlin vgbase >/dev/null
-  stamp /dev/vgbase/lvlin lvlin
+  write_example_data /dev/vgbase/lvlin lvlin vgbase linear-1pv
   capture linear-1pv vgbase
+  capture_fs_oracles linear-1pv vgbase lvlin
   deactivate_vg vgbase
 }
 
@@ -421,16 +469,20 @@ case_linear_multiseg() {
   vgcreate vgseg "$L" >/dev/null
   lvcreate -y -L 8M  -n lvA vgseg >/dev/null
   lvcreate -y -L 8M  -n lvB vgseg >/dev/null   # takes the extents after lvA
-  lvextend -y -L 24M /dev/vgseg/lvA >/dev/null # lvA must jump past lvB
-  lvcreate -y -L 4M  -n lvC vgseg >/dev/null
-  lvextend -y -L 40M /dev/vgseg/lvA >/dev/null # grow again: third segment
+  lvextend -y -L 24M /dev/vgseg/lvA >/dev/null  # lvA must jump past lvB
+  lvcreate -y -L 8M  -n lvC vgseg >/dev/null
+  lvextend -y -L 40M /dev/vgseg/lvA >/dev/null  # grow again: third segment
   local segs; segs=$(lvs --noheadings -o seg_count vgseg/lvA | tr -d ' ')
   echo "    lvA segment count: $segs"
   (( segs >= 3 )) || { echo "    !! expected >=3 segments, got $segs" >&2; return 1; }
   churn_metadata vgseg
-  stamp /dev/vgseg/lvA lvA
-  stamp /dev/vgseg/lvB lvB
+  write_example_data /dev/vgseg/lvA lvA vgseg linear-1pv-multiseg
+  write_example_data /dev/vgseg/lvB lvB vgseg linear-1pv-multiseg
+  write_example_data /dev/vgseg/lvC lvC vgseg linear-1pv-multiseg
   capture linear-1pv-multiseg vgseg
+  capture_fs_oracles linear-1pv-multiseg vgseg lvA
+  capture_fs_oracles linear-1pv-multiseg vgseg lvB
+  capture_fs_oracles linear-1pv-multiseg vgseg lvC
   deactivate_vg vgseg
 }
 
@@ -442,11 +494,12 @@ case_linear_2pv() {
   L1=$(mkimg linear-2pv-a "$SMALL"); L2=$(mkimg linear-2pv-b "$SMALL")
   pvcreate -y -ff "$L1" "$L2" >/dev/null
   vgcreate vgspan "$L1" "$L2" >/dev/null
-  # Sized to exceed one PV's usable space so it must span, without stamping
-  # ~250 MB the way 100%FREE would.
+  # Sized to exceed one PV's usable space so it must span, without filling
+  # the entire VG.
   lvcreate -y -L 160M -n lvspan vgspan >/dev/null
-  stamp /dev/vgspan/lvspan lvspan
+  write_example_data /dev/vgspan/lvspan lvspan vgspan linear-2pv
   capture linear-2pv vgspan
+  capture_fs_oracles linear-2pv vgspan lvspan
   deactivate_vg vgspan
 }
 
@@ -459,8 +512,9 @@ case_striped_2pv() {
   pvcreate -y -ff "$L1" "$L2" >/dev/null
   vgcreate vgstripe "$L1" "$L2" >/dev/null
   lvcreate -y -L 32M -i 2 -I 64 -n lvstr vgstripe >/dev/null
-  stamp /dev/vgstripe/lvstr lvstr
+  write_example_data /dev/vgstripe/lvstr lvstr vgstripe striped-2pv
   capture striped-2pv vgstripe
+  capture_fs_oracles striped-2pv vgstripe lvstr
   deactivate_vg vgstripe
 }
 
@@ -472,22 +526,25 @@ case_sector4k() {
   pvcreate -y -ff "$L" >/dev/null
   vgcreate vg4k "$L" >/dev/null
   lvcreate -y -L 16M -n lv4k vg4k >/dev/null
-  stamp /dev/vg4k/lv4k lv4k
+  write_example_data /dev/vg4k/lv4k lv4k vg4k sector4k
   capture sector4k vg4k
+  capture_fs_oracles sector4k vg4k lv4k
   deactivate_vg vg4k
 }
 
 # ===========================================================================
 # 6. odd-geometry — 2 MiB extents, shifted pe_start, and TWO metadata areas.
+#    Increased to 16M to leave room for ext4 + example files.
 # ===========================================================================
 case_odd_geometry() {
   local L; L=$(mkimg odd-geometry "$SMALL")
   pvcreate -y -ff --dataalignment 128k --metadatacopies 2 "$L" >/dev/null
   vgcreate -s 2M vgodd "$L" >/dev/null
-  lvcreate -y -L 10M -n lvodd vgodd >/dev/null
+  lvcreate -y -L 16M -n lvodd vgodd >/dev/null
   churn_metadata vgodd 60
-  stamp /dev/vgodd/lvodd lvodd
+  write_example_data /dev/vgodd/lvodd lvodd vgodd odd-geometry
   capture odd-geometry vgodd
+  capture_fs_oracles odd-geometry vgodd lvodd
   deactivate_vg vgodd
 }
 
@@ -496,14 +553,15 @@ case_odd_geometry() {
 #    prove we reject thin/raid/snapshot cleanly while still mapping the plain
 #    linear LV beside them, rather than failing the whole VG.
 #    Optional targets are best-effort: some live images lack dm-thin/dm-raid.
+#    lvplain sized at 16M for ext4 + example files.
 # ===========================================================================
 case_mixed_vg() {
   local L1 L2
   L1=$(mkimg mixed-vg-a "$SMALL"); L2=$(mkimg mixed-vg-b "$SMALL")
   pvcreate -y -ff "$L1" "$L2" >/dev/null
   vgcreate vgmix "$L1" "$L2" >/dev/null
-  lvcreate -y -L 8M -n lvplain vgmix >/dev/null
-  stamp /dev/vgmix/lvplain lvplain
+  lvcreate -y -L 16M -n lvplain vgmix >/dev/null
+  write_example_data /dev/vgmix/lvplain lvplain vgmix mixed-vg
 
   if lvcreate -y -L 32M --thinpool tpool vgmix &>/dev/null; then
     lvcreate -y -V 8M --thin -n lvthin vgmix/tpool &>/dev/null \
@@ -517,6 +575,7 @@ case_mixed_vg() {
     && echo "    + snapshot" || echo "    ~ snapshot unavailable"
 
   capture mixed-vg vgmix
+  capture_fs_oracles mixed-vg vgmix lvplain
   deactivate_vg vgmix
 }
 
@@ -531,8 +590,9 @@ case_luks2_default() {
   pvcreate -y -ff /dev/mapper/wl_luks1 >/dev/null
   vgcreate vgluks /dev/mapper/wl_luks1 >/dev/null
   lvcreate -y -L "$LUKS_LV" -n lvcrypt vgluks >/dev/null
-  stamp /dev/vgluks/lvcrypt lvcrypt
+  write_example_data /dev/vgluks/lvcrypt lvcrypt vgluks luks2-default
   capture luks2-default vgluks
+  capture_fs_oracles luks2-default vgluks lvcrypt
   dump_luks "$L" "$EXP_DIR/luks2-default"
   deactivate_vg vgluks wl_luks1
   verify_luks_roundtrip "$L" vgluks lvcrypt wl_luks1
@@ -553,8 +613,9 @@ case_luks2_pbkdf2() {
   pvcreate -y -ff /dev/mapper/wl_luks2 >/dev/null
   vgcreate vgboot /dev/mapper/wl_luks2 >/dev/null
   lvcreate -y -L "$LUKS_LV" -n lvboot vgboot >/dev/null
-  stamp /dev/vgboot/lvboot lvboot
+  write_example_data /dev/vgboot/lvboot lvboot vgboot luks2-pbkdf2
   capture luks2-pbkdf2 vgboot
+  capture_fs_oracles luks2-pbkdf2 vgboot lvboot
   dump_luks "$L" "$EXP_DIR/luks2-pbkdf2"
   deactivate_vg vgboot wl_luks2
   verify_luks_roundtrip "$L" vgboot lvboot wl_luks2
@@ -647,6 +708,98 @@ if compgen -G "$ZST_DIR/*.img.zst" > /dev/null; then
   ( cd "$ZST_DIR" && sha256sum ./*.img.zst ) > "$EXP_DIR/image-checksums.txt"
 fi
 rmdir "$IMG_DIR" "$WORK" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Generate corpus-manifest.json — a single machine-readable file describing
+# every image, its LVs, and the example data inside. Agents and the C++ test
+# harness read this to know what to expect.
+# ---------------------------------------------------------------------------
+echo
+echo "generating corpus-manifest.json"
+python3 - "$EXP_DIR" "$ZST_DIR" "$OUT" <<'PY'
+import json, os, sys, re
+
+exp_dir, img_dir, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+descriptions = {
+    "linear-1pv": "Baseline single-PV linear LV",
+    "linear-1pv-multiseg": "One LV with discontiguous segments on a single PV",
+    "linear-2pv": "LV spanning two PVs",
+    "striped-2pv": "Round-robin striping, 64 KiB stripes, two PVs",
+    "sector4k": "4Kn PV (4096-byte sectors)",
+    "odd-geometry": "2 MiB extents, shifted pe_start, two metadata areas",
+    "mixed-vg": "Supported and unsupported LV types side by side",
+    "luks2-default": "LUKS2 with stock defaults (argon2id, aes-xts-plain64)",
+    "luks2-pbkdf2": "LUKS2 boot-candidate config (PBKDF2)",
+}
+
+manifest = {"cases": {}}
+
+for case_name in sorted(os.listdir(exp_dir)):
+    case_path = os.path.join(exp_dir, case_name)
+    if not os.path.isdir(case_path):
+        continue
+
+    case_info = {
+        "description": descriptions.get(case_name, ""),
+        "images": [],
+        "lvs": {},
+    }
+
+    # Collect image files for this case
+    if os.path.isdir(img_dir):
+        for f in sorted(os.listdir(img_dir)):
+            if not f.endswith('.img.zst'):
+                continue
+            base = f.replace('.img.zst', '')
+            if base == case_name or base.startswith(case_name + '-'):
+                case_info["images"].append(f)
+
+    # Extract VG info from metadata text
+    vg_meta = os.path.join(case_path, "vg-metadata.txt")
+    if os.path.exists(vg_meta):
+        with open(vg_meta) as f:
+            text = f.read()
+        m = re.search(r'^(\w+)\s*\{', text, re.MULTILINE)
+        if m:
+            case_info["vg_name"] = m.group(1)
+        m = re.search(r'extent_size\s*=\s*(\d+)', text)
+        if m:
+            case_info["extent_size_sectors"] = int(m.group(1))
+        case_info["pv_count"] = len(re.findall(r'pv\d+\s*\{', text))
+
+    # Collect filesystem oracle info per LV
+    for entry in sorted(os.listdir(case_path)):
+        if not entry.startswith('fs-'):
+            continue
+        lv_name = entry[3:]
+        lv_info = {"fs_type": "ext4", "files": []}
+
+        checksums_path = os.path.join(case_path, entry, "checksums.txt")
+        if os.path.exists(checksums_path):
+            with open(checksums_path) as f:
+                for line in f:
+                    parts = line.strip().split('  ', 1)
+                    if len(parts) == 2:
+                        lv_info["files"].append({
+                            "path": parts[1],
+                            "sha256": parts[0]
+                        })
+
+        case_info["lvs"][lv_name] = lv_info
+
+    # LUKS flag
+    if os.path.exists(os.path.join(case_path, "luksDump.txt")):
+        case_info["has_luks"] = True
+
+    manifest["cases"][case_name] = case_info
+
+out_path = os.path.join(out_dir, "corpus-manifest.json")
+with open(out_path, 'w') as f:
+    json.dump(manifest, f, indent=2)
+    f.write('\n')
+print(f"    -> {out_path}")
+PY
 
 echo
 echo "======================================================================"

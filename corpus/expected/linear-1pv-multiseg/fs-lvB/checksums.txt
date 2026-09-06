@@ -1,0 +1,5 @@
+cd47c75c771ed9f3b53d9dd19c6b5f39cbb3179ecdf81079bb30c5e99ae48545  ./hello.txt
+42845047985abec3937621ecd324ea08cd49d87fee615f8cac6feb9af0d75f37  ./pattern-1k.bin
+b0e678f82dc19129d91a42af1058c5e50dff4e4f177164d9ae4aae97c5391b17  ./pattern-4k.bin
+ba236d5459a8008d67960e6c3dc901ffe1e1b37d7ab6dea0b08d4a4501d12d32  ./random-1m.bin
+df90e95e188c8f02b3eae03343947717b1cf81de27aeb16be3dd32153adfeece  ./subdir/nested/deep.txt

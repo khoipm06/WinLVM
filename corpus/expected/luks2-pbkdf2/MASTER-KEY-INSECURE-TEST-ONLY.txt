@@ -1,10 +1,10 @@
-LUKS header information for /dev/loop13
+LUKS header information for /dev/loop11
 Cipher name:   	aes
 Cipher mode:   	xts-plain64
 Payload offset:	32768
-UUID:          	eb295f5c-e3a4-4ac1-b07e-430be3e8f746
+UUID:          	ecbe5de5-68aa-4875-8128-a869ffdeee51
 MK bits:       	512
-MK dump:	14 f0 c9 45 54 d3 08 a1 73 19 0a fa 53 1d e3 f7 
-		90 45 e2 66 bc 19 58 3e 4d 98 b0 ad 4b 3f 97 16 
-		64 61 2e f0 8d bf be 33 a8 ee 9b 53 13 a3 66 bd 
-		f1 65 19 28 0d 05 3f ef c8 cd af 44 d7 6b f8 37 
+MK dump:	a8 f1 6f a9 97 64 13 0c 18 d8 82 f2 e1 2c 6c 72 
+		8a 40 37 31 bd c9 ed 34 2f be 1d c9 98 3e 3a fd 
+		0c 7f b7 c2 04 af 30 df 36 3d ad b2 fb bf 14 1c 
+		48 f9 c0 4d 92 1c 08 02 d3 15 06 9c c4 cd a6 f2 

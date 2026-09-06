@@ -1,14 +1,14 @@
-vgmix-lvplain: 0 16384 snapshot-origin 252:11
-vgmix-lvplain-real: 0 16384 linear 7:10 2048
-vgmix-lvraid: 0 16384 raid raid1 3 0 region_size 4096 2 252:6 252:7 252:8 252:9
-vgmix-lvraid_rimage_0: 0 16384 linear 7:10 100352
-vgmix-lvraid_rimage_1: 0 16384 linear 7:11 18432
-vgmix-lvraid_rmeta_0: 0 8192 linear 7:10 92160
-vgmix-lvraid_rmeta_1: 0 8192 linear 7:11 10240
-vgmix-lvsnap: 0 16384 snapshot 252:11 252:12 P 8
-vgmix-lvsnap-cow: 0 8192 linear 7:10 116736
-vgmix-lvthin: 0 16384 thin 252:3 1
-vgmix-tpool: 0 65536 linear 252:3 0
-vgmix-tpool-tpool: 0 65536 thin-pool 252:1 252:2 128 0 0 
-vgmix-tpool_tdata: 0 65536 linear 7:10 26624
-vgmix-tpool_tmeta: 0 8192 linear 7:11 2048
+vgmix-lvplain: 0 32768 snapshot-origin 252:14
+vgmix-lvplain-real: 0 32768 linear 7:8 2048
+vgmix-lvraid: 0 16384 raid raid1 3 0 region_size 4096 2 252:9 252:10 252:11 252:12
+vgmix-lvraid_rimage_0: 0 16384 linear 7:8 116736
+vgmix-lvraid_rimage_1: 0 16384 linear 7:9 18432
+vgmix-lvraid_rmeta_0: 0 8192 linear 7:8 108544
+vgmix-lvraid_rmeta_1: 0 8192 linear 7:9 10240
+vgmix-lvsnap: 0 32768 snapshot 252:14 252:15 P 8
+vgmix-lvsnap-cow: 0 8192 linear 7:8 133120
+vgmix-lvthin: 0 16384 thin 252:6 1
+vgmix-tpool: 0 65536 linear 252:6 0
+vgmix-tpool-tpool: 0 65536 thin-pool 252:4 252:5 128 0 0 
+vgmix-tpool_tdata: 0 65536 linear 7:8 43008
+vgmix-tpool_tmeta: 0 8192 linear 7:9 2048

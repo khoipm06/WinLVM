@@ -1,12 +1,42 @@
+Name:              hostvg-Root
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 1
+Number of targets: 2
+UUID: LVM-ShrmdYWfsgc3FZTHpV31dXTIKlcQdzjReJYGLUNQcwoFnPp0WsZptuTMiszF00LD
+
+Name:              hostvg-VarData
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 2
+Number of targets: 2
+UUID: LVM-ShrmdYWfsgc3FZTHpV31dXTIKlcQdzjRdj7ag6gKTwxxbY3Gmi1WhurNFNzgcE66
+
+Name:              luks-2d467aed-2601-4440-afc8-a61ca2b710dc
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        2
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: CRYPT-LUKS2-2d467aed26014440afc8a61ca2b710dc-luks-2d467aed-2601-4440-afc8-a61ca2b710dc
+
 Name:              vgseg-lvA
 State:             ACTIVE
 Read Ahead:        256
 Tables present:    LIVE
 Open count:        0
 Event number:      0
-Major, minor:      252, 0
+Major, minor:      252, 3
 Number of targets: 3
-UUID: LVM-HU0UsW9ThtY1faOtClxYMcJ15xw37ZoASmYG9BvCTpBcY3hi9yByRKeebfmjFWEh
+UUID: LVM-INZvSTxZDlPqsn1PVTlBX9DgbgbJ1ZGco5HhD2Lpbn8JMQqnPYeEVgubyXWjFz0S
 
 Name:              vgseg-lvB
 State:             ACTIVE
@@ -14,9 +44,9 @@ Read Ahead:        256
 Tables present:    LIVE
 Open count:        0
 Event number:      0
-Major, minor:      252, 1
+Major, minor:      252, 4
 Number of targets: 1
-UUID: LVM-HU0UsW9ThtY1faOtClxYMcJ15xw37ZoA2oMve1kmCMCzbdbiUExlLoM98YqsQWPa
+UUID: LVM-INZvSTxZDlPqsn1PVTlBX9DgbgbJ1ZGchKHjBp7f4WP3qGNd1cOwzHmWlqmvcSn1
 
 Name:              vgseg-lvC
 State:             ACTIVE
@@ -24,7 +54,7 @@ Read Ahead:        256
 Tables present:    LIVE
 Open count:        0
 Event number:      0
-Major, minor:      252, 2
+Major, minor:      252, 5
 Number of targets: 1
-UUID: LVM-HU0UsW9ThtY1faOtClxYMcJ15xw37ZoAKqvqNKHMQALqHnm3MPhw939ppWqcplGE
+UUID: LVM-INZvSTxZDlPqsn1PVTlBX9DgbgbJ1ZGcS3ejYhGqoCn9HP8UZc7WY5MxwUnSfc16
 

@@ -1,2 +1,2 @@
   VG    LV    LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges      Devices      
-  vgodd lvodd s0sj1J-HxyM-y5cp-oebk-bDP7-arLE-QBCXQs 10485760     0     5 linear    1      0 /dev/loop9:0-4 /dev/loop9(0)
+  vgodd lvodd v3MXfk-BNxc-LM3h-2xAF-WcLh-afwF-ycmwCl 16777216     0     8 linear    1      0 /dev/loop7:0-7 /dev/loop7(0)

@@ -1,6 +1,6 @@
-  VG    LV   LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges       Devices      
-  vgseg lvA  SmYG9B-vCTp-BcY3-hi9y-ByRK-eebf-mjFWEh 41943040     0     2 linear    1      0 /dev/loop2:0-1  /dev/loop2(0)
-  vgseg lvA  SmYG9B-vCTp-BcY3-hi9y-ByRK-eebf-mjFWEh 41943040     2     4 linear    1      0 /dev/loop2:4-7  /dev/loop2(4)
-  vgseg lvA  SmYG9B-vCTp-BcY3-hi9y-ByRK-eebf-mjFWEh 41943040     6     4 linear    1      0 /dev/loop2:9-12 /dev/loop2(9)
-  vgseg lvB  2oMve1-kmCM-Czbd-biUE-xlLo-M98Y-qsQWPa  8388608     0     2 linear    1      0 /dev/loop2:2-3  /dev/loop2(2)
-  vgseg lvC  KqvqNK-HMQA-LqHn-m3MP-hw93-9ppW-qcplGE  4194304     0     1 linear    1      0 /dev/loop2:8-8  /dev/loop2(8)
+  VG    LV   LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges        Devices       
+  vgseg lvA  o5HhD2-Lpbn-8JMQ-qnPY-eEVg-ubyX-WjFz0S 41943040     0     2 linear    1      0 /dev/loop1:0-1   /dev/loop1(0) 
+  vgseg lvA  o5HhD2-Lpbn-8JMQ-qnPY-eEVg-ubyX-WjFz0S 41943040     2     4 linear    1      0 /dev/loop1:4-7   /dev/loop1(4) 
+  vgseg lvA  o5HhD2-Lpbn-8JMQ-qnPY-eEVg-ubyX-WjFz0S 41943040     6     4 linear    1      0 /dev/loop1:10-13 /dev/loop1(10)
+  vgseg lvB  hKHjBp-7f4W-P3qG-Nd1c-OwzH-mWlq-mvcSn1  8388608     0     2 linear    1      0 /dev/loop1:2-3   /dev/loop1(2) 
+  vgseg lvC  S3ejYh-GqoC-n9HP-8UZc-7WY5-MxwU-nSfc16  8388608     0     2 linear    1      0 /dev/loop1:8-9   /dev/loop1(8) 

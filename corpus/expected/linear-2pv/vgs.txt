@@ -1,2 +1,2 @@
   VG     VG UUID                                Ext     #Ext Seq System ID #PV #LV
-  vgspan jnKCvz-lH7U-wL8B-5u4m-X4g5-ndZU-f8n00c 4194304   62   2             2   1
+  vgspan vhN3H5-pBy5-2DtD-JDHr-wNkh-UUsE-aiSr21 4194304   62   2             2   1

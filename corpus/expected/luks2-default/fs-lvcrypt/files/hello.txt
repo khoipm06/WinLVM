@@ -1,0 +1,5 @@
+Hello from WinLVM corpus generator
+LV: lvcrypt
+VG: vgluks
+Case: luks2-default
+This file is verification data for the WinLVM driver.

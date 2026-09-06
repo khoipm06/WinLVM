@@ -1,10 +1,40 @@
+Name:              hostvg-Root
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 1
+Number of targets: 2
+UUID: LVM-ShrmdYWfsgc3FZTHpV31dXTIKlcQdzjReJYGLUNQcwoFnPp0WsZptuTMiszF00LD
+
+Name:              hostvg-VarData
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 2
+Number of targets: 2
+UUID: LVM-ShrmdYWfsgc3FZTHpV31dXTIKlcQdzjRdj7ag6gKTwxxbY3Gmi1WhurNFNzgcE66
+
+Name:              luks-2d467aed-2601-4440-afc8-a61ca2b710dc
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        2
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: CRYPT-LUKS2-2d467aed26014440afc8a61ca2b710dc-luks-2d467aed-2601-4440-afc8-a61ca2b710dc
+
 Name:              vgbase-lvlin
 State:             ACTIVE
 Read Ahead:        256
 Tables present:    LIVE
 Open count:        0
 Event number:      0
-Major, minor:      252, 0
+Major, minor:      252, 3
 Number of targets: 1
-UUID: LVM-FGqDUytyD0xEtgUN0AhTt21GzXjjZncTuvmoC3AMeyul5FT8nuB1HTDdSvvajeiu
+UUID: LVM-gdqFtuXxq2aT3dHmVuF7szfc6EgKVxJC6nsQ8Pj1fIgZM4lEAepyrf6yx6lNfEEL
 

@@ -1,2 +1,2 @@
   VG     LV    LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges      Devices      
-  vgbase lvlin uvmoC3-AMey-ul5F-T8nu-B1HT-DdSv-vajeiu 16777216     0     4 linear    1      0 /dev/loop1:0-3 /dev/loop1(0)
+  vgbase lvlin 6nsQ8P-j1fI-gZM4-lEAe-pyrf-6yx6-lNfEEL 16777216     0     4 linear    1      0 /dev/loop0:0-3 /dev/loop0(0)

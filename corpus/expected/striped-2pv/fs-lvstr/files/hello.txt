@@ -1,0 +1,5 @@
+Hello from WinLVM corpus generator
+LV: lvstr
+VG: vgstripe
+Case: striped-2pv
+This file is verification data for the WinLVM driver.

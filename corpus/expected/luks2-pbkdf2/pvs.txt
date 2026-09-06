@@ -1,13 +1,13 @@
-  PV                   PV UUID                                VG       PSize     1st PE  PE  Alloc #PMda
-  /dev/loop1           40papu-YTYe-jfI0-Z2ie-4KKg-qVTj-H9SkKq vgbase   130023424 1048576  31     4     1
-  /dev/loop10          HZNZpS-BLsM-fgGz-pMCs-qCUD-8ra8-zrJKud vgmix    130023424 1048576  31    15     1
-  /dev/loop11          6wRuMZ-eeuF-MHv7-36dB-FwnW-n8HU-60Npud vgmix    130023424 1048576  31     4     1
-  /dev/loop2           JjLuDZ-YD8T-uES8-86y6-IWUS-XJXJ-exfUzt vgseg    130023424 1048576  31    13     1
-  /dev/loop3           4kwTKB-4OMo-bT1E-KDfP-s39G-Xn19-H9ik1Q           67108864 1048576   0     0     1
-  /dev/loop4           16usBo-oQe8-adxk-EFkw-pbrk-qgxU-LSHthl vgspan   130023424 1048576  31    31     1
-  /dev/loop5           zDjbfL-Wrbc-bfoi-LhWY-h5ij-44CQ-YXV0vE vgspan   130023424 1048576  31     9     1
-  /dev/loop6           lIWvCy-QqGZ-MJcC-vwGY-h1rU-EGC9-1ttOIf vgstripe 130023424 1048576  31     4     1
-  /dev/loop7           RWnCxc-1QJz-f8EY-x5Yq-g4yl-3Urt-m2ks93 vgstripe 130023424 1048576  31     4     1
-  /dev/loop8           FhfnQL-Jkdl-bcEq-tX6l-yZSQ-mdje-mwbbb3 vg4k     130023424 1048576  31     4     1
-  /dev/loop9           qLEzKg-lmj0-PDI8-gERr-9ZZh-K3bE-XZeujw vgodd    132120576 1048576  63     5     2
-  /dev/mapper/wl_luks2 8znGKC-WfCa-NCmH-dT3F-6I1c-k33p-04GjY1 vgboot   113246208 1048576  27     4     1
+  PV                                                    PV UUID                                VG       PSize        1st PE  PE    Alloc #PMda
+  /dev/loop0                                            6m0kE1-fm6x-OlV6-sDHg-xLe5-fAxG-mtK0Ow vgbase      130023424 1048576    31     4     1
+  /dev/loop1                                            nrzO4P-48Wl-f5Zo-zmvL-nU3q-REgT-Aklal7 vgseg       130023424 1048576    31    14     1
+  /dev/loop2                                            eqCKjX-0yfK-cSLp-zQwu-e7nw-5gjw-6qKn7n vgspan      130023424 1048576    31    31     1
+  /dev/loop3                                            sifgFv-0qGV-seOV-hIem-6yjV-Df8u-PRsWTF vgspan      130023424 1048576    31     9     1
+  /dev/loop4                                            jEIgTm-YU6S-3rY2-D6d8-iBwn-iHA3-4XYNpM vgstripe    130023424 1048576    31     4     1
+  /dev/loop5                                            F9Mqwq-q7ok-zp3D-krP5-EY1m-8XYl-tBQeJN vgstripe    130023424 1048576    31     4     1
+  /dev/loop6                                            wdVO0N-vUwA-aNzL-CZcd-Ie58-srkl-UwGSXS vg4k        130023424 1048576    31     4     1
+  /dev/loop7                                            G7YN0k-bSzX-b0Oe-DB9I-oQjT-Aah9-o682lj vgodd       132120576 1048576    63     8     2
+  /dev/loop8                                            3I2T1Z-iYlz-PYql-6Mju-Zh7J-sU7z-dy18Wh vgmix       130023424 1048576    31    17     1
+  /dev/loop9                                            NHOqXa-Sk0B-QvyB-Djvc-10OL-fwUj-Qk8Cou vgmix       130023424 1048576    31     4     1
+  /dev/mapper/luks-2d467aed-2601-4440-afc8-a61ca2b710dc c9Jymg-nQrK-M3Ki-KNCi-u6Ay-lwiW-RxgS6h hostvg 128832241664 1048576 30716 30716     1
+  /dev/mapper/wl_luks2                                  4wf6Nu-23Jm-B8rm-lYCr-FQu1-lAwy-pyhFYl vgboot      113246208 1048576    27     4     1

@@ -1,1 +1,1 @@
-vgluks-lvcrypt: 0 32768 linear 252:0 2048
+vgluks-lvcrypt: 0 32768 linear 252:3 2048
