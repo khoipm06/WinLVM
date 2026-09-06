@@ -106,13 +106,39 @@ current one's artifact is committed. Gate references are to `FEASIBILITY.md` §8
 
 ---
 
-### Phase 0 — Ground truth _(Stage 0)_ — ✅ **DONE 2026-07-27**
+### Phase 0 — Ground truth _(Stage 0)_ — ✅ **DONE 2026-07-27** / ⚠️ **corpus must be regenerated**
 
 Generated on Fedora 44, LVM 2.03.38, cryptsetup 2.8.4. All 9 cases passed, 12
 images, zero failures. Corpus in [`../corpus/`](../corpus/), generator in
 `corpus/generate.sh`, provenance in `corpus/expected/PROVENANCE.txt`.
 
-Confirmed present in the captured oracles:
+**2026-07-28 — `generate.sh` significantly enhanced.** The script now writes
+a full **ext4 filesystem** with known files onto every LV (replacing the old raw
+sector stamp approach). The corpus is not functionally usable for driver read
+testing until it is regenerated with this new script on the Linux VM.
+
+What changed in `generate.sh`:
+
+- **Removed**: `stamp()` and `check_stamp()` (raw sector-level magic bytes).
+- **Added**: `write_example_data()` — creates ext4 on each LV, writes
+  `hello.txt`, `pattern-1k.bin`, `pattern-4k.bin`, `random-1m.bin` (1 MiB
+  deterministic pseudo-random), and `subdir/nested/deep.txt`.
+- **Added**: `capture_fs_oracles()` — mounts read-only, records a file listing,
+  SHA-256 checksums, and byte-exact copies of small files into
+  `expected/<case>/fs-<lv>/`.
+- **Added**: `corpus-manifest.json` at the corpus root — a single
+  machine-readable file describing every image, VG, and filesystem contents.
+  Agents and test harnesses read this as their entry point.
+- **Modified**: `verify_luks_roundtrip()` — now verifies the ext4 filesystem
+  and `hello.txt` instead of raw stamps.
+- **LV size adjustments**: `lvC` 4M→8M, `lvodd` 10M→16M, `lvplain` 8M→16M.
+- **`lv-hashes.txt`** now reflects ext4 filesystem content (the data that
+  actually ships) rather than the old stamp pattern.
+
+**Action required:** re-run `sudo ./generate.sh` on the Linux VM and copy the
+output to `corpus/`. See [`../corpus/README.md`](../corpus/README.md).
+
+Confirmed present in the captured oracles (first run):
 
 - `linear-1pv-multiseg`: `lvA` has **3 segments at non-monotonic PV offsets**
   (2048 → 34816 → 75776) — the discontiguous case a naive `start + length`
@@ -127,33 +153,12 @@ Confirmed present in the captured oracles:
 - Both LUKS cases verified by closing and **re-opening the container from
   scratch**, not merely by writing to it once.
 
-_Original criteria, retained for reference:_
-
-Build `corpus/generate.sh`, run on Linux, producing committed disk images plus
-oracle files:
-
-| Image                 | Contents                                                   |
-| --------------------- | ---------------------------------------------------------- |
-| `linear-1pv`          | single PV, single linear LV                                |
-| `linear-1pv-multiseg` | single PV, LV with several non-adjacent segments           |
-| `linear-2pv`          | LV spanning two PVs                                        |
-| `striped-2pv`         | `lvcreate -i2`                                             |
-| `4kn`                 | 4096-byte sector PV                                        |
-| `mixed-vg`            | several LVs, one unsupported type (thin) to test rejection |
-| `luks2-linear`        | LUKS2 container → PV → VG → linear LV                      |
-| `luks2-pbkdf2`        | as above but `--pbkdf pbkdf2`, for the boot case           |
-
-For each, commit: `lvs -o+seg_pe_ranges,seg_start_pe,segtype`, `pvs -o+pe_start`,
-`vgs`, `dmsetup table`, the raw VG metadata text, and `sha256sum` of at least
-three byte ranges of each LV (start, middle, end). For LUKS images also commit
-`cryptsetup luksDump` and the plaintext hash of the decrypted payload head.
-
 **Exit:** the corpus and oracle files are committed, and a script regenerates
 them reproducibly. **Kill criterion if you won't build this** — see Stage 0.
 
 ---
 
-### Phase 1 — `lvmfmt`: format library _(Stage 1)_ — ✅ **DONE 2026-07-27**
+### Phase 1 — `lvmfmt`: format library _(Stage 1)_ — ✅ **DONE 2026-07-27** / ⚠️ **re-verify after corpus regeneration**
 
 Implemented in `src/lvmfmt/`: `bytes.h` (checked arithmetic), `crc32`
 (LVM's non-standard variant), `config` (text metadata grammar), `label`
@@ -177,6 +182,11 @@ NUL terminator, which `vgcfgbackup` files (used by the metadata-text tier) omit.
 parser doesn't see the terminator as an expected-identifier failure. The CRC
 check in `label.cpp` had been silently correct all along — the ring-buffer
 extraction was fine; only the parser choked.
+
+**Note (2026-07-28):** The corpus has changed (ext4 data now on LVs; `lv-hashes.txt`
+will differ). The dmsetup-table and metadata-tier tests are **unaffected** — only
+LV content changed. Re-run the test suite after regenerating the corpus to confirm
+the image-tier tests (Tier 2) still pass.
 
 _Original scope, retained:_
 
@@ -430,16 +440,29 @@ never silently mishandled.
 
 ## 6. Immediate next actions
 
-1. **Answer D1–D4 in §2 and record them here.** These block Phase 2. D1
+1. **Regenerate the corpus on the Linux VM.** `generate.sh` was significantly
+   updated on 2026-07-28 — ext4 filesystem data, `fs-<lv>/` oracle directories,
+   and `corpus-manifest.json` are now produced. The existing images are missing
+   all of this. Run `sudo ./generate.sh` on the Linux VM and commit the output.
+2. **Re-run the test suite** after the corpus is regenerated to confirm the
+   image-tier tests (Tier 2) still pass against the new image content.
+3. **Answer D1–D4 in §2 and record them here.** These block Phase 2. D1
    (license) in particular decides whether Phase 2 can transcribe winmd or must
    clean-room it — a multi-month difference. D2–D4 are recorded as defaults.
-2. **Start Phase 2 (`winlvm.sys`)** — the winmd-shaped WDM volume manager,
-   read-only first. Stage 2 is the project's make-or-break phase.
+4. **Start Phase 2 (`winlvm.sys`)** — the winmd-shaped WDM volume manager,
+   read-only first. Stage 2 is the project's make-or-break phase. The
+   filesystem data in the corpus is the **read verification anchor**: once
+   the driver can read `hello.txt` from each LV and compare it against
+   `expected/<case>/fs-<lv>/files/hello.txt`, Stage 2 has meaningful evidence.
 
 **Already done:**
 
 - **Phase 0 complete.** 12 real Linux-created images with oracle files, in
   `corpus/`. Stage 0 passed.
+- **Phase 1 complete.** `src/lvmfmt/` — LVM2 on-disk format library, 22/22
+  tests pass. `dmsetup table` reproduced byte-for-byte for all corpus cases.
+- **2026-07-28:** `generate.sh` enhanced — ext4 filesystem data on every LV,
+  `fs-<lv>/` oracle directories, `corpus-manifest.json`.
 - Added `.gitignore` negations so verification logs under `corpus/` and
   `tests/evidence/` can be committed despite the blanket `*.log` rule.
 - Rewrote `README.md` to state the real status.
