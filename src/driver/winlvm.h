@@ -2,20 +2,17 @@
  * winlvm.h — winlvm.sys internal types.
  *
  * Architecture mirrors maharmstone/winmd (pure C WDM):
- *   - One control device object (CDO), created in DriverEntry, owned by the
- *     driver instance. Holds the PnP cookie for disk interface notifications
- *     and the in-memory VG cache.
- *   - One PDO per LV, created by a deferred worker when a disk arrives and
- *     proves to be an LVM PV. Each PDO's device extension carries the LV's
- *     segment map and the backing disk PDO pointer.
+ *   - The INF enumerates ROOT\winlvm; the PnP manager creates the root bus
+ *     PDO and calls WinLvmAddDevice, which creates the bus FDO.
+ *   - Disk-interface arrival notifications probe candidate PVs; a worker
+ *     parses the LVM2 metadata and creates one child PDO per mappable LV.
+ *   - Child PDOs are reported via IRP_MN_QUERY_DEVICE_RELATIONS/BusRelations
+ *     and match the INF's WinLvmVolume hardware ID. They are FILE_DEVICE_DISK
+ *     volumes: reads/writes are forwarded to the backing disk device object.
  *
- * I/O: IoGetDeviceObjectPointer + IoAllocateIrp + IoCallDriver to probe PVs;
- * reads through the LV PDO fan out into sub-IRPs to the backing disk. Writes
- * are refused with STATUS_MEDIA_WRITE_PROTECTED until Phase 3.
- *
- * NEVER ZwCreateFile. The previous prototype did ZwCreateFile on every IRP;
- * that is the structural reason it was unbootable and the reason it was
- * deleted (FEASIBILITY.md §2, winlvm-project-direction memory).
+ * NEVER ZwCreateFile: backing devices are addressed through device objects
+ * we already hold (IoGetDeviceObjectPointer once per arrival, then
+ * IoCallDriver).
  */
 #ifndef WINLVM_DRIVER_WINLVM_H
 #define WINLVM_DRIVER_WINLVM_H
@@ -30,49 +27,54 @@
 #include "lvm_read.h"
 
 #define WINLVM_WIN_TAG ((unsigned long)'WMLV')
+#define WL_MAX_CHILDREN 32
 
-/* Forward decls of our internal device-extension types. */
-typedef struct _WINLVM_CDO_EXT WINLVM_CDO_EXT;
-typedef struct _WINLVM_LV_EXT  WINLVM_LV_EXT;
+/* Hardware ID reported by child LV PDOs; matches the INF model entry. */
+static const WCHAR WinLvmHwId[] = L"WinLvmVolume\0";  /* REG_MULTI_SZ */
 
-/* The volume group as we cache it on the CDO. lvm_read fills a
- * winlvm_volume_group on the stack of the probe worker; we copy it into a
- * nonpaged-pool record. The driver keeps ONE cached VG per PV-device-group
- * (we only resolve single-PV groups at this stage). */
+typedef enum { WL_EXT_BUS = 0x31425553, WL_EXT_LV = 0x32564C53 } WL_EXT_KIND;
+
+/* One cached volume group (single-PV groups in this phase). */
 typedef struct {
-    winlvm_volume_group vg;          /* as parsed by lvm_read.c */
-    PDEVICE_OBJECT      *backing_pdos; /* nonpaged array, indexed by vg.pvs[] */
-    UNICODE_STRING       volume_ifname; /* registered GUID_DEVINTERFACE_VOLUME, if any */
+    winlvm_volume_group vg;        /* as parsed by lvm_read.c */
+    PDEVICE_OBJECT       backing_pdo; /* disk PDO holding the PV (referenced) */
 } WINLVM_VG_RECORD;
 
-/* CDO extension. */
-struct _WINLVM_CDO_EXT {
-    PDEVICE_OBJECT      control_device;
-    PVOID               disk_notify_cookie;
-    KSPIN_LOCK          lock;        /* protects the cached vg list */
-    WINLVM_VG_RECORD   *vgs;         /* simple array; nonpaged */
-    size_t              vg_count;
-};
+/* Bus FDO extension. */
+typedef struct _WINLVM_BUS_EXT {
+    WL_EXT_KIND         kind;          /* WL_EXT_BUS */
+    PDEVICE_OBJECT      fdo;           /* this device */
+    PDEVICE_OBJECT      pdo;           /* root-enumerated PDO below */
+    PDEVICE_OBJECT      bus_pdo;       /* attach point (same as pdo here) */
+    KSPIN_LOCK          lock;          /* children/vgs */
+    WINLVM_VG_RECORD   *vgs;           /* single cached VG for now */
+    PDEVICE_OBJECT      children[WL_MAX_CHILDREN];
+    size_t              child_count;
+} WINLVM_BUS_EXT;
 
 /* LV PDO extension. */
-struct _WINLVM_LV_EXT {
-    PDEVICE_OBJECT      pdo;
-    WINLVM_VG_RECORD   *vg;          /* borrowed from the CDO */
-    size_t              lv_index;     /* index into vg->vg.lvs[] */
-    PDEVICE_OBJECT      backing_pdo;  /* first PV's disk PDO */
+typedef struct _WINLVM_LV_EXT {
+    WL_EXT_KIND         kind;          /* WL_EXT_LV */
+    PDEVICE_OBJECT      pdo;           /* this device */
+    WINLVM_VG_RECORD   *record;       /* borrowed from the bus */
+    size_t              lv_index;     /* index into record->vg.lvs[] */
+    PDEVICE_OBJECT      backing_pdo;   /* PV disk PDO (referenced) */
     ULONGLONG           byte_size;
-};
+    UNICODE_STRING      ifname;        /* volume interface, if registered */
+} WINLVM_LV_EXT;
 
-/* lvm_read.c expects a winlvm_byte_source whose impl is a kernel-side
- * struct holding the disk PDO + FILE_OBJECT. read() builds an IRP_MJ_READ,
- * sends it with IoCallDriver, and waits on the event. */
+/* Kernel-side byte source: IRP_MJ_READ against the disk PDO. */
 typedef struct {
-    PDEVICE_OBJECT  disk_pdo;        /* top of the stack we send IRPs to */
-    PFILE_OBJECT    file;            /* referenced file object for that PDO */
-    KEVENT          done;            /* completion synchronisation */
+    PDEVICE_OBJECT  disk_pdo;
+    PFILE_OBJECT    file;
+    KEVENT          done;
 } WINLVM_DISK_SOURCE;
 
-/* Forward decls of the dispatchers. */
+/* Globals (winlvm.c). */
+extern WINLVM_BUS_EXT *g_bus_ext;      /* set by AddDevice, cleared on REMOVE */
+extern PVOID            g_disk_notify_cookie;
+
+/* Dispatchers. */
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     WinLvmUnload;
 DRIVER_ADD_DEVICE WinLvmAddDevice;
@@ -84,6 +86,7 @@ DRIVER_DISPATCH WinLvmFlush;
 DRIVER_DISPATCH WinLvmShutdown;
 DRIVER_DISPATCH WinLvmDeviceControl;
 DRIVER_DISPATCH WinLvmPnp;
+DRIVER_DISPATCH WinLvmPower;
 
 NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context);
 void WinLvmProbeWorker(PVOID);

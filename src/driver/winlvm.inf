@@ -18,9 +18,15 @@ PnpLockdown=1
 
 [Standard.NTamd64]
 %WinLvmDeviceDesc%=WinLvm_Install,ROOT\winlvm
+%WinLvmVolumeDesc%=WinLvmVolume_Install,WinLvmVolume
 
 [WinLvm_Install.NT]
 CopyFiles=WinLvm.Files
+
+[WinLvmVolume_Install.NT]
+; children are serviced by the same driver; no files to copy
+[WinLvmVolume_Install.NT.Services]
+AddService=winlvm,0x00000002,WinLvm_Service_Inst
 
 [WinLvm.Files]
 winlvm.sys
@@ -55,5 +61,6 @@ DefaultDestDir = 12 ; Drivers directory
 ProviderString = "winlvm"
 ManufacturerString = "winlvm"
 WinLvmDeviceDesc = "winlvm Logical Volume Manager Bus"
+WinLvmVolumeDesc = "winlvm Logical Volume"
 WinLvmServiceDesc = "winlvm Volume Manager Service"
 DiskId1 = "winlvm Installation Disk"
