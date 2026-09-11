@@ -87,6 +87,7 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
 
     WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)fdo->DeviceExtension;
     RtlZeroMemory(ext, sizeof(*ext));
+    ext->kind = WL_EXT_BUS;  /* dispatch discriminator — MUST precede any IRP */
     ext->fdo = fdo;
     ext->pdo = PhysicalDeviceObject;
     KeInitializeSpinLock(&ext->lock);
@@ -257,6 +258,7 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
 
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)lv_pdo->DeviceExtension;
     RtlZeroMemory(ext, sizeof(*ext));
+    ext->kind = WL_EXT_LV;  /* dispatch discriminator — MUST precede any IRP */
     ext->pdo = lv_pdo;
     ext->record = record;
     ext->lv_index = lv_index;
