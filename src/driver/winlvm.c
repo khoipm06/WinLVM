@@ -235,6 +235,7 @@ void WinLvmProbeWorker(PVOID context) {
                 WINLVM_VG_RECORD *record = bus->vgs;
                 KeReleaseSpinLock(&bus->lock, old);
 
+                int created = 0;
                 if (!record) {
                     record = ExAllocatePoolZero(NonPagedPool,
                         sizeof(WINLVM_VG_RECORD), WINLVM_WIN_TAG);
@@ -243,11 +244,11 @@ void WinLvmProbeWorker(PVOID context) {
                         ObReferenceObject(work->target_disk);
                         record->backing_pdo = work->target_disk;
                         KeAcquireSpinLock(&bus->lock, &old);
-                        if (!bus->vgs) { bus->vgs = record; }
+                        if (!bus->vgs) { bus->vgs = record; created = 1; }
                         else {
-                            WINLVM_VG_RECORD *r = bus->vgs;
                             /* single-PV groups only for now: a second VG on
-                             * another disk is dropped with a ref leak-free */
+                             * another disk is dropped leak-free */
+                            WINLVM_VG_RECORD *r = bus->vgs;
                             if (r != record) {
                                 KeReleaseSpinLock(&bus->lock, old);
                                 ObDereferenceObject(work->target_disk);
@@ -258,9 +259,15 @@ void WinLvmProbeWorker(PVOID context) {
                         }
                         KeReleaseSpinLock(&bus->lock, old);
                     }
+                } else if (record->backing_pdo != work->target_disk) {
+                    /* a different disk carrying (a copy of) the same VG:
+                     * single-PV phase — ignore, no duplicate LV devnodes */
+                    record = NULL;
                 }
 
-                if (record) {
+                /* re-notifies of the same PV must not re-create LV PDOs:
+                 * duplicates would collide on the LV-UUID instance ID */
+                if (record && created) {
                     for (size_t i = 0; i < vg->lv_count; i++) {
                         if (!vg->lvs[i].mappable) continue;
                         WinLvmProbeWorkerCreateLvPdo(bus, record, i,
@@ -328,13 +335,11 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     lv_pdo->Flags |= DO_DIRECT_IO;
     lv_pdo->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    UNICODE_STRING ifname;
-    status = IoRegisterDeviceInterface(lv_pdo, &GUID_DEVINTERFACE_VOLUME,
-                                       NULL, &ifname);
-    if (NT_SUCCESS(status)) {
-        IoSetDeviceInterfaceState(&ifname, TRUE);
-        ext->ifname = ifname;
-    }
+    /* The volume interface is registered at IRP_MN_START_DEVICE, not here:
+     * IoRegisterDeviceInterface needs the PDO's devnode instance path, and
+     * no devnode exists until PnP processes this PDO via BusRelations —
+     * create-time registration fails silently and mountmgr never hears
+     * about the volume. */
 
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
@@ -369,13 +374,16 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         switch (irpSp->MinorFunction) {
         case IRP_MN_QUERY_DEVICE_RELATIONS:
             if (irpSp->Parameters.QueryDeviceRelations.Type == BusRelations) {
+                /* The bus FDO owns the BusRelations answer for its children
+                 * and completes the IRP itself (toaster busenum pattern).
+                 * Forwarding down lets the root PDO (PnpManager) replace the
+                 * answer with its own failure/empty relations — enumerated
+                 * children never materialize as devnodes (2026-09-11 kd -kl
+                 * finding: child_count=1 in the driver, zero in PnP). */
                 NTSTATUS st = WinLvmQueryBusRelations(ext, Irp);
-                if (!NT_SUCCESS(st)) {
-                    Irp->IoStatus.Status = st;
-                    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-                    return st;
-                }
-                /* fall through to forward with our relations attached */
+                Irp->IoStatus.Status = st;
+                IoCompleteRequest(Irp, IO_NO_INCREMENT);
+                return st;
             }
             break;
         case IRP_MN_START_DEVICE: {
@@ -495,17 +503,52 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_START_DEVICE:
+        /* The devnode exists by the time START arrives: register the volume
+         * interface NOW (create-time registration fails — no instance path
+         * yet), then activate so mountmgr begins its queries. */
+        if (!lvext->ifname.Buffer) {
+            UNICODE_STRING ifname;
+            NTSTATUS ifst = IoRegisterDeviceInterface(DeviceObject,
+                &GUID_DEVINTERFACE_VOLUME, NULL, &ifname);
+            if (NT_SUCCESS(ifst)) lvext->ifname = ifname;
+        }
+        if (lvext->ifname.Buffer) {
+            IoSetDeviceInterfaceState(&lvext->ifname, TRUE);
+        }
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
     case IRP_MN_QUERY_REMOVE_DEVICE:
     case IRP_MN_CANCEL_REMOVE_DEVICE:
     case IRP_MN_QUERY_STOP_DEVICE:
     case IRP_MN_CANCEL_STOP_DEVICE:
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
-    case IRP_MN_REMOVE_DEVICE:
-        /* children are removed by the bus REMOVE path; if PnP removes a
-         * child directly, complete quietly — bus REMOVE does the cleanup */
+    case IRP_MN_REMOVE_DEVICE: {
+        /* PnP removes a child directly: deactivate interface, drop self
+         * from the bus children array (else next QDR reports a freed PDO),
+         * release refs, delete self. */
+        if (lvext->ifname.Buffer) {
+            IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
+            RtlFreeUnicodeString(&lvext->ifname);
+        }
+        if (g_bus_ext) {
+            KIRQL old;
+            KeAcquireSpinLock(&g_bus_ext->lock, &old);
+            for (size_t i = 0; i < g_bus_ext->child_count; i++) {
+                if (g_bus_ext->children[i] == DeviceObject) {
+                    g_bus_ext->children[i] =
+                        g_bus_ext->children[g_bus_ext->child_count - 1];
+                    g_bus_ext->child_count--;
+                    break;
+                }
+            }
+            KeReleaseSpinLock(&g_bus_ext->lock, old);
+        }
+        ObDereferenceObject(lvext->backing_pdo);
+        IoDeleteDevice(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
+    }
     default:
         /* Raw-PDO contract: unknown PnP requests (QUERY_INTERFACE,
          * QUERY_DEVICE_TEXT, ...) must NOT complete with success —
@@ -524,7 +567,8 @@ static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
     size_t n = bus->child_count;
-    KeReleaseSpinLock(&bus->lock, old);
+    KeReleaseSpinLock(&bus->lock, &old);
+    WL_TRACE_1("QDR bus relations: %u children", (unsigned)n);
     if (n == 0) return STATUS_SUCCESS;  /* leave existing (NULL) relations */
 
     size_t bytes = sizeof(DEVICE_RELATIONS) + n * sizeof(PDEVICE_OBJECT);
