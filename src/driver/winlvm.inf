@@ -1,15 +1,16 @@
 ; winlvm.inf
 ;
-; Installation file for the winlvm Volume Manager driver.
-; This driver is root-enumerated as a bus driver (the control device)
-; and enumerates physical LVs as volume PDOs.
+; Bus driver INF: installs winlvm.sys on the root-enumerated bus devnode
+; (ROOT\winlvm). Class=System — the bus is NOT a volume; a Volume-class bus
+; makes the volume class filters (volsnap) attach to the bus stack.
+; LV volume children are matched separately by winlvm-vol.inf.
 
 [Version]
 Signature="$WINDOWS NT$"
-Class=Volume
-ClassGuid={71A27CDD-812A-11D0-BEC7-08002BE2092F}
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=07/26/2026,1.0.0.0
+DriverVer=09/11/2026,1.1.0.0
 CatalogFile=winlvm.cat
 PnpLockdown=1
 
@@ -18,15 +19,9 @@ PnpLockdown=1
 
 [Standard.NTamd64]
 %WinLvmDeviceDesc%=WinLvm_Install,ROOT\winlvm
-%WinLvmVolumeDesc%=WinLvmVolume_Install,WinLvmVolume
 
 [WinLvm_Install.NT]
 CopyFiles=WinLvm.Files
-
-[WinLvmVolume_Install.NT]
-; children are serviced by the same driver; no files to copy
-[WinLvmVolume_Install.NT.Services]
-AddService=winlvm,0x00000002,WinLvm_Service_Inst
 
 [WinLvm.Files]
 winlvm.sys
@@ -37,7 +32,7 @@ AddService=winlvm,0x00000002,WinLvm_Service_Inst
 [WinLvm_Service_Inst]
 DisplayName    = %WinLvmServiceDesc%
 ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 1               ; SERVICE_SYSTEM_START (Load after boot drivers)
+StartType      = 3               ; SERVICE_DEMAND_START (runtime install; early-boot probes deadlock)
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\winlvm.sys
 LoadOrderGroup = System Bus Extender
@@ -61,6 +56,5 @@ DefaultDestDir = 12 ; Drivers directory
 ProviderString = "winlvm"
 ManufacturerString = "winlvm"
 WinLvmDeviceDesc = "winlvm Logical Volume Manager Bus"
-WinLvmVolumeDesc = "winlvm Logical Volume"
 WinLvmServiceDesc = "winlvm Volume Manager Service"
 DiskId1 = "winlvm Installation Disk"

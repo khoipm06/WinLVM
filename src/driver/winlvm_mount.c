@@ -16,9 +16,11 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
             return STATUS_BUFFER_OVERFLOW;
         }
 
-        /* winmd returns a synthetic \Device\WinMD{uuid}; we return the
-         * registered volume interface name of this LV's PDO. */
-        ULONG nameLen = ext->ifname.Length;
+        /* mountmgr requires a \Device-namespace name it can open — the
+         * volume interface symlink is not valid here (winmd pattern). */
+        UNICODE_STRING devName;
+        RtlInitUnicodeString(&devName, ext->devname);
+        ULONG nameLen = devName.Length;
         ULONG reqSize = sizeof(MOUNTDEV_NAME) + nameLen;
 
         if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < reqSize) {
@@ -28,7 +30,7 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
 
         PMOUNTDEV_NAME mountName = (PMOUNTDEV_NAME)Irp->AssociatedIrp.SystemBuffer;
         mountName->NameLength = (USHORT)nameLen;
-        RtlCopyMemory(mountName->Name, ext->ifname.Buffer, nameLen);
+        RtlCopyMemory(mountName->Name, devName.Buffer, nameLen);
         Irp->IoStatus.Information = reqSize;
         return STATUS_SUCCESS;
     }

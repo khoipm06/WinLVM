@@ -79,6 +79,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDeviceObject) {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    /* The INF installs our service on the LV child devnodes too; stacking a
+     * second bus FDO on a child PDO we created ourselves is bus-on-bus
+     * recursion (the 2026-09-11 install crash-loop). Refuse, fail closed. */
+    if (PhysicalDeviceObject->DriverObject == DriverObject || g_bus_ext) {
+        WL_TRACE("AddDevice refused: own child PDO or bus already up");
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
     PDEVICE_OBJECT fdo = NULL;
     NTSTATUS status = IoCreateDevice(DriverObject, sizeof(WINLVM_BUS_EXT),
                                      NULL, FILE_DEVICE_BUS_EXTENDER,
@@ -249,16 +257,33 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
                                          WINLVM_VG_RECORD *record,
                                          size_t lv_index,
                                          PDEVICE_OBJECT backing_disk) {
+    /* Named device object: mountmgr requires QUERY_DEVICE_NAME to answer
+     * with a \Device namespace name it can open; the volume interface
+     * (\??\Volume{guid}) symlink is NOT a valid answer there. */
+    winlvm_logical_volume *lv0 = &record->vg.lvs[lv_index];
+    WCHAR namebuf[64];
+    RtlZeroMemory(namebuf, sizeof(namebuf));
+    UNICODE_STRING devName;
+    devName.Buffer = namebuf;
+    devName.MaximumLength = sizeof(namebuf);
+    NTSTATUS status = RtlUnicodeStringPrintf(&devName, L"\\Device\\WinLvm%hs",
+                                             lv0->id);
+    if (!NT_SUCCESS(status)) return;
+
     PDEVICE_OBJECT lv_pdo = NULL;
-    NTSTATUS status = IoCreateDevice(bus->fdo->DriverObject,
-                                     sizeof(WINLVM_LV_EXT), NULL,
+    status = IoCreateDevice(bus->fdo->DriverObject,
+                                     sizeof(WINLVM_LV_EXT), &devName,
                                      FILE_DEVICE_DISK, FILE_DEVICE_SECURE_OPEN,
                                      FALSE, &lv_pdo);
-    if (!NT_SUCCESS(status)) return;
+    if (!NT_SUCCESS(status)) {
+        WL_TRACE_1("pdo create failed 0x%x", (unsigned)status);
+        return;
+    }
 
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)lv_pdo->DeviceExtension;
     RtlZeroMemory(ext, sizeof(*ext));
     ext->kind = WL_EXT_LV;  /* dispatch discriminator — MUST precede any IRP */
+    RtlCopyMemory(ext->devname, namebuf, sizeof(namebuf));
     ext->pdo = lv_pdo;
     ext->record = record;
     ext->lv_index = lv_index;
@@ -385,8 +410,12 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             size_t i = 0;
             for (; i < 32 && lv->id[i]; i++) inst[i] = (WCHAR)lv->id[i];
             inst[i] = 0;
+            /* QUERY_ID answers are REG_MULTI_SZ lists: the string's NUL must
+             * be followed by the list-terminating NUL. A (i+1) allocation
+             * left PnP parsing one WCHAR past the block (pool overread) —
+             * the 2026-09-11 install crash. */
             PWCHAR id = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
-                (i + 1) * sizeof(WCHAR), WINLVM_WIN_TAG);
+                (i + 2) * sizeof(WCHAR), WINLVM_WIN_TAG);
             if (!id) break;
             RtlCopyMemory(id, inst, (i + 1) * sizeof(WCHAR));
             Irp->IoStatus.Information = (ULONG_PTR)id;
@@ -394,10 +423,20 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         }
         break;
     }
-    case IRP_MN_QUERY_CAPABILITIES:
+    case IRP_MN_QUERY_CAPABILITIES: {
+        /* Raw-PDO contract (Oracle-verified): with no function driver the
+         * child devnode only starts if the PDO marks itself raw-capable. */
+        PDEVICE_CAPABILITIES caps = irpSp->Parameters.DeviceCapabilities.Capabilities;
+        caps->RawDeviceOK = TRUE;
+        caps->SurpriseRemovalOK = TRUE;
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
-    case IRP_MN_QUERY_DEVICE_TEXT:
+    }
+    case IRP_MN_QUERY_RESOURCES:
+    case IRP_MN_QUERY_RESOURCE_REQUIREMENTS:
+        /* No hardware resources behind an LV; PnP requires the explicit
+         * success-with-NULL or the raw devnode never starts. */
+        Irp->IoStatus.Information = 0;
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_START_DEVICE:
@@ -413,7 +452,12 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     default:
-        Irp->IoStatus.Status = STATUS_SUCCESS;
+        /* Raw-PDO contract: unknown PnP requests (QUERY_INTERFACE,
+         * QUERY_DEVICE_TEXT, ...) must NOT complete with success —
+         * STATUS_SUCCESS on IRP_MN_QUERY_INTERFACE makes the querying
+         * driver call through its uninitialized output struct
+         * (privileged-instruction BSOD 0x7E/c0000096, 2026-09-11). */
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
         break;
     }
 

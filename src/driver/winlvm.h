@@ -61,6 +61,7 @@ typedef struct _WINLVM_LV_EXT {
     PDEVICE_OBJECT      backing_pdo;   /* PV disk PDO (referenced) */
     ULONGLONG           byte_size;
     UNICODE_STRING      ifname;        /* volume interface, if registered */
+    WCHAR               devname[64];   /* \Device\WinLvm<uuid> (mountmgr) */
 } WINLVM_LV_EXT;
 
 /* Kernel-side byte source: IRP_MJ_READ against the disk PDO. */
