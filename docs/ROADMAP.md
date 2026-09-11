@@ -1,7 +1,6 @@
 # winlvm Roadmap
 
 **Date:** 2026-07-26
-**Supersedes:** `legacy notes`, `IMPLEMENTATION_STATUS.md`, `SESSION_SUMMARY.md`
 ---
 
 ## 0. Context
@@ -218,30 +217,47 @@ Parsed-and-rejected: `mirror`, `raid*`, `thin*`, `cache*`, `snapshot`,
 **The single most important phase.** Transcribe winmd's architecture
 (`FEASIBILITY.md` §5.1), substituting LVM2 for md RAID.
 
-- WDM driver, control device + root-enumerated bus PDO via
-  `IoReportDetectedDevice`, one PDO per LV, volume FDO per PDO.
-- `winlvm.inf`: `Class = Volume`, two model entries (`ROOT\winlvm` and
-  `WinLvmVolume`).
-- Discovery by `IoRegisterPlugPlayNotification` on `GUID_DEVINTERFACE_DISK` and
-  `GUID_DEVINTERFACE_VOLUME` with
+**2026-09-11 architecture correction (as built, Oracle-audited):** the driver
+uses a root-enumerated bus devnode from the INF (`ROOT\winlvm`,
+`devcon install`), with `WinLvmAddDevice` creating the bus FDO — NOT
+`IoReportDetectedDevice` and NOT a control device. LV children are **raw PDOs**
+owned by the bus (no function driver; `RawDeviceOK=TRUE` in
+QUERY_CAPABILITIES; `winlvm-vol.inf` installs a null service), matching how
+the code is written. The bus INF is `Class=System`; the volume INF is
+`Class=Volume` — separate files, like winbtrfs's btrfs/btrfs-vol split.
+
+- WDM driver: root bus devnode (`ROOT\winlvm` INF) → bus FDO via AddDevice →
+  one raw PDO per mappable LV, reported via BusRelations.
+- `winlvm.inf` (bus, Class=System) + `winlvm-vol.inf` (children, Class=Volume,
+  raw/null-service install — an `AddService=winlvm` on children caused
+  bus-on-bus recursion and the 2026-09-11 install crash-loop).
+- Discovery by `IoRegisterPlugPlayNotification` on `GUID_DEVINTERFACE_DISK`
+  (registered at bus `IRP_MN_START_DEVICE`) with
   `PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES`; work-item deferred;
-  `IoGetDeviceObjectPointer` + `IoAllocateIrp` + `IoCallDriver` to probe the PV
+  `IoGetDeviceObjectPointer` + `IoBuildSynchronousFsdRequest` to probe the PV
   label. **Never `ZwCreateFile`.**
-- Mount manager: register `GUID_DEVINTERFACE_VOLUME`, answer
-  `IOCTL_MOUNTDEV_QUERY_DEVICE_NAME` and `IOCTL_MOUNTDEV_QUERY_UNIQUE_ID` (LV
+- Mount manager: register `GUID_DEVINTERFACE_VOLUME` on the child PDOs, answer
+  `IOCTL_MOUNTDEV_QUERY_DEVICE_NAME` (a `\Device\...` name — the interface
+  symlink is not a valid answer) and `IOCTL_MOUNTDEV_QUERY_UNIQUE_ID` (LV
   UUID). Strip stale drive letters from absorbed PVs.
 - Read path: pass-through via `IoCopyCurrentIrpStackLocationToNext` for
   single-member I/O; sub-IRP fan-out with partial MDLs for spanning I/O.
 - Writes rejected with `STATUS_MEDIA_WRITE_PROTECTED` for now.
 
-**Exit:** on a clean VM, installing via right-click→Install on `winlvm.inf`
-causes a Linux-created LV to appear in Disk Management **with a drive letter**,
-and NTFS mounts from it read-only. Screenshot and `sha256` comparison against
-the Linux oracle both committed. No `sc create` anywhere.
+**Exit:** on a clean VM, installing the bus INF (via `devcon install` — the
+INF has no `[DefaultInstall]`, so right-click→Install cannot work; devcon is
+the accepted equivalent, it performs the same PnP root-devnode install)
+causes a Linux-created LV to appear in Disk Management **with a drive letter**.
+**Evidence anchor (2026-09-11 amendment):** corpus LVs are ext4, which Windows
+cannot mount, so the committed evidence is: volume visible + drive letter +
+raw-volume read hash matching `corpus/expected/<case>/lv-hashes.txt`
+(byte-exact LV image compare). An NTFS-formatted test LV for a real mount test
+is optional follow-up. Screenshot + hash comparison committed. No `sc create`
+anywhere.
 
 ---
 
-### Phase 3 — Write path _(Stage 3)_ — ✅ **DONE**
+### Phase 3 — Write path _(Stage 3)_ — ✅ code complete / ⚠️ **Stage 3 NOT met**
 
 Data writes only. **No LVM2 metadata mutation yet.**
 
@@ -251,6 +267,12 @@ Data writes only. **No LVM2 metadata mutation yet.**
 - `IRP_MJ_SHUTDOWN` handling.
 - Honor LVM2 `system_id`: refuse read-write activation of a VG owned by another
   host. Refuse if the VG looks like it is active on Linux.
+
+**2026-09-11 status correction (Oracle audit):** code landed (`winlvm_io.c`)
+but the exit criterion — 72 h `diskspd` stress + Driver Verifier run with
+committed logs — has **never** been executed (the driver only first
+successfully installed 2026-09-11). Do not treat this phase as done until
+those artifacts exist in `tests/evidence/`.
 
 **Exit:** 72 hours of `diskspd` read/write stress with zero corruption, verified
 against Linux afterwards; clean surprise-removal behavior; and a **clean Driver
@@ -274,10 +296,24 @@ corpus, in CI.
 
 ---
 
-### Phase 5 — LUKS2, user mode first _(Stage 4)_ — 🟡 **in progress**
+### Phase 5 — LUKS2, user mode first _(Stage 4)_ — 🟡 **in progress (partial)**
 
 Build `luksfmt` + `crypto` as portable libraries, validated in user mode before
 they ever enter the kernel.
+
+**2026-09-11 status (Oracle audit):** the decrypt direction is implemented and
+tested for PBKDF2 containers (`luks_read.c`, `luks_unlock.c`, chain tests vs
+`lv-hashes.txt` oracle). Outstanding for Stage 4 as written:
+- **argon2id** (the stock-`cryptsetup`-defaults case, `luks2-default` in the
+  corpus) fails closed — needed for data volumes per D4.
+- the "cryptsetup opens what we produce" direction requires a produce/serialize
+  path that does not exist (lib is read-only). Decision needed (smart agents):
+  descope Stage 4 to decrypt-only, since the boot goal never writes LUKS headers.
+- quality gaps before any kernel fold-in (Phase 6 entry criteria): validate the
+  header `csum` field (currently read but never checked — fail-closed
+  violation), secondary-header (`SKUL\xba\xbe`) fallback, and replace the
+  shared `static json_buf[64 KiB]` in `luks_read.c` (same cross-thread race
+  class already fixed in `lvm_read.c`).
 
 - LUKS2 binary header (4096 bytes, magic `LUKS\xba\xbe`, version 2, big-endian),
   JSON area, secondary header at `SKUL\xba\xbe`.
