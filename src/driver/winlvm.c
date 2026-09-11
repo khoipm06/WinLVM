@@ -171,6 +171,7 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
     NTSTATUS status = IoGetDeviceObjectPointer(data->SymbolicLinkName,
         FILE_READ_ATTRIBUTES, &work->target_file, &work->target_disk);
     if (!NT_SUCCESS(status)) {
+        WL_TRACE_1("notify: pointer failed 0x%x", (unsigned)status);
         ExFreePoolWithTag(work, WINLVM_WIN_TAG);
         return status;
     }
@@ -189,6 +190,7 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
 void WinLvmProbeWorker(PVOID context) {
     WINLVM_PROBE_WORK *work = (WINLVM_PROBE_WORK *)context;
     WINLVM_BUS_EXT *bus = g_bus_ext;
+    WL_TRACE("probe worker start");
 
     if (bus) {
         WINLVM_DISK_SOURCE dsrc;
@@ -206,6 +208,7 @@ void WinLvmProbeWorker(PVOID context) {
         if (vg) {
             winlvm_lvm_err err;
             if (winlvm_read_vg(&src, vg, &err)) {
+                WL_TRACE_1("probe: VG parsed, lvs=%u", (unsigned)vg->lv_count);
                 KIRQL old;
                 KeAcquireSpinLock(&bus->lock, &old);
                 WINLVM_VG_RECORD *record = bus->vgs;
@@ -244,6 +247,8 @@ void WinLvmProbeWorker(PVOID context) {
                     }
                     IoInvalidateDeviceRelations(bus->pdo, BusRelations);
                 }
+            } else {
+                WL_TRACE_1("probe: parse failed: %s", err.message);
             }
             ExFreePoolWithTag(vg, WINLVM_WIN_TAG);
         }
