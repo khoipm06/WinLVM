@@ -797,19 +797,32 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
 
     /* Step 2/3: walk every metadata area, take the first readable one. */
     char *text = (char *)0;
-    /* Static buffer is fine for the test build; the driver allocates from
-     * nonpaged pool and passes its own via a wrapper if it needs more. We
-     * use a stack-like local here for testability; the driver's wrapper may
-     * prefer ExAllocatePool2. For the contract, a single caller-supplied
-     * scratch buffer of WINLVM_MAX_METADATA_BYTES suffices, but we accept
-     * the simpler static modelling here for unit tests. */
+    /* Kernel build: probe workers for multiple disks run concurrently, so
+     * the scratch buffer must be per-call, not a shared static (the shared
+     * static is a cross-thread corruption race — it caused the boot-time
+     * SYSTEM_THREAD_EXCEPTION_NOT_HANDLED in winlvm.sys). User-mode tests
+     * are single-threaded; the static keeps them allocation-free. */
+#ifdef _KERNEL_MODE
+    unsigned char *text_buf = (unsigned char *)0;
+    {
+        extern void *winlvm_probe_scratch_alloc(void);
+        extern void winlvm_probe_scratch_free(void *p);
+        text_buf = (unsigned char *)winlvm_probe_scratch_alloc();
+        if (!text_buf) {
+            wl_set_err(err, "out of memory reading LVM metadata");
+            return 0;
+        }
+    }
+#else
     static unsigned char text_buf[WINLVM_MAX_METADATA_BYTES + 1];
+#endif
     text = (char *)text_buf;
 
     winlvm_lvm_err local_err;
     wl_zero(&local_err, sizeof(local_err));
     int got_text = 0;
     size_t text_len = 0;
+    int result = 0;
     for (size_t i = 0; i < WINLVM_MAX_MD_AREAS && label.metadata_areas[i].size != 0; i++) {
         winlvm_mda_header mda;
         if (!read_mda_header(src, &label.metadata_areas[i], &mda, &local_err)) continue;
@@ -818,16 +831,21 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
             break;
         }
     }
-    if (!got_text) {
+    if (got_text) {
+        /* Step 4: parse. */
+        if (parse_vg(text, text_len, vg, &label, 0, 0)) {
+            result = 1;
+        } else {
+            wl_set_err(err, "no volume group section in metadata");
+        }
+    } else {
         wl_set_err(err, local_err.failed ? local_err.message : "no readable metadata area");
-        return 0;
     }
+#ifdef _KERNEL_MODE
+    winlvm_probe_scratch_free(text_buf);
+#endif
+    if (!result) return 0;
 
-    /* Step 4: parse. */
-    if (!parse_vg(text, text_len, vg, &label, 0, 0)) {
-        wl_set_err(err, "no volume group section in metadata");
-        return 0;
-    }
     if (vg->extent_size_sectors == 0) { wl_set_err(err, "VG declares a zero extent size"); return 0; }
     if (vg->pv_count == 0) { wl_set_err(err, "VG lists no physical volumes"); return 0; }
 

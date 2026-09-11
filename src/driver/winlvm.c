@@ -17,11 +17,29 @@
  */
 #include <initguid.h>
 #include "winlvm.h"
+/* ntstrsafe must come after the WDK headers: it needs the STATUS_* constants
+ * that ntddk.h defines (including it first breaks the build with
+ * 'STATUS_INVALID_PARAMETER: undeclared identifier' inside ntstrsafe.h). */
+#include <ntstrsafe.h>
 
 /* Globals. g_bus_ext is set by AddDevice and cleared on REMOVE; the disk
  * arrival callback may fire before AddDevice, so it must be null-checked. */
 WINLVM_BUS_EXT *g_bus_ext = NULL;
 PVOID           g_disk_notify_cookie = NULL;
+
+/* Per-call metadata scratch for lvm_read.c's kernel path: probe workers
+ * for several disks run concurrently, so no shared statics. */
+void *winlvm_probe_scratch_alloc(void) {
+    return ExAllocatePoolZero(NonPagedPool, WINLVM_MAX_METADATA_BYTES + 1,
+                             WINLVM_WIN_TAG);
+}
+
+void winlvm_probe_scratch_free(void *p) {
+    if (p) ExFreePoolWithTag(p, WINLVM_WIN_TAG);
+}
+
+#define WL_TRACE(msg) DbgPrint("winlvm: " msg "\n")
+#define WL_TRACE_1(msg, a) DbgPrint("winlvm: " msg "\n", a)
 
 static const WCHAR kBusDeviceName[] = L"\\Device\\WinLvmBus";
 static const WCHAR kBusSymLink[] = L"\\DosDevices\\WinLvmBus";
