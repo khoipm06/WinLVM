@@ -59,9 +59,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->DriverExtension->AddDevice           = WinLvmAddDevice;
     DriverObject->DriverUnload                         = WinLvmUnload;
 
-    /* PnP registration must happen after the dispatch table so a callback
-     * racing DriverEntry's return never sees a NULL handler. */
-    NTSTATUS status = IoRegisterPlugPlayNotification(
+    /* PnP registration happens at bus START (WinLvmPnp IRP_MN_START_DEVICE),
+     * not here: existing-disk callbacks fired in DriverEntry would race
+     * ahead of AddDevice and see g_bus_ext == NULL, so their probes would
+     * be dropped and the LVs never enumerated. */
+    WL_TRACE("DriverEntry");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
+    if (g_disk_notify_cookie) return STATUS_SUCCESS;
+    return IoRegisterPlugPlayNotification(
         EventCategoryDeviceInterfaceChange,
         PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
         (PVOID)&GUID_DEVINTERFACE_DISK,
@@ -69,7 +77,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         WinLvmPnpDiskNotify,
         NULL,
         &g_disk_notify_cookie);
-    return status;
+}
+
+typedef struct {
+    WORK_QUEUE_ITEM item;
+    PDRIVER_OBJECT  driver;
+} WINLVM_REGISTER_WORK;
+
+static VOID WinLvmRegisterWorker(PVOID context) {
+    WINLVM_REGISTER_WORK *work = (WINLVM_REGISTER_WORK *)context;
+    /* Bus may have been removed while this worker sat queued: registering
+     * then would leave a cookie pointing at a dead bus and block the next
+     * devnode cycle from re-registering. */
+    if (g_bus_ext) WinLvmRegisterDiskNotify(work->driver);
+    ExFreePoolWithTag(work, WINLVM_WIN_TAG);
 }
 
 /* --------------------------------------------------------------- */
@@ -357,6 +378,27 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 /* fall through to forward with our relations attached */
             }
             break;
+        case IRP_MN_START_DEVICE: {
+            IoSkipCurrentIrpStackLocation(Irp);
+            NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
+            /* Register disk notifications only from a work item AFTER the
+             * start transaction closes: INCLUDE_EXISTING callbacks fire
+             * probes synchronously enough that child-devnode installs +
+             * IoInvalidateDeviceRelations landed INSIDE this still-open
+             * "Starting device" PnP transaction — the 2026-09-11 install
+             * rollback (300 s timeout, service deleted, log cut at
+             * "Starting device"). g_bus_ext is live from AddDevice. */
+            if (NT_SUCCESS(st)) {
+                WINLVM_REGISTER_WORK *work = ExAllocatePoolZero(NonPagedPool,
+                    sizeof(WINLVM_REGISTER_WORK), WINLVM_WIN_TAG);
+                if (work) {
+                    ExInitializeWorkItem(&work->item, WinLvmRegisterWorker, work);
+                    work->driver = DeviceObject->DriverObject;
+                    ExQueueWorkItem(&work->item, DelayedWorkQueue);
+                }
+            }
+            return st;
+        }
         case IRP_MN_REMOVE_DEVICE: {
             IoSkipCurrentIrpStackLocation(Irp);
             NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
@@ -375,6 +417,14 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 ObDereferenceObject(ext->vgs->backing_pdo);
                 ExFreePoolWithTag(ext->vgs, WINLVM_WIN_TAG);
                 ext->vgs = NULL;
+            }
+            /* Drop the disk-interface registration with the bus: leaving the
+             * cookie set makes the next devnode cycle's START skip
+             * re-registration (WinLvmRegisterDiskNotify early-outs), so a
+             * disable/enable would silently stop finding LVs forever. */
+            if (g_disk_notify_cookie) {
+                IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
+                g_disk_notify_cookie = NULL;
             }
             IoDetachDevice(ext->bus_pdo);
             if (g_bus_ext == ext) g_bus_ext = NULL;
