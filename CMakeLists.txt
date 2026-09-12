@@ -84,6 +84,16 @@ if(ZSTD_EXE)
   # Pass the raw corpus images directory
   add_test(NAME winlvm_driver_parser_tests COMMAND winlvm_driver_parser_tests "${CORPUS_OUT}")
 
+  # Adversarial vectors for the freestanding parser: stripe-array boundary,
+  # CRC edge cases, wraparound sizes, fail-closed typeless segments. Fully
+  # synthetic — no corpus dependency.
+  add_executable(winlvm_lvm_hardening_tests
+    tests/lvm_read/test_lvm_read_hardening.c
+    src/driver/lvm_read.c
+  )
+  target_include_directories(winlvm_lvm_hardening_tests PRIVATE src/driver)
+  add_test(NAME winlvm_lvm_hardening_tests COMMAND winlvm_lvm_hardening_tests)
+
   add_executable(winlvm_luks_tests
     tests/luks_read/test_luks_read.c
     src/luksfmt/luks_read.c

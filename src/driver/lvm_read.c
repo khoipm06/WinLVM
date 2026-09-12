@@ -91,7 +91,10 @@ uint32_t winlvm_lvm_crc32(const void *data, size_t len) {
 
 static int src_read_full(winlvm_byte_source *src, uint64_t off,
                          void *buf, size_t len) {
-    if (off + len > src->size) return 0;
+    /* Wrap-checked: `off + len` alone can rotate past src->size on
+     * adversarial on-disk numbers, and the (0,0)-terminated area lists
+     * hand us attacker-chosen offsets before any validation. */
+    if (off > src->size || len > src->size - off) return 0;
     size_t got = src->read(src->impl, off, buf, len);
     return got == len;
 }
@@ -182,9 +185,10 @@ static const char MDA_MAGIC[16] = { ' ','L','V','M','2',' ','x','[',
 #define MDA_HEADER_SIZE 512u
 
 static int read_mda_header(winlvm_byte_source *src, const winlvm_disk_area *area,
-                           winlvm_mda_header *out, winlvm_lvm_err *err) {
+                            winlvm_mda_header *out, winlvm_lvm_err *err) {
     if (area->size < MDA_HEADER_SIZE ||
-        area->offset + area->size > src->size) {
+        area->offset > src->size ||
+        area->size > src->size - area->offset) {
         wl_set_err(err, "metadata area lies outside the device");
         return 0;
     }
@@ -341,9 +345,19 @@ static int p_int(parser *ps, uint64_t *out) {
         ps->pos++;
     }
     if (ps->pos >= ps->len || ps->p[ps->pos] < '0' || ps->p[ps->pos] > '9') return 0;
+    /* Saturate at INT64_MAX like lvmfmt's strtoll, instead of wrapping
+     * mod 2^64 — the two parsers must agree on adversarial metadata
+     * (contract: lvm_read.h "MUST match the C++ lvmfmt library"). */
     uint64_t v = 0;
     while (ps->pos < ps->len && ps->p[ps->pos] >= '0' && ps->p[ps->pos] <= '9') {
-        v = v * 10 + (uint64_t)(ps->p[ps->pos] - '0');
+        uint64_t digit = (uint64_t)(ps->p[ps->pos] - '0');
+        if (v > ((uint64_t)INT64_MAX - digit) / 10) { v = (uint64_t)INT64_MAX; }
+        else v = v * 10 + digit;
+        if (v == (uint64_t)INT64_MAX) {
+            /* drain remaining digits so the cursor lands past the number */
+            while (ps->pos < ps->len && ps->p[ps->pos] >= '0' && ps->p[ps->pos] <= '9') ps->pos++;
+            break;
+        }
         ps->pos++;
     }
     *out = neg ? 0 : v;
@@ -495,7 +509,7 @@ static void parse_lv_body(parser *ps, winlvm_logical_volume *lv) {
                     }
                 }
             }
-            else if (wl_streq(key, "id"))   p_string(ps, lv->id, sizeof(lv->id));
+            else if (wl_streq(key, "id"))   { char v[64]; if (p_string(ps, v, sizeof(v))) { wl_strip_dashes(v); wl_strcpy(lv->id, sizeof(lv->id), v); } }
             else {
                 /* skip a value or array */
                 if (ps->pos < ps->len && ps->p[ps->pos] == '[') {

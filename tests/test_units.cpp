@@ -21,6 +21,46 @@ TEST(checked_arithmetic_refuses_to_wrap) {
   CHECK(!range_fits(UINT64_MAX, 1, UINT64_MAX));
 }
 
+// The exact arithmetic the extent math does on untrusted disk numbers:
+// pe_start + stripe_offset*extent_size must refuse to wrap rather than
+// map a read at a rotated address. Mirrors src/driver/lvm_read.c's C++
+// counterpart in mapping.cpp (build_dm_table's checked_add/checked_mul).
+TEST(overflow_paths_hit_by_extent_math_shapes) {
+  // (2^32 extents) * (2^32 sectors) wraps uint64 — must be nullopt.
+  CHECK(!checked_mul(1ull << 32, 1ull << 32).has_value());
+  // pe_start near UINT64_MAX + 1 sector must refuse.
+  CHECK(!checked_add(UINT64_MAX - 511, 512).has_value());
+  // A range starting near the top must not fit even a 1-byte length.
+  CHECK(!range_fits(UINT64_MAX, 1, UINT64_MAX));
+  // Exactly-at-the-end fits; one past does not.
+  CHECK(range_fits(UINT64_MAX - 1, 1, UINT64_MAX));
+  CHECK(!range_fits(UINT64_MAX, 1, UINT64_MAX));
+  // The two largest representable products that must still succeed.
+  CHECK(checked_mul(UINT64_MAX, 1).value() == UINT64_MAX);
+  CHECK(checked_add(UINT64_MAX, 0).value() == UINT64_MAX);
+  // Zero-length range at any offset fits (read_metadata_text relies on
+  // this class of boundary for its `first`/`wrapped` split).
+  CHECK(range_fits(UINT64_MAX, 0, UINT64_MAX));
+  CHECK(range_fits(0, 0, 0));
+}
+
+// LVM CRC-32 against the one vector we have from a real corpus label:
+// the constants must never silently change to the zlib variant.
+TEST(lvm_crc32_edge_vectors) {
+  // Initial value is LVM2's INITIAL_CRC (third_party/lvm2 lib/misc/crc.h).
+  CHECK_EQ(lvm_crc32("", 0), 0xf597a6cfu);
+  // Incremental application must compose exactly like a one-shot call:
+  // calc_crc(calc_crc(INIT, a), b) == calc_crc(INIT, a||b). This is how
+  // LVM applies it to the label (fixed span) and text (fixed span).
+  const char two[] = "xy";
+  const uint32_t chained = lvm_crc32("y", 1, lvm_crc32("x", 1, lvm_crc32("", 0)));
+  CHECK_EQ(lvm_crc32(two, 2), chained);
+  // Reflected poly 0xedb88320: crc of a single 0x01 differs from crc of a
+  // single 0x80 — guards against table-build regressions (the kernel-side
+  // build_crc_table had exactly this shape; see src/driver/lvm_read.c).
+  CHECK(lvm_crc32("\x01", 1) != lvm_crc32("\x80", 1));
+}
+
 TEST(little_endian_readers) {
   const std::uint8_t buf[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
   CHECK_EQ(le16(buf), std::uint16_t{0x0201});
