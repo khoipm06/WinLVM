@@ -23,11 +23,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = WinLvmCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = WinLvmCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = WinLvmCreateClose;
     DriverObject->MajorFunction[IRP_MJ_READ]           = WinLvmRead;
     DriverObject->MajorFunction[IRP_MJ_WRITE]          = WinLvmWrite;
     DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS]  = WinLvmFlush;
     DriverObject->MajorFunction[IRP_MJ_SHUTDOWN]       = WinLvmShutdown;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = WinLvmDeviceControl;
+    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = WinLvmSystemControl;
     DriverObject->MajorFunction[IRP_MJ_PNP]            = WinLvmPnp;
     DriverObject->MajorFunction[IRP_MJ_POWER]          = WinLvmPower;
     DriverObject->DriverExtension->AddDevice           = WinLvmAddDevice;
@@ -58,6 +60,20 @@ NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return STATUS_SUCCESS;
+}
+
+/* Verifier 0x21F root cause (dedicated.dmp, 2026-09-12): VfWmiTestStartedPdoStack
+ * sends WMI IRPs at every started devnode; a NULL IRP_MJ_SYSTEM_CONTROL slot in
+ * the dispatch table is a bugcheck. We register no WMI guidance, so completing
+ * with STATUS_INVALID_DEVICE_REQUEST (the WMI-contract answer for "no WMI
+ * support") is the fail-closed contract, same shape winbtrfs drv_system_control
+ * uses for objects without WMI data. */
+NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
 
 /* PnP discriminator: the bus FDO half lives in winlvm_bus.c, the LV PDO
