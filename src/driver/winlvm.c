@@ -64,19 +64,18 @@ NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 /* Verifier 0x21F root cause (dedicated.dmp, 2026-09-12): VfWmiTestStartedPdoStack
  * sends WMI IRPs at every started devnode; a NULL IRP_MJ_SYSTEM_CONTROL slot in
- * the dispatch table is a bugcheck. We register no WMI guidance. Contract
- * (grounded: ReactOS usbport PDO path + winbtrfs drv_system_control + classpnp
- * ClassSystemControl): FDO forwards WMI to its lower driver; a PDO at the
- * bottom of its stack completes with the IoStatus PnP shipped the IRP with
- * (NOT_SUPPORTED) - overwriting it (0x220: "completed by someone other than
- * the ProviderId") breaks the WMI manager's provider bookkeeping. */
+ * the dispatch table is a bugcheck. We register no WMI guidance (never call
+ * IoWMIRegistrationControl), so no WMI IRP ever legitimately targets us as
+ * provider. Contract (MS bug-check 0xC9 table + WmiSystemControl doc + winbtrfs
+ * drv_system_control): a driver that is not the ProviderId must forward - but
+ * forwarding from the root bus FDO to PnpManager's root PDO made a third party
+ * complete the verifier probe (0x220: 'completed by someone other than the
+ * ProviderId', flagged at winlvm+0x1160 in v17.dmp). The 0x220 wording for the
+ * lowest-level driver: 'it must complete the IRP'. For a driver with no WMI
+ * registration and no providers below, the lowest-layer completion is the
+ * untouched IoStatus pass-through for BOTH extensions. */
 NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
-    if (kind == WL_EXT_BUS) {
-        WINLVM_BUS_EXT *bus = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
-        IoSkipCurrentIrpStackLocation(Irp);
-        return IoCallDriver(bus->bus_pdo, Irp);
-    }
+    UNREFERENCED_PARAMETER(DeviceObject);
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return Irp->IoStatus.Status;
