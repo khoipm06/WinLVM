@@ -90,13 +90,21 @@ size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) 
     return got;
 }
 
+static NTSTATUS WinLvmForwardCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
+    if (Irp->PendingReturned) {
+        IoMarkIrpPending(Irp);
+    }
+    return STATUS_SUCCESS;
+}
+
 /* Pass-through: I/O entirely within one segment forwards with a shifted
  * byte offset (winmd's linear.c pattern). Parameters is a union, so
  * Read.ByteOffset and Write.ByteOffset alias the same storage. */
 static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-    PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
 
     size_t seg;
     uint64_t off_in_seg;
@@ -108,11 +116,12 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return STATUS_END_OF_FILE;
     }
 
-    *nextSp = *irpSp;
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
     nextSp->Parameters.Read.ByteOffset.QuadPart =
         (LONGLONG)LvPvByteOffset(ext, seg, off_in_seg);
 
-    IoSetCompletionRoutine(Irp, NULL, NULL, FALSE, FALSE, FALSE);
+    IoSetCompletionRoutine(Irp, WinLvmForwardCompletion, NULL, TRUE, TRUE, TRUE);
     return IoCallDriver(ext->backing_pdo, Irp);
 }
 
@@ -186,7 +195,7 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_INVALID_DEVICE_REQUEST;
     }
-    IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(ext->backing_pdo, Irp);
 }
 

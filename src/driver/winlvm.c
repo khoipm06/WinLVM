@@ -155,7 +155,7 @@ NTSTATUS WinLvmPower(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
     WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
     PoStartNextPowerIrp(Irp);
-    IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoSkipCurrentIrpStackLocation(Irp);
     return PoCallDriver(ext->bus_pdo, Irp);
 }
 
@@ -374,6 +374,13 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
 
 static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp);
 
+static NTSTATUS WinLvmSyncCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Irp);
+    KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
 NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
@@ -397,8 +404,18 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             }
             break;
         case IRP_MN_START_DEVICE: {
-            IoSkipCurrentIrpStackLocation(Irp);
+            /* WDM FDO contract: an FDO must wait for the lower driver to
+             * complete START before starting itself, then complete the IRP.
+             * Skipping down without waiting trips Verifier PnpStartDevice rule. */
+            KEVENT event;
+            KeInitializeEvent(&event, NotificationEvent, FALSE);
+            IoCopyCurrentIrpStackLocationToNext(Irp);
+            IoSetCompletionRoutine(Irp, WinLvmSyncCompletion, &event, TRUE, TRUE, TRUE);
             NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
+            if (st == STATUS_PENDING) {
+                KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+                st = Irp->IoStatus.Status;
+            }
             if (NT_SUCCESS(st)) {
                 WINLVM_REGISTER_WORK *work = ExAllocatePoolZero(NonPagedPool,
                     sizeof(WINLVM_REGISTER_WORK), WINLVM_WIN_TAG);
@@ -408,6 +425,8 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     ExQueueWorkItem(&work->item, DelayedWorkQueue);
                 }
             }
+            Irp->IoStatus.Status = st;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
             return st;
         }
         case IRP_MN_REMOVE_DEVICE: {
@@ -454,6 +473,12 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_TRACE_1("child pnp minor 0x%x", (unsigned)irpSp->MinorFunction);
     switch (irpSp->MinorFunction) {
     case IRP_MN_QUERY_ID: {
+        /* Verifier 0x20E: every PnP IRP must be initialized to
+         * STATUS_NOT_SUPPORTED before dispatch logic. Alloc-failure breaks
+         * and unhandled IdTypes (CompatibleIDs, ContainerID, LegacyBusType)
+         * would otherwise complete with the I/O manager's sentinel status. */
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = 0;
         BUS_QUERY_ID_TYPE type = irpSp->Parameters.QueryId.IdType;
         WL_TRACE_1("child query id type %d", (int)type);
         if (type == BusQueryHardwareIDs) {
