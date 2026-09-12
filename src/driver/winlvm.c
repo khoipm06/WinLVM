@@ -86,6 +86,16 @@ typedef struct {
 
 static VOID WinLvmRegisterWorker(PVOID context) {
     WINLVM_REGISTER_WORK *work = (WINLVM_REGISTER_WORK *)context;
+    WL_TRACE("register worker entry");
+    /* F10 fix: PnP START transaction holds devnode lock across post-start.
+     * DelayedWorkQueue can execute immediately on another core before PnP
+     * unwinds, so IoRegisterPlugPlayNotification(INCLUDE_EXISTING) callback's
+     * IoGetDeviceObjectPointer deadlocks with the open devnode lock.
+     * 2s relative delay lets the START transaction close completely. */
+    LARGE_INTEGER delay;
+    delay.QuadPart = -20000000LL;  /* 2 seconds relative (100ns units) */
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    WL_TRACE("register worker delay done");
     /* Bus may have been removed while this worker sat queued: registering
      * then would leave a cookie pointing at a dead bus and block the next
      * devnode cycle from re-registering. */
@@ -389,13 +399,6 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         case IRP_MN_START_DEVICE: {
             IoSkipCurrentIrpStackLocation(Irp);
             NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
-            /* Register disk notifications only from a work item AFTER the
-             * start transaction closes: INCLUDE_EXISTING callbacks fire
-             * probes synchronously enough that child-devnode installs +
-             * IoInvalidateDeviceRelations landed INSIDE this still-open
-             * "Starting device" PnP transaction — the 2026-09-11 install
-             * rollback (300 s timeout, service deleted, log cut at
-             * "Starting device"). g_bus_ext is live from AddDevice. */
             if (NT_SUCCESS(st)) {
                 WINLVM_REGISTER_WORK *work = ExAllocatePoolZero(NonPagedPool,
                     sizeof(WINLVM_REGISTER_WORK), WINLVM_WIN_TAG);
@@ -567,10 +570,13 @@ static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
     size_t n = bus->child_count;
-    KeReleaseSpinLock(&bus->lock, &old);
+    KeReleaseSpinLock(&bus->lock, old);
     WL_TRACE_1("QDR bus relations: %u children", (unsigned)n);
-    if (n == 0) return STATUS_SUCCESS;  /* leave existing (NULL) relations */
 
+    /* WDM contract: BusRelations completed with STATUS_SUCCESS must ALWAYS
+     * carry a valid PDEVICE_RELATIONS in Information — even with zero
+     * children. Returning success with Information = NULL made PnP
+     * dereference NULL right after START (2026-09-12 install freeze). */
     size_t bytes = sizeof(DEVICE_RELATIONS) + n * sizeof(PDEVICE_OBJECT);
     PDEVICE_RELATIONS rel = (PDEVICE_RELATIONS)ExAllocatePoolZero(
         NonPagedPool, bytes, WINLVM_WIN_TAG);
