@@ -244,6 +244,17 @@ the code is written. The bus INF is `Class=System`; the volume INF is
   single-member I/O; sub-IRP fan-out with partial MDLs for spanning I/O.
 - Writes rejected with `STATUS_MEDIA_WRITE_PROTECTED` for now.
 
+**2026-09-12 module split:** the source tree follows winmd's
+single-responsibility file layout — `winlvm.c` (DriverEntry + dispatch wiring
++ the PnP/device-control kind discriminators), `winlvm_bus.c` (bus FDO:
+AddDevice, disk-interface notify, probe worker, BusRelations),
+`winlvm_child.c` (LV PDO PnP: QUERY_ID/CAPS/START/REMOVE),
+`winlvm_power.c` (power), `winlvm_io.c` (read/write/flush/shutdown +
+PV byte source), `winlvm_mount.c` (MOUNTDEV/geometry IOCTLs), and the
+freestanding `lvm_read.c` parser. Pure code movement from the former
+monolithic `winlvm.c` — dispatch wiring verified identical, no behavior
+change.
+
 **Exit:** on a clean VM, installing the bus INF (via `devcon install` — the
 INF has no `[DefaultInstall]`, so right-click→Install cannot work; devcon is
 the accepted equivalent, it performs the same PnP root-devnode install)

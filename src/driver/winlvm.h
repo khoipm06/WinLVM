@@ -29,6 +29,10 @@
 #define WINLVM_WIN_TAG ((unsigned long)'WMLV')
 #define WL_MAX_CHILDREN 32
 
+/* Tracing (shared by winlvm.c / winlvm_bus.c / winlvm_child.c). */
+#define WL_TRACE(msg) DbgPrint("winlvm: " msg "\n")
+#define WL_TRACE_1(msg, a) DbgPrint("winlvm: " msg "\n", a)
+
 /* Device ID and Hardware IDs reported by child LV PDOs.
  * WDM contract: DeviceID MUST have the form <enumerator>\<device-id> with a
  * backslash, else PnP cannot build the device instance path and drops the
@@ -95,6 +99,10 @@ DRIVER_DISPATCH WinLvmPower;
 
 NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context);
 void WinLvmProbeWorker(PVOID);
+
+/* winlvm_bus.c / winlvm_child.c — kind halves of WinLvmPnp. */
+DRIVER_DISPATCH WinLvmBusPnp;
+DRIVER_DISPATCH WinLvmChildPnp;
 
 /* winlvm_io.c */
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len);

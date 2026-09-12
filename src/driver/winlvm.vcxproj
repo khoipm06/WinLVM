@@ -75,10 +75,13 @@
  </ItemGroup>
   <ItemGroup>
     <ClCompile Include="winlvm.c" />
+    <ClCompile Include="winlvm_bus.c" />
+    <ClCompile Include="winlvm_child.c" />
+    <ClCompile Include="winlvm_power.c" />
     <ClCompile Include="winlvm_io.c" />
     <ClCompile Include="winlvm_mount.c" />
     <ClCompile Include="lvm_read.c" />
- </ItemGroup>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
