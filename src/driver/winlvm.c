@@ -451,22 +451,25 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     /* ---- LV PDO (child of our bus): we are the bottom of its stack ---- */
     WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+    WL_TRACE_1("child pnp minor 0x%x", (unsigned)irpSp->MinorFunction);
     switch (irpSp->MinorFunction) {
     case IRP_MN_QUERY_ID: {
         BUS_QUERY_ID_TYPE type = irpSp->Parameters.QueryId.IdType;
+        WL_TRACE_1("child query id type %d", (int)type);
         if (type == BusQueryHardwareIDs) {
             /* must match the INF's WinLvmVolume model entry */
             PWCHAR ids = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
-                sizeof(WinLvmHwId) + sizeof(WCHAR) * 2, WINLVM_WIN_TAG);
+                sizeof(WinLvmHwId), WINLVM_WIN_TAG);
             if (!ids) break;
             RtlCopyMemory(ids, WinLvmHwId, sizeof(WinLvmHwId));
             Irp->IoStatus.Information = (ULONG_PTR)ids;
             Irp->IoStatus.Status = STATUS_SUCCESS;
         } else if (type == BusQueryDeviceID) {
+            /* WDM contract: DeviceID MUST have <enumerator>\<device-id> form */
             PWCHAR id = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
-                sizeof(WinLvmHwId), WINLVM_WIN_TAG);
+                sizeof(WinLvmDeviceId), WINLVM_WIN_TAG);
             if (!id) break;
-            RtlCopyMemory(id, WinLvmHwId, sizeof(WinLvmHwId));
+            RtlCopyMemory(id, WinLvmDeviceId, sizeof(WinLvmDeviceId));
             Irp->IoStatus.Information = (ULONG_PTR)id;
             Irp->IoStatus.Status = STATUS_SUCCESS;
         } else if (type == BusQueryInstanceID) {
@@ -476,10 +479,6 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             size_t i = 0;
             for (; i < 32 && lv->id[i]; i++) inst[i] = (WCHAR)lv->id[i];
             inst[i] = 0;
-            /* QUERY_ID answers are REG_MULTI_SZ lists: the string's NUL must
-             * be followed by the list-terminating NUL. A (i+1) allocation
-             * left PnP parsing one WCHAR past the block (pool overread) —
-             * the 2026-09-11 install crash. */
             PWCHAR id = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
                 (i + 2) * sizeof(WCHAR), WINLVM_WIN_TAG);
             if (!id) break;
@@ -492,6 +491,7 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     case IRP_MN_QUERY_CAPABILITIES: {
         /* Raw-PDO contract (Oracle-verified): with no function driver the
          * child devnode only starts if the PDO marks itself raw-capable. */
+        WL_TRACE("child query caps");
         PDEVICE_CAPABILITIES caps = irpSp->Parameters.DeviceCapabilities.Capabilities;
         caps->RawDeviceOK = TRUE;
         caps->SurpriseRemovalOK = TRUE;
@@ -506,6 +506,7 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_START_DEVICE:
+        WL_TRACE("child START");
         /* The devnode exists by the time START arrives: register the volume
          * interface NOW (create-time registration fails — no instance path
          * yet), then activate so mountmgr begins its queries. */
@@ -586,7 +587,13 @@ static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     rel->Count = (ULONG)n;
     for (size_t i = 0; i < n; i++) {
         rel->Objects[i] = bus->children[i];
-        /* PnP takes its own references when it consumes the relations. */
+        /* WDM contract: the bus driver must reference each reported PDO;
+         * PnP consumes that reference when it ingests the devnode. Reporting
+         * without it leaves the PDO delete-pending (refcount 1->0) and the
+         * devnode never materializes (2026-09-12 kd -kl: refcount 0,
+         * DO_BUS_ENUMERATED set, zero devnodes). Winbtrfs volume.c:149
+         * references the same way. */
+        ObReferenceObject(bus->children[i]);
     }
     KeReleaseSpinLock(&bus->lock, old);
 

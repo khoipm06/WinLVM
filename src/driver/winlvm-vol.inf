@@ -21,6 +21,7 @@ PnpLockdown=1
 %ManufacturerString%=Standard,NTamd64
 
 [Standard.NTamd64]
+%WinLvmVolumeDesc%=WinLvmVolume_Install,WinLvm\Volume
 %WinLvmVolumeDesc%=WinLvmVolume_Install,WinLvmVolume
 
 [WinLvmVolume_Install.NT]

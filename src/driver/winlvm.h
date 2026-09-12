@@ -29,8 +29,12 @@
 #define WINLVM_WIN_TAG ((unsigned long)'WMLV')
 #define WL_MAX_CHILDREN 32
 
-/* Hardware ID reported by child LV PDOs; matches the INF model entry. */
-static const WCHAR WinLvmHwId[] = L"WinLvmVolume\0";  /* REG_MULTI_SZ */
+/* Device ID and Hardware IDs reported by child LV PDOs.
+ * WDM contract: DeviceID MUST have the form <enumerator>\<device-id> with a
+ * backslash, else PnP cannot build the device instance path and drops the
+ * devnode without error. HardwareIDs is a REG_MULTI_SZ matching the INF. */
+static const WCHAR WinLvmDeviceId[] = L"WinLvm\\Volume";
+static const WCHAR WinLvmHwId[] = L"WinLvm\\Volume\0WinLvmVolume\0";  /* REG_MULTI_SZ */
 
 typedef enum { WL_EXT_BUS = 0x31425553, WL_EXT_LV = 0x32564C53 } WL_EXT_KIND;
 
