@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     uint64_t image_size = (uint64_t)WL_FTELL64(f);
     WL_FSEEK64(f, 0, SEEK_SET);
 
+    static unsigned char jscratch[WL_LUKS_JSON_SCRATCH_MAX];
+
     winlvm_byte_source src = {
         .impl = f,
         .size = image_size,
@@ -45,7 +47,7 @@ int main(int argc, char **argv) {
 
     winlvm_luks_metadata md;
     winlvm_luks_err err = {0};
-    if (!winlvm_luks_read_metadata(&src, &md, &err)) {
+    if (!winlvm_luks_read_metadata(&src, jscratch, &md, &err)) {
         fprintf(stderr, "LUKS2 read failed: %s\n", err.message);
         fclose(f);
         return 1;

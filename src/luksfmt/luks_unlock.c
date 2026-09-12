@@ -122,6 +122,10 @@ int winlvm_luks_unlock_keyslot(winlvm_byte_source *src,
         set_uerr(err, "unsupported keyslot KDF (pbkdf2 only)");
         return 0;
     }
+    if (!wl_streq2(ks->kdf.hash, "sha256")) {
+        set_uerr(err, "unsupported KDF hash (sha256 only)");
+        return 0;
+    }
     if (ks->key_size == 0 || ks->key_size > WL_LUKS_MAX_KEY_SIZE) {
         set_uerr(err, "keyslot key_size out of range");
         return 0;
@@ -130,17 +134,35 @@ int winlvm_luks_unlock_keyslot(winlvm_byte_source *src,
         set_uerr(err, "keyslot stripe count out of range");
         return 0;
     }
+    if (!wl_streq2(ks->af_type, "luks1")) {
+        set_uerr(err, "unsupported AF splitter (luks1 only)");
+        return 0;
+    }
+    if (!wl_streq2(ks->af_hash, "sha256")) {
+        set_uerr(err, "unsupported AF hash (sha256 only)");
+        return 0;
+    }
+    /* Keyslot area cipher: per luks2_keyslot_luks2.c, the PBKDF2 output
+     * length is area.key_size and the XTS key for the area is that many
+     * bytes. Fail closed on anything but aes-xts-plain64 with a 64-byte
+     * key (AES-256-XTS). */
+    if (!wl_streq2(ks->area_encryption[0] ? ks->area_encryption : "aes-xts-plain64",
+                   "aes-xts-plain64")) {
+        set_uerr(err, "unsupported keyslot area cipher");
+        return 0;
+    }
+    uint64_t area_key_len = ks->area_key_size ? ks->area_key_size : ks->key_size;
+    if (area_key_len != 64) {
+        set_uerr(err, "expected a 64-byte aes-xts-plain64 area key");
+        return 0;
+    }
     size_t need = (size_t)ks->key_size * (size_t)ks->af_stripes;
-    if (need > ks->area_size) {
-        set_uerr(err, "keyslot area too small for AF stripes");
+    if (ks->area_size < need || ks->area_size % 512 != 0) {
+        set_uerr(err, "keyslot area too small or not 512-aligned");
         return 0;
     }
     if (volume_key_cap < ks->key_size) {
         set_uerr(err, "volume_key buffer too small");
-        return 0;
-    }
-    if (ks->key_size != 64) {
-        set_uerr(err, "expected a 64-byte aes-xts-plain64 keyslot key");
         return 0;
     }
     if (scratch_cap < need) {
@@ -148,28 +170,33 @@ int winlvm_luks_unlock_keyslot(winlvm_byte_source *src,
         return 0;
     }
 
-    /* 1. area key from the passphrase */
+    /* 1. area key from the passphrase (length = area key size) */
     uint8_t kdf_salt[64];
     size_t salt_len = b64_decode(ks->kdf_salt_b64, kdf_salt, sizeof(kdf_salt));
     if (salt_len == 0) { set_uerr(err, "invalid KDF salt"); return 0; }
+    if (ks->kdf.iterations == 0) {
+        set_uerr(err, "invalid KDF iteration count");
+        return 0;
+    }
 
     uint8_t area_key[WL_LUKS_MAX_KEY_SIZE];
     wl_pbkdf2_sha256(passphrase, passphrase_len,
                      kdf_salt, salt_len,
                      (uint32_t)ks->kdf.iterations,
-                     area_key, (size_t)ks->key_size);
+                     area_key, (size_t)area_key_len);
 
     /* 2. decrypt the keyslot area: XTS with the area key, plain64 sector
-     *    numbers starting at 0 at area_offset. The XTS key size equals the
-     *    keyslot key size (e.g. 32 bytes => AES-128-XTS for a 16-byte area
-     *    key never occurs; cryptsetup uses key_size/2 AES with full XTS —
-     *    for key_size 64 the area key IS the 64-byte XTS key). */
-    if (ks->key_size != 64) { set_uerr(err, "expected aes-xts 64-byte key"); return 0; }
+     *    numbers starting at 0 at area_offset (cryptsetup's storage
+     *    wrapper decrypts with iv_start 0 relative to the area offset). */
     wl_xts_ctx xts;
     wl_xts_init(&xts, area_key, 64);
 
     uint8_t *area_buf = scratch;
     size_t sect = (need + 511) / 512;
+    if (ks->area_offset > UINT64_MAX - sect * 512) {
+        set_uerr(err, "keyslot area offset overflows");
+        return 0;
+    }
 
     uint8_t sector[512];
     size_t have = 0;
@@ -201,11 +228,16 @@ int winlvm_luks_verify_key(const winlvm_luks_metadata *md,
     if (md->digest_count < 1) return 0;
     const winlvm_luks_digest *d = &md->digests[0];
     if (!wl_streq2(d->type, "pbkdf2")) return 0;
+    if (!wl_streq2(d->kdf.hash, "sha256")) return 0;
 
     uint8_t salt[64], stored[64], computed[32];
     size_t salt_len = b64_decode(d->salt_b64, salt, sizeof(salt));
     size_t stored_len = b64_decode(d->digest_b64, stored, sizeof(stored));
-    if (salt_len == 0 || stored_len != 32) return 0;
+    /* Per luks2_digest_pbkdf2.c: salt is exactly 32 bytes; the digest is
+     * either 20 bytes (LUKS1 SHA1 legacy) or the hash size (32 for
+     * sha256). We only accept sha256, so exactly 32. */
+    if (salt_len != 32 || stored_len != 32) return 0;
+    if (d->kdf.iterations == 0) return 0;
 
     wl_pbkdf2_sha256(volume_key, key_len, salt, salt_len,
                      (uint32_t)d->kdf.iterations, computed, 32);
@@ -235,6 +267,14 @@ int winlvm_luks_decrypt_region(winlvm_byte_source *src,
     wl_xts_init(&xts, volume_key, 64);
 
     uint64_t first_sector = start_byte / sector_size;
+    if (start_byte % sector_size != 0) {
+        set_uerr(err, "start offset not sector aligned");
+        return 0;
+    }
+    if (seg->offset > UINT64_MAX - start_byte - len) {
+        set_uerr(err, "segment offset+range overflows");
+        return 0;
+    }
     for (uint64_t i = 0; i < len / sector_size; i++) {
         uint8_t tweak[16];
         plain64_tweak(first_sector + i + seg->iv_tweak, tweak);
@@ -258,10 +298,14 @@ size_t winlvm_luks_view_read(winlvm_luks_view *view,
     if (len == 0 || !view || !view->backing) return 0;
     const winlvm_luks_segment *seg = &view->md->segments[0];
     uint64_t ss = seg->sector_size ? seg->sector_size : 512;
+    if (ss != 512 && ss != 4096) return 0;
+    if (view->key_len != 64) return 0;
 
+    if (offset > UINT64_MAX - len) return 0;
     uint64_t first = (offset / ss) * ss;
     uint64_t covered_end = ((offset + len + ss - 1) / ss) * ss;
     if (covered_end - first > (4ull << 20)) return 0;  /* 4 MiB sanity cap */
+    if (seg->offset > UINT64_MAX - covered_end) return 0;
 
     uint8_t sector[4096];
     if (ss > sizeof(sector)) return 0;

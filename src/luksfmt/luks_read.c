@@ -16,6 +16,7 @@
  * from nonpaged pool / boot-start driver / UEFI DXE contexts.
  */
 #include "luks_read.h"
+#include "../crypto/wl_sha256.h"
 
 #ifndef _KERNEL_MODE
 #include <string.h>
@@ -54,35 +55,10 @@ static void wl_set_err(winlvm_luks_err *err, const char *msg) {
     wl_strcpy(err->message, sizeof(err->message), msg);
 }
 
-/* Re-export the same CRC32 used by lvm_read.c. We duplicate the few-byte
- * implementation here rather than introduce a header cycle. The polynomial
- * matches LVM2's non-standard CRC32 (poly 0xedb88320, init 0xf597a6cf, no
- * final XOR) — see third_party/cryptsetup/lib/luks2/luks2_disk_metadata.c
- * which calls crypt_hash_final; LUKS2 uses an external message digest
- * (sha256 etc.), NOT crc32. So the csum field is *not* validated via CRC
- * at all — it is verified by computing the chosen digest over
- * (binary header with csum zeroed || json area) and comparing. */
-static uint32_t crc32_table[256];
-static int crc32_table_built = 0;
-
-static void build_crc32_table(void) {
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++)
-            c = (c & 1) ? (0xedb88320u ^ (c >> 1)) : (c >> 1);
-        crc32_table[i] = c;
-    }
-    crc32_table_built = 1;
-}
-
-static uint32_t luks_crc32(const void *data, size_t len) {
-    if (!crc32_table_built) build_crc32_table();
-    const unsigned char *p = (const unsigned char *)data;
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < len; i++)
-        crc = crc32_table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
-    return crc ^ 0xffffffffu;
-}
+/* LUKS2 header integrity uses a message digest (checksum_alg, sha256),
+ * verified in winlvm_luks_read_metadata — see luks2_disk_metadata.c
+ * hdr_checksum_check. There is no CRC32 anywhere in the LUKS2 on-disk
+ * format. */
 
 static uint16_t be16(const unsigned char *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
@@ -138,8 +114,12 @@ int winlvm_luks_read_header(winlvm_byte_source *src,
     out->hdr_offset = be64(buf + 256);
     WL_MEMCPY(out->csum,           buf + 448, LUKS2_CHECKSUM_L);
 
-    if (out->hdr_size < LUKS2_HDR_BIN_LEN || out->hdr_size > 128ull * 1024 * 1024) {
-        wl_set_err(err, "LUKS2 hdr_size out of range");
+    if (out->hdr_size < LUKS2_HDR_16K_LEN) {
+        wl_set_err(err, "LUKS2 hdr_size below 16 KiB minimum");
+        return 0;
+    }
+    if (out->hdr_size > LUKS2_HDR_OFFSET_MAX) {
+        wl_set_err(err, "LUKS2 hdr_size above 4 MiB maximum");
         return 0;
     }
     return 1;
@@ -293,26 +273,6 @@ static int jp_next_kv(json_parser *jp, char *out_key, size_t out_cap) {
     return 1;
 }
 
-/* Parse a kdf sub-object, which holds type/hash/iterations/time/memory/cpus.
- * Per luks2_keyslot.c / luks2_digest.c. Consumes the opening '{' itself. */
-static void parse_kdf(json_parser *jp, winlvm_luks_kdf *kdf) {
-    jp_skip_ws(jp);
-    if (jp->pos >= jp->len || jp->p[jp->pos] != '{') return;
-    jp->pos++;
-    char key[64];
-    while (jp_next_kv(jp, key, sizeof(key))) {
-        if (!strcmp(key, "type")) jp_read_string(jp, kdf->type, sizeof(kdf->type));
-        else if (!strcmp(key, "hash")) jp_read_string(jp, kdf->hash, sizeof(kdf->hash));
-        else if (!strcmp(key, "iterations")) jp_read_int(jp, &kdf->iterations);
-        else if (!strcmp(key, "time")) jp_read_int(jp, &kdf->time);
-        else if (!strcmp(key, "memory")) jp_read_int(jp, &kdf->memory);
-        else if (!strcmp(key, "cpus")) jp_read_int(jp, &kdf->cpus);
-        else if (!strcmp(key, "salt")) jp_skip_value(jp);
-        else jp_skip_value(jp);
-    }
-    if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
-}
-
 /* Parse a segment object: { type, offset, size, iv_tweak, encryption,
  * sector_size }. Per luks2_segment.c. Consumes the opening '{' itself. */
 static void parse_segment(json_parser *jp, winlvm_luks_segment *seg) {
@@ -386,6 +346,8 @@ static void parse_keyslot(json_parser *jp, winlvm_luks_keyslot *ks) {
                 while (jp_next_kv(jp, k2, sizeof(k2))) {
                     if (!strcmp(k2, "offset")) jp_read_int_or_string(jp, &ks->area_offset);
                     else if (!strcmp(k2, "size")) jp_read_int_or_string(jp, &ks->area_size);
+                    else if (!strcmp(k2, "encryption")) jp_read_string(jp, ks->area_encryption, sizeof(ks->area_encryption));
+                    else if (!strcmp(k2, "key_size")) jp_read_int_or_string(jp, &ks->area_key_size);
                     else jp_skip_value(jp);
                 }
                 if (jp->pos < jp->len && jp->p[jp->pos] == '}') jp->pos++;
@@ -418,6 +380,7 @@ static void parse_digest(json_parser *jp, winlvm_luks_digest *d) {
  * --------------------------------------------------------------- */
 
 int winlvm_luks_read_metadata(winlvm_byte_source *src,
+                              unsigned char *json_scratch,
                               winlvm_luks_metadata *out_md,
                               winlvm_luks_err *err) {
     if (err) err->failed = 0;
@@ -425,6 +388,11 @@ int winlvm_luks_read_metadata(winlvm_byte_source *src,
 
     winlvm_luks_header hdr;
     if (!winlvm_luks_read_header(src, 0, &hdr, err)) return 0;
+
+    if (hdr.hdr_offset != 0) {
+        wl_set_err(err, "primary header hdr_offset must be 0");
+        return 0;
+    }
 
     if (hdr.hdr_size < LUKS2_HDR_BIN_LEN) {
         wl_set_err(err, "hdr_size too small");
@@ -435,17 +403,46 @@ int winlvm_luks_read_metadata(winlvm_byte_source *src,
         wl_set_err(err, "JSON area too large to allocate in nonpaged pool");
         return 0;
     }
-    /* We allocate a scratch buffer for the JSON area. The caller owns
-     * out_md; we use a temporary stack buffer limited to 64 KiB which is
-     * enough for normal LUKS2 metadata. */
-    static unsigned char json_buf[64 * 1024];
-    if (json_len > sizeof(json_buf)) {
-        wl_set_err(err, "JSON area exceeds in-place buffer");
+    unsigned char *json_buf = json_scratch;
+    if (!json_buf) {
+        wl_set_err(err, "JSON scratch buffer required");
+        return 0;
+    }
+    if (json_len > WL_LUKS_JSON_SCRATCH_MAX) {
+        wl_set_err(err, "JSON area exceeds scratch buffer");
         return 0;
     }
     if (!src->read(src->impl, LUKS2_HDR_BIN_LEN, json_buf, json_len)) {
         wl_set_err(err, "failed to read JSON area");
         return 0;
+    }
+
+    /* Verify the header checksum before trusting anything in it:
+     * per luks2_disk_metadata.c hdr_checksum_check, SHA-256 over
+     * (binary header with csum zeroed || full JSON area), compared
+     * against the stored csum's first hash-length bytes. Fail closed
+     * on mismatch or on an unsupported checksum algorithm. */
+    {
+        unsigned char cbuf[LUKS2_HDR_BIN_LEN];
+        if (!src->read(src->impl, 0, cbuf, LUKS2_HDR_BIN_LEN)) {
+            wl_set_err(err, "failed to re-read header for checksum");
+            return 0;
+        }
+        if (!wl_streq(hdr.checksum_alg, "sha256")) {
+            wl_set_err(err, "unsupported checksum algorithm");
+            return 0;
+        }
+        wl_zero(cbuf + 448, LUKS2_CHECKSUM_L);
+        uint8_t digest[32];
+        wl_sha256_ctx hc;
+        wl_sha256_init(&hc);
+        wl_sha256_update(&hc, cbuf, LUKS2_HDR_BIN_LEN);
+        wl_sha256_update(&hc, json_buf, json_len);
+        wl_sha256_final(&hc, digest);
+        if (WL_MEMCMP(digest, hdr.csum, 32) != 0) {
+            wl_set_err(err, "LUKS2 header checksum mismatch");
+            return 0;
+        }
     }
 
     /* Walk the JSON top-level object looking for known keys. */

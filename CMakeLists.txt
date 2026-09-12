@@ -81,8 +81,9 @@ if(ZSTD_EXE)
   if(TARGET corpus)
     add_dependencies(winlvm_driver_parser_tests corpus)
   endif()
-  # Pass the raw corpus images directory
-  add_test(NAME winlvm_driver_parser_tests COMMAND winlvm_driver_parser_tests "${CORPUS_OUT}")
+  # Pass the raw corpus images directory; oracles come from the source tree
+  add_test(NAME winlvm_driver_parser_tests
+    COMMAND winlvm_driver_parser_tests "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
 
   # Adversarial vectors for the freestanding parser: stripe-array boundary,
   # CRC edge cases, wraparound sizes, fail-closed typeless segments. Fully
@@ -97,8 +98,9 @@ if(ZSTD_EXE)
   add_executable(winlvm_luks_tests
     tests/luks_read/test_luks_read.c
     src/luksfmt/luks_read.c
+    src/crypto/wl_sha256.c
   )
-  target_include_directories(winlvm_luks_tests PRIVATE src/luksfmt)
+  target_include_directories(winlvm_luks_tests PRIVATE src/luksfmt src/crypto)
   if(TARGET corpus)
     add_dependencies(winlvm_luks_tests corpus)
   endif()
@@ -117,7 +119,10 @@ if(ZSTD_EXE)
   if(TARGET corpus)
     add_dependencies(winlvm_luks_unlock_tests corpus)
   endif()
-  add_test(NAME winlvm_luks_unlock_tests COMMAND winlvm_luks_unlock_tests "${CORPUS_OUT}/luks2-pbkdf2.img")
+  add_test(NAME winlvm_luks_unlock_tests
+    COMMAND winlvm_luks_unlock_tests
+            "${CORPUS_OUT}/luks2-pbkdf2.img"
+            "${CORPUS_SRC}/expected")
 
   # LUKS+LVM integration: unlock container, parse PV, hash LV vs oracle.
   add_executable(winlvm_luks_lvm_chain_tests
@@ -146,6 +151,25 @@ if(ZSTD_EXE)
   )
   target_include_directories(winlvm_crypto_tests PRIVATE src/crypto)
   add_test(NAME winlvm_crypto_tests COMMAND winlvm_crypto_tests)
+
+  # Stage 4 KDF support matrix: pbkdf2 = supported, argon2id = documented
+  # NOT_SUPPORTED (fail closed), tampered-header rejection.
+  add_executable(winlvm_luks_kdf_matrix_tests
+    tests/luks_read/test_luks_kdf_matrix.c
+    src/luksfmt/luks_read.c
+    src/luksfmt/luks_unlock.c
+    src/crypto/wl_sha256.c
+    src/crypto/wl_aes_xts.c
+  )
+  target_include_directories(winlvm_luks_kdf_matrix_tests PRIVATE
+    src/luksfmt src/crypto)
+  if(TARGET corpus)
+    add_dependencies(winlvm_luks_kdf_matrix_tests corpus)
+  endif()
+  add_test(NAME winlvm_luks_kdf_matrix_tests
+    COMMAND winlvm_luks_kdf_matrix_tests
+            "${CORPUS_OUT}/luks2-default.img"
+            "${CORPUS_OUT}/luks2-pbkdf2.img")
 endif()
 enable_testing()
 

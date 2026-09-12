@@ -34,6 +34,9 @@ extern "C" {
 
 #define LUKS2_DEFAULT_HDR_SIZE    0x1000000ull   /* 16 MiB */
 #define LUKS2_HDR_16K_LEN         0x4000ull      /* 16 KiB (minimum) */
+/* Per cryptsetup luks2.h: header (hdr_size incl. JSON area) must be
+ * between 16 KiB and 4 MiB (LUKS2_HDR_OFFSET_MAX). */
+#define LUKS2_HDR_OFFSET_MAX      0x400000ull    /* 4 MiB (maximum) */
 
 /* Basic error reporting. */
 typedef struct {
@@ -105,6 +108,11 @@ typedef struct {
     char     af_type[64];         /* "luks1" */
     uint64_t af_stripes;          /* 4000 by default */
     char     af_hash[64];         /* "sha256" */
+    /* Keyslot area encryption (luks2_keyslot_luks2.c reads these from the
+     * area object; the derived key length is area.key_size, NOT the
+     * top-level key_size which describes the volume key). */
+    char     area_encryption[64]; /* e.g. "aes-xts-plain64" */
+    uint64_t area_key_size;       /* derived (area-cipher) key bytes */
 } winlvm_luks_keyslot;
 
 /* Top-level parsed metadata. */
@@ -127,8 +135,13 @@ int winlvm_luks_read_header(winlvm_byte_source *src,
                             winlvm_luks_err *err);
 
 /* Read & parse the full LUKS2 metadata: primary header + JSON area.
- * Fills out_md. */
+ * Fills out_md. json_scratch is caller-owned scratch of at least
+ * WL_LUKS_JSON_SCRATCH_MAX bytes (kept caller-side so kernel callers can
+ * use nonpaged pool and concurrent probes share no static state). */
+#define WL_LUKS_JSON_SCRATCH_MAX (64u * 1024)
+
 int winlvm_luks_read_metadata(winlvm_byte_source *src,
+                              unsigned char *json_scratch,
                               winlvm_luks_metadata *out_md,
                               winlvm_luks_err *err);
 

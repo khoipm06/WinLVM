@@ -33,8 +33,8 @@ static int fails = 0, passes = 0;
     else { fails++; printf("[ FAIL ] %s\n", name); } } while (0)
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <luks2-pbkdf2 image>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <luks2-pbkdf2 image> <corpus-expected-dir>\n", argv[0]);
         return 1;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -42,12 +42,13 @@ int main(int argc, char **argv) {
     WL_FSEEK64(f, 0, SEEK_END);
     uint64_t image_size = (uint64_t)WL_FTELL64(f);
 
+    static unsigned char jscratch[WL_LUKS_JSON_SCRATCH_MAX];
     winlvm_byte_source src = { f, image_size, file_read };
 
     /* 1. metadata */
     winlvm_luks_metadata md;
     winlvm_luks_err err = {0};
-    if (!winlvm_luks_read_metadata(&src, &md, &err)) {
+    if (!winlvm_luks_read_metadata(&src, jscratch, &md, &err)) {
         fprintf(stderr, "metadata: %s\n", err.message);
         return 1;
     }
@@ -94,30 +95,142 @@ int main(int argc, char **argv) {
         CHECK("decrypted payload is an LVM2 PV (LABELONE)", memcmp(buf, "LABELONE", 8) == 0);
     }
 
-    /* 6. whole-LV hash (16 MiB) — compare against Linux oracle on stdout */
+    /* 6. LV-content hash vs Linux oracle. The LUKS payload is the PV, not
+     * the LV: lvboot starts at the PV 1st-PE offset (pvs.txt oracle).
+     * Decrypt the LV's first 128 KiB through decrypt_region and compare
+     * against the lv-hashes range-0 oracle line. */
     {
-        const size_t LV = 16u * 1024 * 1024;
-        uint8_t *buf = (uint8_t *)malloc(LV);
-        if (!buf) { fprintf(stderr, "oom\n"); return 1; }
+        char path[512];
+        uint64_t pe_start = 0;
+        snprintf(path, sizeof(path), "%s/luks2-pbkdf2/pvs.txt", argv[2]);
+        FILE *pf = fopen(path, "r");
+        if (!pf) { printf("[ FAIL ] open %s\n", path); fails++; }
+        else {
+            char line[1024];
+            while (fgets(line, sizeof(line), pf)) {
+                if (strstr(line, "vgboot") == NULL) continue;
+                char *p = strtok(line, " \t\n");
+                int col = 0;
+                while (p) {
+                    if (++col == 5) { pe_start = strtoull(p, NULL, 10); break; }
+                    p = strtok(NULL, " \t\n");
+                }
+                break;
+            }
+            fclose(pf);
+        }
+        CHECK("PV 1st-PE parsed from pvs.txt oracle", pe_start == 1048576);
+
+        char oracle[65] = {0};
+        snprintf(path, sizeof(path), "%s/luks2-pbkdf2/lv-hashes.txt", argv[2]);
+        FILE *hf = fopen(path, "r");
+        if (!hf) { printf("[ FAIL ] open %s\n", path); fails++; }
+        else {
+            char line[512];
+            while (fgets(line, sizeof(line), hf))
+                if (strncmp(line, "lvboot offset=0 length=131072 sha256=", 37) == 0)
+                    memcpy(oracle, line + 37, 64);
+            fclose(hf);
+        }
+
+        const size_t RANGE = 131072;
+        uint8_t *buf = (uint8_t *)malloc(RANGE);
         winlvm_luks_unlock_err e4 = {0};
-        if (!winlvm_luks_decrypt_region(&src, &md, volume_key, 64, 0, buf, LV, &e4)) {
+        if (!winlvm_luks_decrypt_region(&src, &md, volume_key, 64, pe_start,
+                                        buf, RANGE, &e4)) {
             fprintf(stderr, "decrypt: %s\n", e4.message);
             free(buf);
             return 1;
         }
         uint8_t h[32];
-        wl_sha256(buf, LV, h);
-        printf("LV sha256: ");
-        for (int i = 0; i < 32; i++) printf("%02x", h[i]);
-        printf("  (compare against corpus/expected/luks2-pbkdf2/lv-hashes.txt lvcrypt whole sha256)\n");
+        wl_sha256(buf, RANGE, h);
+        char ours[65];
+        for (int i = 0; i < 32; i++) snprintf(ours + 2*i, 3, "%02x", h[i]);
         free(buf);
-        passes++;
+        if (oracle[0] == 0) { printf("[ FAIL ] oracle range-0 line missing\n"); fails++; }
+        else if (strcmp(ours, oracle) == 0) {
+            passes++;
+            printf("[  OK  ] LV first-128KiB sha256 matches Linux oracle\n");
+        } else {
+            fails++;
+            printf("[ FAIL ] LV range hash %s != oracle %s\n", ours, oracle);
+        }
     }
 
-    /* 7. volume key vs committed master-key oracle (printed for eyeball) */
-    printf("MK: ");
-    for (int i = 0; i < 64; i++) printf("%02x", volume_key[i]);
-    printf("  (compare against MASTER-KEY-INSECURE-TEST-ONLY.txt)\n");
+    /* 7. volume key hard assert vs committed master-key oracle
+     *    (bytes start on the "MK dump:" line itself) */
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/luks2-pbkdf2/MASTER-KEY-INSECURE-TEST-ONLY.txt", argv[2]);
+        FILE *mf = fopen(path, "r");
+        if (!mf) { printf("[ FAIL ] open %s\n", path); fails++; }
+        else {
+            char line[256];
+            uint8_t mk[64]; size_t n = 0;
+            int in_dump = 0;
+            while (n < 64 && fgets(line, sizeof(line), mf)) {
+                if (strncmp(line, "MK dump:", 8) == 0) {
+                    in_dump = 1;
+                    /* first byte row shares this line after the marker */
+                    char *rest = line + 8;
+                    for (char *tok = strtok(rest, " \t\n"); tok && n < 64; tok = strtok(NULL, " \t\n")) {
+                        char *end = NULL;
+                        unsigned long v = strtoul(tok, &end, 16);
+                        if (*end != '\0' || end == tok) break;
+                        mk[n++] = (uint8_t)v;
+                    }
+                    continue;
+                }
+                if (!in_dump) continue;
+                for (char *tok = strtok(line, " \t\n"); tok && n < 64; tok = strtok(NULL, " \t\n")) {
+                    char *end = NULL;
+                    unsigned long v = strtoul(tok, &end, 16);
+                    if (*end != '\0' || end == tok) break;
+                    mk[n++] = (uint8_t)v;
+                }
+            }
+            fclose(mf);
+            CHECK("volume key equals committed master key", n == 64 && memcmp(mk, volume_key, 64) == 0);
+        }
+    }
+
+    /* 8. KDF edge cases: iteration count and salt are honored — a keyslot
+     *    whose declared iterations differ from what unlock uses must fail
+     *    the digest (proves we actually consume kdf.iterations and kdf_salt). */
+    {
+        winlvm_luks_metadata md2;
+        winlvm_luks_err e5 = {0};
+        winlvm_byte_source src2 = { f, image_size, file_read };
+        (void)winlvm_luks_read_metadata(&src2, jscratch, &md2, &e5);
+        md2.keyslots[0].kdf.iterations += 1;   /* wrong count -> wrong area key */
+        uint8_t vk2[64];
+        static uint8_t scratch2[WL_LUKS_UNLOCK_SCRATCH_MAX];
+        winlvm_luks_unlock_err e6 = {0};
+        int klen2 = winlvm_luks_unlock_keyslot(&src2, &md2, 0, pass, strlen(pass),
+                                               vk2, sizeof(vk2),
+                                               scratch2, sizeof(scratch2), &e6);
+        CHECK("modified iterations -> wrong key (digest fails)",
+              klen2 > 0 && !winlvm_luks_verify_key(&md2, vk2, 64));
+
+        winlvm_luks_metadata md3 = md2;
+        md3.keyslots[0].kdf.iterations -= 1;
+        md3.keyslots[0].kdf_salt_b64[0] = md3.keyslots[0].kdf_salt_b64[0] == 'A' ? 'B' : 'A';
+        int klen3 = winlvm_luks_unlock_keyslot(&src2, &md3, 0, pass, strlen(pass),
+                                               vk2, sizeof(vk2),
+                                               scratch2, sizeof(scratch2), &e6);
+        CHECK("modified salt -> wrong key (digest fails)",
+              (klen3 <= 0) || !winlvm_luks_verify_key(&md3, vk2, 64));
+    }
+
+    /* 9. unaligned / oversized requests refused */
+    {
+        uint8_t tmp[512];
+        winlvm_luks_unlock_err e7 = {0};
+        CHECK("unaligned length refused",
+              !winlvm_luks_decrypt_region(&src, &md, volume_key, 64, 0, tmp, 511, &e7));
+        CHECK("unaligned start refused",
+              !winlvm_luks_decrypt_region(&src, &md, volume_key, 64, 100, tmp, 512, &e7));
+    }
 
     fclose(f);
     printf("\n%d passed, %d failed\n", passes, fails);

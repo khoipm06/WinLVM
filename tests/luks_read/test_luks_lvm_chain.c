@@ -61,12 +61,13 @@ int main(int argc, char **argv) {
     if (!f) { perror(argv[1]); return 1; }
     WL_FSEEK64(f, 0, SEEK_END);
     uint64_t image_size = (uint64_t)WL_FTELL64(f);
+    static unsigned char jscratch[WL_LUKS_JSON_SCRATCH_MAX];
     winlvm_byte_source file_src = { f, image_size, file_read };
 
     /* 1. metadata + unlock */
     winlvm_luks_metadata md;
     winlvm_luks_err err = {0};
-    CHECK("luks2 metadata parses", winlvm_luks_read_metadata(&file_src, &md, &err));
+    CHECK("luks2 metadata parses", winlvm_luks_read_metadata(&file_src, jscratch, &md, &err));
 
     uint8_t volume_key[64];
     static uint8_t scratch[WL_LUKS_UNLOCK_SCRATCH_MAX];
