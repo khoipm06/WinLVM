@@ -4,6 +4,7 @@
  * MOUNTDEV queries plus the storage geometry/length queries partmgr and
  * mountmgr issue before they will treat the device as a volume. Everything
  * else returns STATUS_INVALID_DEVICE_REQUEST, which is a valid answer. */
+#include <stddef.h>   /* offsetof — MOUNTDEV variable-length sizing */
 #include "winlvm.h"
 
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext) {
@@ -11,49 +12,57 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
     ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
 
     if (code == IOCTL_MOUNTDEV_QUERY_DEVICE_NAME) {
+        /* MSDN contract (mountmgr/ni-mountmgr-ioctl_mountdev_query_device_name):
+         * buffer < sizeof(MOUNTDEV_NAME) is not answerable at all — the
+         * caller cannot even see the NameLength field. winbtrfs volume.c:313
+         * answers STATUS_BUFFER_TOO_SMALL for that case; we match. */
         if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(MOUNTDEV_NAME)) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_NAME);
-            return STATUS_BUFFER_OVERFLOW;
+            return STATUS_BUFFER_TOO_SMALL;
         }
+
+        PMOUNTDEV_NAME mountName = (PMOUNTDEV_NAME)Irp->AssociatedIrp.SystemBuffer;
 
         /* mountmgr requires a \Device-namespace name it can open — the
          * volume interface symlink is not valid here (winmd pattern). */
         UNICODE_STRING devName;
         RtlInitUnicodeString(&devName, ext->devname);
-        ULONG nameLen = devName.Length;
-        ULONG reqSize = sizeof(MOUNTDEV_NAME) + nameLen;
+        mountName->NameLength = (USHORT)devName.Length;
 
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < reqSize) {
+        /* MSDN: too small for header+name -> Information = sizeof(MOUNTDEV_NAME),
+         * Status = STATUS_BUFFER_OVERFLOW, and the NameLength member MUST be
+         * filled so the caller can size its retry (winbtrfs volume.c:321-323
+         * identical, modulo its TOO_SMALL/OF split). offsetof, not sizeof:
+         * the header size is the length field plus the name that follows it. */
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength <
+            offsetof(MOUNTDEV_NAME, Name) + devName.Length) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_NAME);
             return STATUS_BUFFER_OVERFLOW;
         }
 
-        PMOUNTDEV_NAME mountName = (PMOUNTDEV_NAME)Irp->AssociatedIrp.SystemBuffer;
-        mountName->NameLength = (USHORT)nameLen;
-        RtlCopyMemory(mountName->Name, devName.Buffer, nameLen);
-        Irp->IoStatus.Information = reqSize;
+        RtlCopyMemory(mountName->Name, devName.Buffer, devName.Length);
+        Irp->IoStatus.Information = offsetof(MOUNTDEV_NAME, Name) + devName.Length;
         return STATUS_SUCCESS;
     }
 
     if (code == IOCTL_MOUNTDEV_QUERY_UNIQUE_ID) {
         if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(MOUNTDEV_UNIQUE_ID)) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_UNIQUE_ID);
-            return STATUS_BUFFER_OVERFLOW;
+            return STATUS_BUFFER_TOO_SMALL;
         }
 
         winlvm_logical_volume *lv = &ext->record->vg.lvs[ext->lv_index];
-        ULONG idLen = 32; /* raw UUID */
-        ULONG reqSize = sizeof(MOUNTDEV_UNIQUE_ID) + idLen;
+        PMOUNTDEV_UNIQUE_ID uniqueId = (PMOUNTDEV_UNIQUE_ID)Irp->AssociatedIrp.SystemBuffer;
+        uniqueId->UniqueIdLength = 32; /* raw 32-char LV UUID (dashes stripped) */
 
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < reqSize) {
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength <
+            offsetof(MOUNTDEV_UNIQUE_ID, UniqueId) + 32) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_UNIQUE_ID);
             return STATUS_BUFFER_OVERFLOW;
         }
 
-        PMOUNTDEV_UNIQUE_ID uniqueId = (PMOUNTDEV_UNIQUE_ID)Irp->AssociatedIrp.SystemBuffer;
-        uniqueId->UniqueIdLength = (USHORT)idLen;
-        RtlCopyMemory(uniqueId->UniqueId, lv->id, idLen);
-        Irp->IoStatus.Information = reqSize;
+        RtlCopyMemory(uniqueId->UniqueId, lv->id, 32);
+        Irp->IoStatus.Information = offsetof(MOUNTDEV_UNIQUE_ID, UniqueId) + 32;
         return STATUS_SUCCESS;
     }
 
