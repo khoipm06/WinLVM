@@ -135,7 +135,8 @@ NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     switch (disposition) {
     case IrpProcessed:
-        /* WmiSystemControl completed the IRP itself. */
+        /* Toaster canonical: IRP already completed by wmilib/DpWmiXxx —
+         * completing again = double-complete crash. Do nothing. */
         return status;
     case IrpNotCompleted:
         /* Wmilib filled IoStatus but left completion to us. */
