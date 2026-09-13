@@ -129,7 +129,7 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             KeReleaseSpinLock(&g_bus_ext->lock, old);
             if (rec) {
                 if (rec->disk_ifname.Buffer)
-                    RtlFreeUnicodeString(&rec->disk_ifname);
+                    ExFreePoolWithTag(rec->disk_ifname.Buffer, WINLVM_WIN_TAG);
                 ObDereferenceObject(rec->backing_pdo);
                 ExFreePoolWithTag(rec, WINLVM_WIN_TAG);
             }

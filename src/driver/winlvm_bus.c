@@ -158,11 +158,21 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
     if (!work) return STATUS_INSUFFICIENT_RESOURCES;
 
     /* stash the arrival link: the worker stores it on the VG record so a
-     * later REMOVAL notification can match this disk back to the record */
-    if (!NT_SUCCESS(RtlDuplicateUnicodeString(
-            RTL_DUPLICATE_UNICODE_STRING_NULL_TERMINATE,
-            data->SymbolicLinkName, &work->ifname)))
-        RtlZeroMemory(&work->ifname, sizeof(work->ifname));
+     * later REMOVAL notification can match this disk back to the record.
+     * (No RtlDuplicateUnicodeString — that's ntifs-only; manual copy.) */
+    {
+        USHORT n = data->SymbolicLinkName->Length;
+        PWCHAR buf = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
+            n + sizeof(WCHAR), WINLVM_WIN_TAG);
+        if (buf) {
+            RtlCopyMemory(buf, data->SymbolicLinkName->Buffer, n);
+            work->ifname.Buffer = buf;
+            work->ifname.Length = n;
+            work->ifname.MaximumLength = (USHORT)(n + sizeof(WCHAR));
+        } else {
+            RtlZeroMemory(&work->ifname, sizeof(work->ifname));
+        }
+    }
 
     NTSTATUS status = IoGetDeviceObjectPointer(data->SymbolicLinkName,
         FILE_READ_ATTRIBUTES, &work->target_file, &work->target_disk);
@@ -269,7 +279,7 @@ void WinLvmProbeWorker(PVOID context) {
 
     ObDereferenceObject(work->target_file);  /* pair from IoGetDeviceObjectPointer */
     if (work->ifname.Buffer)              /* never stored on a record */
-        RtlFreeUnicodeString(&work->ifname);
+        ExFreePoolWithTag(work->ifname.Buffer, WINLVM_WIN_TAG);
     ExFreePoolWithTag(work, WINLVM_WIN_TAG);
 }
 
