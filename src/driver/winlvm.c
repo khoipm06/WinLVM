@@ -62,23 +62,104 @@ NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     return STATUS_SUCCESS;
 }
 
-/* Verifier 0x21F root cause (dedicated.dmp, 2026-09-12): VfWmiTestStartedPdoStack
- * sends WMI IRPs at every started devnode; a NULL IRP_MJ_SYSTEM_CONTROL slot in
- * the dispatch table is a bugcheck. We register no WMI guidance (never call
- * IoWMIRegistrationControl), so no WMI IRP ever legitimately targets us as
- * provider. Contract (MS bug-check 0xC9 table + WmiSystemControl doc + winbtrfs
- * drv_system_control): a driver that is not the ProviderId must forward - but
- * forwarding from the root bus FDO to PnpManager's root PDO made a third party
- * complete the verifier probe (0x220: 'completed by someone other than the
- * ProviderId', flagged at winlvm+0x1160 in v17.dmp). The 0x220 wording for the
- * lowest-level driver: 'it must complete the IRP'. For a driver with no WMI
- * registration and no providers below, the lowest-layer completion is the
- * untouched IoStatus pass-through for BOTH extensions. */
+/* Verifier 0x220 saga (dedicated.dmp sequence, 2026-09-12): VfWmiTestStartedPdoStack
+ * sends WMI IRPs at every started devnode.
+ *   - 0x21F: NULL IRP_MJ_SYSTEM_CONTROL dispatch slot → wire a handler.
+ *   - v17 0x220: bus FDO forwarded the probe down to PnpManager's root PDO —
+ *     the completing driver was outside the ProviderId's stack.
+ *   - v18 0x220: bus FDO completed the probe in-driver with no WMI
+ *     registration — still not the recognized WMI provider for the LV PDO.
+ * Root asymmetry (Oracle verdict, 2026-09-12): the verifier probe's ProviderId
+ * is a device object outside the bus stack — the LV child PDO — and with no
+ * IoWMIRegistrationControl anywhere, no in-stack routing can ever satisfy it.
+ * Decisive fix (H5, classpnp/Toaster pattern): register a zero-GUID
+ * WMILIB_CONTEXT on BOTH the bus FDO and every LV child PDO at START and
+ * dispatch through WmiSystemControl, so the WMI core has a real "who owns WMI
+ * here" answer and routes ProviderId-addressed probes to the LV PDO's own
+ * stack, where the PDO (bottom of stack) legitimately completes them. */
+NTSTATUS WinLvmQueryWmiRegInfo(PDEVICE_OBJECT DeviceObject, PULONG RegFlags,
+                               PUNICODE_STRING InstanceName,
+                               PUNICODE_STRING *RegistryPath,
+                               PUNICODE_STRING MofResourceName,
+                               PDEVICE_OBJECT *Pdo) {
+    /* WDK 26100 WMI_QUERY_REGINFO_CALLBACK: GuidCount/GuidList are
+     * WMILIB_CONTEXT fields, not callback params (the v18 signature was a
+     * silent ABI mismatch). InstanceName and MofResourceName are only
+     * consumed when INSTANCE_PDO / a MOF resource are absent — leave intact. */
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind != WL_EXT_BUS && kind != WL_EXT_LV) {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    *RegFlags = WMIREG_FLAG_INSTANCE_PDO;
+    *RegistryPath = NULL;   /* no registry-backed WMI data; SAL maybenull */
+    *Pdo = (kind == WL_EXT_BUS)
+        ? ((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->pdo
+        : DeviceObject;
+    return STATUS_SUCCESS;
+}
+
+void WinLvmWmiInit(PDEVICE_OBJECT DeviceObject) {
+    /* Caller (START_DEVICE) runs at PASSIVE_LEVEL — IoWMIRegistrationControl
+     * requirement. Failure is nonfatal: registering is what makes the WMI
+     * core hold a provider entry for this device (Oracle H5); if it fails
+     * the stack still functions, only verifier probes stay unsatisfiable. */
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    WMILIB_CONTEXT *wmi = (kind == WL_EXT_BUS)
+        ? &((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->wmi
+        : &((WINLVM_LV_EXT *)DeviceObject->DeviceExtension)->wmi;
+
+    RtlZeroMemory(wmi, sizeof(*wmi));
+    wmi->QueryWmiRegInfo = WinLvmQueryWmiRegInfo;
+
+    NTSTATUS st = IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_REGISTER);
+    WL_TRACE_1("wmi register 0x%x", (unsigned)st);
+}
+
 NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    UNREFERENCED_PARAMETER(DeviceObject);
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return Irp->IoStatus.Status;
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind != WL_EXT_BUS && kind != WL_EXT_LV) {
+        /* R5 fail-closed: kind must be set before any IRP can arrive. */
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    WMILIB_CONTEXT *wmi = (kind == WL_EXT_BUS)
+        ? &((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->wmi
+        : &((WINLVM_LV_EXT *)DeviceObject->DeviceExtension)->wmi;
+
+    NTSTATUS status = STATUS_SUCCESS;
+    SYSCTL_IRP_DISPOSITION disposition =
+        WmiSystemControl(wmi, DeviceObject, Irp, &status);
+
+    switch (disposition) {
+    case IrpProcessed:
+        /* WmiSystemControl completed the IRP itself. */
+        return status;
+    case IrpNotCompleted:
+        /* Wmilib filled IoStatus but left completion to us. */
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    case IrpForward:
+    case IrpNotWmi: {
+        if (kind == WL_EXT_BUS) {
+            /* Not our block: classpnp contract hands the IRP down. */
+            WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(ext->bus_pdo, Irp);
+        }
+        /* LV PDO is the bottom of its own stack and, once registered, the
+         * ProviderId the verifier probes — completing here is legitimate. */
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    }
+    default:
+        /* Fail closed on any disposition we do not recognize. */
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
 }
 
 /* PnP discriminator: the bus FDO half lives in winlvm_bus.c, the LV PDO

@@ -19,6 +19,9 @@
 
 #include <ntddk.h>
 #include <wdm.h>
+#include <wmilib.h>
+#include <wmistr.h>   /* WMIREG_FLAG_* — NOT pulled in by km/wmilib.h (it
+                       * defines WMIGUIDREGINFO itself and includes nothing) */
 #include <ntdddisk.h>
 #include <mountmgr.h>
 #include <mountdev.h>
@@ -58,6 +61,7 @@ typedef struct _WINLVM_BUS_EXT {
     WINLVM_VG_RECORD   *vgs;           /* single cached VG for now */
     PDEVICE_OBJECT      children[WL_MAX_CHILDREN];
     size_t              child_count;
+    WMILIB_CONTEXT      wmi;           /* zero-GUID wmilib context (START reg) */
 } WINLVM_BUS_EXT;
 
 /* LV PDO extension. */
@@ -70,6 +74,7 @@ typedef struct _WINLVM_LV_EXT {
     ULONGLONG           byte_size;
     UNICODE_STRING      ifname;        /* volume interface, if registered */
     WCHAR               devname[64];   /* \Device\WinLvm<uuid> (mountmgr) */
+    WMILIB_CONTEXT      wmi;           /* zero-GUID wmilib context (START reg) */
 } WINLVM_LV_EXT;
 
 /* Kernel-side byte source: IRP_MJ_READ against the disk PDO. */
@@ -100,6 +105,17 @@ DRIVER_DISPATCH WinLvmPower;
 
 NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context);
 void WinLvmProbeWorker(PVOID);
+
+/* winlvm.c — zero-GUID WMI provider (Oracle 2026-09-12 verdict: register
+ * wmilib on both the bus FDO and every LV PDO at START, dispatch through
+ * WmiSystemControl — the classpnp shape that satisfies the verifier's
+ * VfWmiTestStartedPdoStack probe; v16–v18 never registered). */
+NTSTATUS WinLvmQueryWmiRegInfo(PDEVICE_OBJECT DeviceObject, PULONG RegFlags,
+                               PUNICODE_STRING InstanceName,
+                               PUNICODE_STRING *RegistryPath,
+                               PUNICODE_STRING MofResourceName,
+                               PDEVICE_OBJECT *Pdo);
+void WinLvmWmiInit(PDEVICE_OBJECT DeviceObject);
 
 /* winlvm_bus.c / winlvm_child.c — kind halves of WinLvmPnp. */
 DRIVER_DISPATCH WinLvmBusPnp;

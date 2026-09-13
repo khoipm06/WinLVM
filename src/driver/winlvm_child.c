@@ -84,6 +84,10 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         if (lvext->ifname.Buffer) {
             IoSetDeviceInterfaceState(&lvext->ifname, TRUE);
         }
+        /* Oracle H5: zero-GUID wmilib provider per LV PDO — the verifier
+         * probe's ProviderId IS this self-started PDO; registration makes
+         * this stack the legitimate completer, ending the 0x220 cycle. */
+        WinLvmWmiInit(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_QUERY_REMOVE_DEVICE:
@@ -96,6 +100,7 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         /* PnP removes a child directly: deactivate interface, drop self
          * from the bus children array (else next QDR reports a freed PDO),
          * release refs, delete self. */
+        IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
         if (lvext->ifname.Buffer) {
             IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
             RtlFreeUnicodeString(&lvext->ifname);

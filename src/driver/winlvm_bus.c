@@ -336,6 +336,11 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             st = Irp->IoStatus.Status;
         }
         if (NT_SUCCESS(st)) {
+            /* Oracle H5: register a zero-GUID wmilib provider on the bus FDO
+             * so the WMI core owns the FDO ↔ ProviderId mapping the verifier
+             * probe expects. Nonfatal, PASSIVE_LEVEL (START_DEVICE). */
+            WinLvmWmiInit(DeviceObject);
+
             WINLVM_REGISTER_WORK *work = ExAllocatePoolZero(NonPagedPool,
                 sizeof(WINLVM_REGISTER_WORK), WINLVM_WIN_TAG);
             if (work) {
@@ -353,6 +358,10 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
         /* forward down, then detach + delete children then self */
         for (size_t i = 0; i < ext->child_count; i++) {
+            /* Children are deleted directly here (never see their own
+             * REMOVE_DEVICE), so undo their per-device state explicitly:
+             * the child's WMI provider entry (H5) and volume interface. */
+            IoWMIRegistrationControl(ext->children[i], WMIREG_ACTION_DEREGISTER);
             WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)ext->children[i]->DeviceExtension;
             if (ce->ifname.Buffer) {
                 IoSetDeviceInterfaceState(&ce->ifname, FALSE);
@@ -375,6 +384,7 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
             g_disk_notify_cookie = NULL;
         }
+        IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
         IoDetachDevice(ext->bus_pdo);
         if (g_bus_ext == ext) g_bus_ext = NULL;
         IoDeleteDevice(DeviceObject);
