@@ -49,6 +49,11 @@ typedef enum { WL_EXT_BUS = 0x31425553, WL_EXT_LV = 0x32564C53 } WL_EXT_KIND;
 typedef struct {
     winlvm_volume_group vg;        /* as parsed by lvm_read.c */
     PDEVICE_OBJECT       backing_pdo; /* disk PDO holding the PV (referenced) */
+    UNICODE_STRING       disk_ifname; /* \??\ disk interface link (owned) —
+                                          * matches REMOVAL notifications to
+                                          * this record (surprise-removal
+                                          * teardown, winlvm_bus.c) */
+    volatile LONG        dead;     /* backing disk removed: fail new I/O */
 } WINLVM_VG_RECORD;
 
 /* Bus FDO extension. */

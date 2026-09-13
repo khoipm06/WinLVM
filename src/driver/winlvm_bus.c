@@ -108,6 +108,9 @@ typedef struct {
     WORK_QUEUE_ITEM item;
     PDEVICE_OBJECT  target_disk;
     PFILE_OBJECT    target_file;
+    UNICODE_STRING  ifname;   /* disk interface link (owned): arrival link
+                              * stashed for the worker to store on the VG
+                              * record — REMOVAL matching (winlvm_bus.c) */
 } WINLVM_PROBE_WORK;
 
 NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
@@ -115,11 +118,51 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
         (PDEVICE_INTERFACE_CHANGE_NOTIFICATION)notificationStruct;
     UNREFERENCED_PARAMETER(context);
     if (!data || !data->SymbolicLinkName) return STATUS_SUCCESS;
+
+    /* Backing-disk surprise removal: the probe only listens to ARRIVALS,
+     * so a removed PV left a live VG record pointing at a dead PDO — IRPs
+     * forwarded there wedged the VM minutes after the removal
+     * (2026-09-13 surprise-removal test). Tear the record down. */
+    if (IsEqualGUID(&data->Event, &GUID_DEVICE_INTERFACE_REMOVAL)) {
+        WINLVM_BUS_EXT *bus = g_bus_ext;
+        if (!bus) return STATUS_SUCCESS;
+        KIRQL old;
+        KeAcquireSpinLock(&bus->lock, &old);
+        WINLVM_VG_RECORD *record = bus->vgs;
+        WINLVM_VG_RECORD *hit = NULL;
+        if (record && record->disk_ifname.Buffer &&
+            RtlEqualUnicodeString(&record->disk_ifname,
+                                  data->SymbolicLinkName, TRUE)) {
+            hit = record;
+        }
+        if (hit) {
+            /* Mark dead first so in-flight dispatch fails new I/O cleanly;
+             * actual record free happens after child PDOs are gone
+             * (IRP_MN_REMOVE_DEVICE drops them — winlvm_child.c). */
+            InterlockedExchange(&hit->dead, 1);
+        }
+        KeReleaseSpinLock(&bus->lock, old);
+        if (hit) {
+            WL_TRACE("bus: backing disk removed, invalidating VG");
+            /* Re-report relations: children with a dead record complete
+             * their own removal path on the next QDR cycle. */
+            IoInvalidateDeviceRelations(bus->pdo, BusRelations);
+        }
+        return STATUS_SUCCESS;
+    }
+
     if (!IsEqualGUID(&data->Event, &GUID_DEVICE_INTERFACE_ARRIVAL)) return STATUS_SUCCESS;
 
     WINLVM_PROBE_WORK *work = ExAllocatePoolZero(NonPagedPool,
         sizeof(WINLVM_PROBE_WORK), WINLVM_WIN_TAG);
     if (!work) return STATUS_INSUFFICIENT_RESOURCES;
+
+    /* stash the arrival link: the worker stores it on the VG record so a
+     * later REMOVAL notification can match this disk back to the record */
+    if (!NT_SUCCESS(RtlDuplicateUnicodeString(
+            RTL_DUPLICATE_UNICODE_STRING_NULL_TERMINATE,
+            data->SymbolicLinkName, &work->ifname)))
+        RtlZeroMemory(&work->ifname, sizeof(work->ifname));
 
     NTSTATUS status = IoGetDeviceObjectPointer(data->SymbolicLinkName,
         FILE_READ_ATTRIBUTES, &work->target_file, &work->target_disk);
@@ -175,6 +218,14 @@ void WinLvmProbeWorker(PVOID context) {
                         record->vg = *vg;
                         ObReferenceObject(work->target_disk);
                         record->backing_pdo = work->target_disk;
+                        /* keep the disk interface link so a later REMOVAL
+                         * notification can find this record again */
+                        if (work->ifname.Buffer)
+                            record->disk_ifname = work->ifname;
+                        else
+                            RtlZeroMemory(&record->disk_ifname,
+                                          sizeof(record->disk_ifname));
+                        work->ifname.Buffer = NULL; /* ownership moved */
                         KeAcquireSpinLock(&bus->lock, &old);
                         if (!bus->vgs) { bus->vgs = record; created = 1; }
                         else {
@@ -184,6 +235,8 @@ void WinLvmProbeWorker(PVOID context) {
                             if (r != record) {
                                 KeReleaseSpinLock(&bus->lock, old);
                                 ObDereferenceObject(work->target_disk);
+                                if (record->disk_ifname.Buffer)
+                                    RtlFreeUnicodeString(&record->disk_ifname);
                                 ExFreePoolWithTag(record, WINLVM_WIN_TAG);
                                 record = NULL;
                                 KeAcquireSpinLock(&bus->lock, &old);
@@ -215,6 +268,8 @@ void WinLvmProbeWorker(PVOID context) {
     }
 
     ObDereferenceObject(work->target_file);  /* pair from IoGetDeviceObjectPointer */
+    if (work->ifname.Buffer)              /* never stored on a record */
+        RtlFreeUnicodeString(&work->ifname);
     ExFreePoolWithTag(work, WINLVM_WIN_TAG);
 }
 
@@ -400,7 +455,18 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
-    size_t n = bus->child_count;
+    size_t n = 0;
+    /* dead-VG children are not reported — PnP sends them REMOVE, which
+     * detaches them from the record (surprise-removal teardown) */
+    for (size_t i = 0; i < bus->child_count; i++) {
+        WINLVM_LV_EXT *lext =
+            (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
+        if (lext->record && lext->record->dead) continue;
+        bus->children[n] = bus->children[i];
+        if (n != i) bus->children[i] = NULL;
+        n++;
+    }
+    bus->child_count = n;
     KeReleaseSpinLock(&bus->lock, old);
     WL_TRACE_1("QDR bus relations: %u children", (unsigned)n);
 

@@ -127,10 +127,11 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
-    if (ext->kind != WL_EXT_LV) {
-        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    if (ext->kind != WL_EXT_LV || ext->record->dead) {
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_INVALID_DEVICE_REQUEST;
+        return STATUS_DEVICE_REMOVED;
     }
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     if (irpSp->Parameters.Read.Length == 0) {
@@ -155,10 +156,10 @@ NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
-    if (ext->kind != WL_EXT_LV) {
-        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    if (ext->kind != WL_EXT_LV || ext->record->dead) {
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_INVALID_DEVICE_REQUEST;
+        return STATUS_DEVICE_REMOVED;
     }
     /* Honor LVM2 system_id: a VG owned by another host must not be
      * written by us. */

@@ -116,7 +116,23 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     break;
                 }
             }
+            /* Surprise-removal teardown: last child of a dead record
+             * releases the record (backing PDO deref + ifname + struct).
+             * In-flight IRPs already saw dead=1 and fail closed. */
+            WINLVM_VG_RECORD *rec = lvext->record;
+            if (rec && rec->dead && g_bus_ext->child_count == 0 &&
+                g_bus_ext->vgs == rec) {
+                g_bus_ext->vgs = NULL;
+            } else {
+                rec = NULL;
+            }
             KeReleaseSpinLock(&g_bus_ext->lock, old);
+            if (rec) {
+                if (rec->disk_ifname.Buffer)
+                    RtlFreeUnicodeString(&rec->disk_ifname);
+                ObDereferenceObject(rec->backing_pdo);
+                ExFreePoolWithTag(rec, WINLVM_WIN_TAG);
+            }
         }
         ObDereferenceObject(lvext->backing_pdo);
         IoDeleteDevice(DeviceObject);
