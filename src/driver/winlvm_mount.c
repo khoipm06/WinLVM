@@ -5,6 +5,8 @@
  * mountmgr issue before they will treat the device as a volume. Everything
  * else returns STATUS_INVALID_DEVICE_REQUEST, which is a valid answer. */
 #include <stddef.h>   /* offsetof — MOUNTDEV variable-length sizing */
+#include <ntifs.h>    /* FSCTL_* volume-lock codes (SOURCES-only include; */
+                    /* ntifs.h after ntddk.h per WDK build order) */
 #include "winlvm.h"
 
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext) {
@@ -124,6 +126,22 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
 
     if (code == IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME) {
         return STATUS_NOT_IMPLEMENTED;
+    }
+
+    /* Raw-volume semantics: diskspd/format-style tools open \\.\E: while a
+     * filesystem may still hold cached state. The volume manager sends
+     * dismount/lock FSCTLs and expects an answer; a stateless passthrough
+     * volume has no cached state to flush — answer SUCCESS immediately
+     * (classpnp raw-volume pattern; winbtrfs does the same in its volume
+     * ioctl default). Without this, the 2026-09-13 diskspd raw-open
+     * wedge: mountmgr's dismount handshake waited forever. */
+    if (code == FSCTL_DISMOUNT_VOLUME || code == FSCTL_LOCK_VOLUME ||
+        code == FSCTL_UNLOCK_VOLUME) {
+        return STATUS_SUCCESS;
+    }
+    if (code == FSCTL_ALLOW_EXTENDED_DASD_IO) {
+        Irp->IoStatus.Information = 0;
+        return STATUS_SUCCESS;
     }
 
     return STATUS_INVALID_DEVICE_REQUEST;
