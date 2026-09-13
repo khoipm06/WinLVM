@@ -99,7 +99,15 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     case IRP_MN_REMOVE_DEVICE: {
         /* PnP removes a child directly: deactivate interface, drop self
          * from the bus children array (else next QDR reports a freed PDO),
-         * release refs, delete self. */
+         * release refs, delete self.
+         *
+         * The VG record is NOT freed here — it is owned by the bus FDO and
+         * freed in WinLvmBusPnp's REMOVE_DEVICE. The volume PDO stays
+         * delete-pending while ext4fsd holds the mount, and that stack can
+         * still forward flush/shutdown IRPs which read ext->record->dead.
+         * Freeing the record when the last child dropped off the array was
+         * the delayed-wedge UAF (2026-09-14 NMI repro; PnpSurpriseRemove:
+         * no delete until the surprise IRP succeeds AND handles close). */
         IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
         if (lvext->ifname.Buffer) {
             IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
@@ -116,29 +124,23 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     break;
                 }
             }
-            /* Surprise-removal teardown: last child of a dead record
-             * releases the record (backing PDO deref + ifname + struct).
-             * In-flight IRPs already saw dead=1 and fail closed. */
-            WINLVM_VG_RECORD *rec = lvext->record;
-            if (rec && rec->dead && g_bus_ext->child_count == 0 &&
-                g_bus_ext->vgs == rec) {
-                g_bus_ext->vgs = NULL;
-            } else {
-                rec = NULL;
-            }
             KeReleaseSpinLock(&g_bus_ext->lock, old);
-            if (rec) {
-                if (rec->disk_ifname.Buffer)
-                    ExFreePoolWithTag(rec->disk_ifname.Buffer, WINLVM_WIN_TAG);
-                ObDereferenceObject(rec->backing_pdo);
-                ExFreePoolWithTag(rec, WINLVM_WIN_TAG);
-            }
         }
         ObDereferenceObject(lvext->backing_pdo);
         IoDeleteDevice(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     }
+    case IRP_MN_SURPRISE_REMOVAL:
+        /* WDM contract (irp-mn-surprise-removal.md): all PnP drivers MUST
+         * answer this IRP with STATUS_SUCCESS — "a driver must not fail
+         * this IRP". The old default (STATUS_NOT_SUPPORTED) stalled the
+         * surprise-removal processing of the mounted volume stack after a
+         * backing-disk yank. Teardown stays in REMOVE_DEVICE; SURPRISE only
+         * acknowledges (PnpSurpriseRemove rule: no IoDeleteDevice until
+         * the surprise IRP succeeds and all open handles close). */
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
     default:
         /* Raw-PDO contract: unknown PnP requests (QUERY_INTERFACE,
          * QUERY_DEVICE_TEXT, ...) must NOT complete with success —

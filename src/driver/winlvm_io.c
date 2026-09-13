@@ -196,6 +196,15 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_INVALID_DEVICE_REQUEST;
     }
+    /* Surprise-removed backing disk: fail closed like WinLvmRead/Write —
+     * forwarding into the removed disk stack (or through the freed record)
+     * was the delayed-wedge path (2026-09-14 NMI repro). */
+    if (ext->record->dead) {
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_REMOVED;
+    }
     IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(ext->backing_pdo, Irp);
 }

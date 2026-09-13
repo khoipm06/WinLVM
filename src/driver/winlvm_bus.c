@@ -245,8 +245,12 @@ void WinLvmProbeWorker(PVOID context) {
                             if (r != record) {
                                 KeReleaseSpinLock(&bus->lock, old);
                                 ObDereferenceObject(work->target_disk);
+                                /* disk_ifname is a MANUAL NonPagedPool copy
+                                 * (see ifname stash above) — tagged free,
+                                 * never RtlFreeUnicodeString (no header) */
                                 if (record->disk_ifname.Buffer)
-                                    RtlFreeUnicodeString(&record->disk_ifname);
+                                    ExFreePoolWithTag(record->disk_ifname.Buffer,
+                                                      WINLVM_WIN_TAG);
                                 ExFreePoolWithTag(record, WINLVM_WIN_TAG);
                                 record = NULL;
                                 KeAcquireSpinLock(&bus->lock, &old);
