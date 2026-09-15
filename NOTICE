@@ -1,0 +1,14 @@
+winlvm
+Copyright (C) 2026 winlvm contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Third-Party Reference Notice:
+The third_party/ directory contains pointers to and reference source code from
+external upstream projects (such as Linux LVM2, cryptsetup, and WinBtrfs).
+These materials are included for architectural and format reference only.
+They are NOT built, linked, or redistributed as part of winlvm binaries.
+Each upstream component remains under its respective original license.
