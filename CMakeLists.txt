@@ -18,6 +18,25 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# lvmcore — freestanding C11 LVM2 parser and arena allocator.
+# Kernel-safe, zero dynamic allocations, non-recursive, stack <= 512 bytes.
+# ---------------------------------------------------------------------------
+add_library(lvmcore STATIC
+  src/lvmcore/crc32.c
+  src/lvmcore/arena.c
+  src/lvmcore/parser.c
+  src/lvmcore/serialize.c
+)
+set_target_properties(lvmcore PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+)
+target_include_directories(lvmcore PUBLIC src/lvmcore/include)
+if(NOT MSVC)
+  target_compile_options(lvmcore PRIVATE -Wframe-larger-than=512)
+endif()
+
+# ---------------------------------------------------------------------------
 # lvmfmt — LVM2 on-disk format. Platform-agnostic by construction: no Win32,
 # no CRT beyond <cstdint>/<string>/<vector>/<optional>, so the same sources can
 # later build for kernel mode and UEFI. Keep it that way.
@@ -170,6 +189,55 @@ if(ZSTD_EXE)
     COMMAND winlvm_luks_kdf_matrix_tests
             "${CORPUS_OUT}/luks2-default.img"
             "${CORPUS_OUT}/luks2-pbkdf2.img")
+
+  # -------------------------------------------------------------------------
+  # lvmcore test suite: parser, hardening, and differential verification gate.
+  # -------------------------------------------------------------------------
+  add_executable(test_lvmcore_parser
+    tests/lvmcore/test_lvmcore_parser.c
+  )
+  target_link_libraries(test_lvmcore_parser PRIVATE lvmcore)
+  if(TARGET corpus)
+    add_dependencies(test_lvmcore_parser corpus)
+  endif()
+  add_test(NAME test_lvmcore_parser
+    COMMAND test_lvmcore_parser "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
+
+  add_executable(test_lvmcore_hardening
+    tests/lvmcore/test_lvmcore_hardening.c
+  )
+  target_link_libraries(test_lvmcore_hardening PRIVATE lvmcore)
+  add_test(NAME test_lvmcore_hardening COMMAND test_lvmcore_hardening)
+
+  add_executable(test_lvmcore_differential
+    tests/lvmcore/test_lvmcore_differential.c
+    src/driver/lvm_read.c
+  )
+  target_include_directories(test_lvmcore_differential PRIVATE src/driver)
+  target_link_libraries(test_lvmcore_differential PRIVATE lvmcore)
+  if(TARGET corpus)
+    add_dependencies(test_lvmcore_differential corpus)
+  endif()
+  add_test(NAME test_lvmcore_differential
+    COMMAND test_lvmcore_differential "${CORPUS_OUT}")
+
+  add_executable(test_lvmcore_serialize
+    tests/lvmcore/test_lvmcore_serialize.c
+  )
+  target_link_libraries(test_lvmcore_serialize PRIVATE lvmcore)
+  if(TARGET corpus)
+    add_dependencies(test_lvmcore_serialize corpus)
+  endif()
+  add_test(NAME test_lvmcore_serialize
+    COMMAND test_lvmcore_serialize "${CORPUS_OUT}")
+
+  add_executable(lvmcore_dump_vgcfg
+    tests/lvmcore/lvmcore_dump_vgcfg.c
+  )
+  target_link_libraries(lvmcore_dump_vgcfg PRIVATE lvmcore)
+  if(TARGET corpus)
+    add_dependencies(lvmcore_dump_vgcfg corpus)
+  endif()
 endif()
 enable_testing()
 
