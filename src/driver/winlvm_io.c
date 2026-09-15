@@ -138,8 +138,8 @@ static size_t LvMapToPieces(WINLVM_LV_EXT *ext,
 
 /* Completion for ONE fan-out sub-IRP. Frees the sub-IRP/MDL/bounce, copies
  * a bounce piece into the parent buffer, and on the LAST in-flight piece
- * completes the parent IRP exactly once and returns the ctx to the
- * lookaside. Any failure latches the first status (never a partial
+ * completes the parent IRP exactly once and returns the ctx to the pool.
+ * Any failure latches the first status (never a partial
  * success: Information = 0 on failure). */
 static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
                                        PVOID Context) {
@@ -168,7 +168,7 @@ static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         parent->IoStatus.Status = final;
         parent->IoStatus.Information = NT_SUCCESS(final) ? wctx->total_len : 0;
         IoCompleteRequest(parent, IO_NO_INCREMENT);
-        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
     }
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
@@ -199,8 +199,8 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    WL_READ_CTX *wctx = (WL_READ_CTX *)ExAllocateFromNPagedLookasideList(
-        &g_bus_ext->read_ctx_lookaside);
+    WL_READ_CTX *wctx = (WL_READ_CTX *)ExAllocatePoolWithTag(
+        NonPagedPool, sizeof(WL_READ_CTX), WINLVM_WIN_TAG);
     if (!wctx) {
         Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
         Irp->IoStatus.Information = 0;
@@ -210,13 +210,12 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     RtlZeroMemory(wctx, sizeof(*wctx));
     wctx->parent = Irp;
     wctx->parent_dev = DeviceObject;
-    wctx->lookaside = &g_bus_ext->read_ctx_lookaside;
     wctx->parent_base = (PUCHAR)MmGetSystemAddressForMdlSafe(
         Irp->MdlAddress, NormalPagePriority);
     wctx->total_len = len;
     wctx->status = STATUS_SUCCESS;
     if (!wctx->parent_base) {
-        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -226,7 +225,7 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     size_t n = LvMapToPieces(ext, view, lv_byte, len, wctx->pieces,
                              WL_MAX_READ_PIECES);
     if (n == 0) {
-        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -266,10 +265,14 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             if (mdl) MmBuildMdlForNonPagedPool(mdl);
         } else {
             /* parent buffer slice: partial MDL over the already-locked
-             * parent MDL — no new locking, exactly the aligned request */
-            mdl = IoBuildPartialMdl(Irp->MdlAddress,
-                                    wctx->parent_base + pc->parent_off,
-                                    pc->len);
+             * parent MDL — no new locking, exactly the aligned request.
+             * IoAllocateMdl allocates the target MDL; IoBuildPartialMdl
+             * (VOID return, WDK contract) maps the source slice into it. */
+            mdl = IoAllocateMdl(NULL, pc->len, FALSE, FALSE, NULL);
+            if (mdl)
+                IoBuildPartialMdl(Irp->MdlAddress, mdl,
+                                  (PUCHAR)wctx->parent_base + pc->parent_off,
+                                  pc->len);
         }
         if (!mdl) {
             if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
@@ -298,7 +301,7 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
             if (pc->sub_irp) IoFreeIrp(pc->sub_irp);
         }
-        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
         Irp->IoStatus.Status = fail;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);

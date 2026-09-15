@@ -81,11 +81,6 @@ typedef struct _WINLVM_BUS_EXT {
     PDEVICE_OBJECT      pdo;           /* root-enumerated PDO below */
     PDEVICE_OBJECT      bus_pdo;       /* attach point (same as pdo here) */
     KSPIN_LOCK          lock;          /* children/vg_records */
-    /* Read fan-out piece contexts (winlvm_io.c): DISPATCH_LEVEL paging I/O
-     * must not ExAllocatePool or wait — every per-piece context comes from
-     * this lookaside (plan line 222-223). Init AddDevice, delete at bus
-     * REMOVE_DEVICE AFTER the registry sweep (see teardown ordering note). */
-    NPAGED_LOOKASIDE_LIST read_ctx_lookaside;
     /* Multi-VG registry (W2 Task 8): fixed array of records keyed by VG
      * UUID, with one glue-owned view arena per accepted record. Records
      * are never freed individually — the v22 UAF class is dead at the
@@ -101,17 +96,17 @@ typedef struct _WINLVM_BUS_EXT {
  * Lifetime diagram (all in winlvm_io.c):
  *   caller IRP (WinLvmRead)
  *     └─ wl_map_begin/next → N pieces (cap WL_MAX_READ_PIECES)
- *     └─ one WL_READ_CTX from the bus lookaside, ctx->remaining = N
+ *     └─ one WL_READ_CTX from nonpaged pool, ctx->remaining = N
  *     └─ per piece: sub-IRP = IoAllocateIrp(backing->StackSize + 1, FALSE)
  *             (ISSUE-21), MDL over the parent buffer (aligned) or a
  *             sector-aligned bounce (unaligned), IoSetCompletionRoutine
  *     └─ completion: free sub-IRP/MDL/bounce, InterlockedDecrement
- *             remaining; last one frees the ctx (back to lookaside) and
+ *             remaining; last one frees the ctx (back to pool) and
  *             completes the PARENT IRP exactly once.
  *   ANY failure latches ctx->status; the parent completes with a terminal
  *   status and Information = 0 — never a partial completion.
- * Struct + logic live in ONE place (winlvm_io.c); only the size must be
- * visible for lookaside init, so the struct is here. */
+ * Struct + logic live in ONE place (winlvm_io.c); size visible here for
+ * forward declaration. */
 #define WL_MAX_READ_PIECES 64
 
 typedef struct WL_READ_CTX WL_READ_CTX;
@@ -140,7 +135,6 @@ typedef struct {
 typedef struct WL_READ_CTX {
     PIRP                 parent;        /* the caller's IRP (completed once) */
     PDEVICE_OBJECT       parent_dev;    /* the LV PDO (for completion boost) */
-    PNPAGED_LOOKASIDE_LIST lookaside;   /* ctx free-list (bus-owned) */
     PUCHAR               parent_base;   /* mapped parent buffer base */
     ULONG                total_len;     /* original request length */
     size_t               pieces_issued; /* pieces actually sent */

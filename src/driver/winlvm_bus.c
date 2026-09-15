@@ -141,14 +141,8 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
     ext->pdo = PhysicalDeviceObject;
     KeInitializeSpinLock(&ext->lock);
     wl_vg_registry_init(ext->vg_records, WL_VG_MAX); /* idempotent after zero */
-    /* Read fan-out piece context cache (winlvm_io.c): DISPATCH_LEVEL
-     * paging I/O allocates pieces from here, never ExAllocatePool. */
-    ExInitializeNPagedLookasideList(&ext->read_ctx_lookaside, NULL, NULL,
-                                    POOL_NX_ALLOCATION, sizeof(WL_READ_CTX),
-                                    WINLVM_WIN_TAG, 0);
     ext->bus_pdo = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
     if (!ext->bus_pdo) {
-        ExDeleteNPagedLookasideList(&ext->read_ctx_lookaside);
         IoDeleteDevice(fdo);
         return STATUS_NO_SUCH_DEVICE;
     }
@@ -397,7 +391,7 @@ void WinLvmProbeWorker(PVOID context) {
                     KIRQL kl;
                     KeAcquireSpinLock(&bus->lock, &kl);
                     wl_vg_lv_set_activated(r, newly[i], 0);
-                    KeReleaseSpinLock(&bus->lock, &kl);
+                    KeReleaseSpinLock(&bus->lock, kl);
                 }
             }
             IoInvalidateDeviceRelations(bus->pdo, BusRelations);
@@ -676,14 +670,12 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
             g_disk_notify_cookie = NULL;
         }
-        /* Read-fan-out lookaside: children are gone (their sweep ran
-         * above), so no in-flight piece context can touch the list.
-         * Residual race: a sub-IRP completing after its child PDO was
-         * deleted would free its ctx into this list — same async-teardown
-         * window as the probe worker / bus REMOVE race (W3 work-queue
-         * drain). The ctx is never dereferenced out of the list, so a
-         * leaked ctx is a leak, not a UAF. */
-        ExDeleteNPagedLookasideList(&ext->read_ctx_lookaside);
+        /* Read-fan-out ctx lifetimes: children are gone (their sweep ran
+         * above), so no in-flight piece context remains; each ctx is freed
+         * by ITS OWN completion routine from nonpaged pool, so teardown
+         * never touches them here. Same async-teardown window as the probe
+         * worker / bus REMOVE race (W3 work-queue drain): a ctx leaked by
+         * that window is pool-leaked, not a UAF. */
         IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
         IoDetachDevice(ext->bus_pdo);
         if (g_bus_ext == ext) g_bus_ext = NULL;
