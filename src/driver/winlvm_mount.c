@@ -89,13 +89,38 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
             Irp->IoStatus.Information = sizeof(DISK_GEOMETRY);
             return STATUS_BUFFER_OVERFLOW;
         }
+        /* Per-PV sector size query (StorageAccessAlignmentProperty) feeds
+         * ext->logical_sector; the volume answers geometry in those units.
+         * CHS values are synthetic (whole-disk volume): the only fields
+         * consumers rely on are BytesPerSector and Cylinders. */
+        ULONG bps = ext->logical_sector ? ext->logical_sector : 512;
+        ULONGLONG chs_bytes = (ULONGLONG)63 * 255 * bps;
         PDISK_GEOMETRY g = (PDISK_GEOMETRY)Irp->AssociatedIrp.SystemBuffer;
-        g->Cylinders.QuadPart = (LONGLONG)(ext->byte_size / (63 * 255 * 512));
+        g->Cylinders.QuadPart = chs_bytes ? (LONGLONG)(ext->byte_size / chs_bytes) : 0;
         g->MediaType = FixedMedia;
         g->TracksPerCylinder = 255;
         g->SectorsPerTrack = 63;
-        g->BytesPerSector = 512;
+        g->BytesPerSector = bps;
         Irp->IoStatus.Information = sizeof(DISK_GEOMETRY);
+        return STATUS_SUCCESS;
+    }
+
+    if (code == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX) {
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DISK_GEOMETRY_EX)) {
+            Irp->IoStatus.Information = sizeof(DISK_GEOMETRY_EX);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        ULONG bps = ext->logical_sector ? ext->logical_sector : 512;
+        ULONGLONG chs_bytes = (ULONGLONG)63 * 255 * bps;
+        PDISK_GEOMETRY_EX g = (PDISK_GEOMETRY_EX)Irp->AssociatedIrp.SystemBuffer;
+        RtlZeroMemory(g, sizeof(*g));
+        g->Geometry.Cylinders.QuadPart = chs_bytes ? (LONGLONG)(ext->byte_size / chs_bytes) : 0;
+        g->Geometry.MediaType = FixedMedia;
+        g->Geometry.TracksPerCylinder = 255;
+        g->Geometry.SectorsPerTrack = 63;
+        g->Geometry.BytesPerSector = bps;
+        g->DiskSize.QuadPart = (LONGLONG)ext->byte_size;
+        Irp->IoStatus.Information = sizeof(DISK_GEOMETRY_EX);
         return STATUS_SUCCESS;
     }
 

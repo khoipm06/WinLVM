@@ -51,11 +51,18 @@ typedef enum { WL_EXT_BUS = 0x31425553, WL_EXT_LV = 0x32564C53 } WL_EXT_KIND;
 
 /* Glue-side per-PV backing: the arrived disk behind one PV slot of a
  * record. Core stores an opaque tag pointer per PV (pv_tag[]); this is
- * what it points at. Disk PDO and interface link are referenced/owned. */
+ * what it points at. Disk PDO, interface link and FILE_OBJECT are
+ * referenced/owned. Sector sizes come from a probe-time
+ * StorageAccessAlignmentProperty query (512/512e/4Kn) — the read path's
+ * alignment authority (plan line 218-220). */
 typedef struct {
     PDEVICE_OBJECT backing_pdo; /* disk PDO holding the PV (referenced) */
+    PFILE_OBJECT   backing_file; /* disk file object (referenced) — the
+                                  * sync IOCTL and forwarded IRPs ride on it */
     UNICODE_STRING disk_ifname; /* \??\ disk interface link (owned) — maps */
                                 /* REMOVAL notifications back to the PV    */
+    ULONG          logical_sector;   /* BytesPerLogicalSector  (>=512) */
+    ULONG          physical_sector;  /* BytesPerPhysicalSector (>=logical) */
 } WINLVM_PV_TAG;
 
 /* A parsed VG view: arena + the view struct. The record's `view` points
@@ -74,6 +81,11 @@ typedef struct _WINLVM_BUS_EXT {
     PDEVICE_OBJECT      pdo;           /* root-enumerated PDO below */
     PDEVICE_OBJECT      bus_pdo;       /* attach point (same as pdo here) */
     KSPIN_LOCK          lock;          /* children/vg_records */
+    /* Read fan-out piece contexts (winlvm_io.c): DISPATCH_LEVEL paging I/O
+     * must not ExAllocatePool or wait — every per-piece context comes from
+     * this lookaside (plan line 222-223). Init AddDevice, delete at bus
+     * REMOVE_DEVICE AFTER the registry sweep (see teardown ordering note). */
+    NPAGED_LOOKASIDE_LIST read_ctx_lookaside;
     /* Multi-VG registry (W2 Task 8): fixed array of records keyed by VG
      * UUID, with one glue-owned view arena per accepted record. Records
      * are never freed individually — the v22 UAF class is dead at the
@@ -85,13 +97,80 @@ typedef struct _WINLVM_BUS_EXT {
     WMILIB_CONTEXT      wmi;           /* zero-GUID wmilib context (START reg) */
 } WINLVM_BUS_EXT;
 
+/* ---- READ fan-out context (winlvm_io.c) ------------------------------
+ * Lifetime diagram (all in winlvm_io.c):
+ *   caller IRP (WinLvmRead)
+ *     └─ wl_map_begin/next → N pieces (cap WL_MAX_READ_PIECES)
+ *     └─ one WL_READ_CTX from the bus lookaside, ctx->remaining = N
+ *     └─ per piece: sub-IRP = IoAllocateIrp(backing->StackSize + 1, FALSE)
+ *             (ISSUE-21), MDL over the parent buffer (aligned) or a
+ *             sector-aligned bounce (unaligned), IoSetCompletionRoutine
+ *     └─ completion: free sub-IRP/MDL/bounce, InterlockedDecrement
+ *             remaining; last one frees the ctx (back to lookaside) and
+ *             completes the PARENT IRP exactly once.
+ *   ANY failure latches ctx->status; the parent completes with a terminal
+ *   status and Information = 0 — never a partial completion.
+ * Struct + logic live in ONE place (winlvm_io.c); only the size must be
+ * visible for lookaside init, so the struct is here. */
+#define WL_MAX_READ_PIECES 64
+
+typedef struct WL_READ_CTX WL_READ_CTX;
+
+/* One sub-read of a fan-out. Parent buffer slice = [parent_off,
+ * parent_off + len): aligned pieces build a fresh MDL directly over the
+ * locked parent slice; unaligned pieces read an aligned window into
+ * bounce_buf and copy the slice back in the completion routine. */
+typedef struct {
+    uint32_t pv_slot;      /* record PV slot (mapper output) */
+    uint32_t backing_idx;  /* index into WINLVM_LV_EXT backing tables */
+    uint32_t len;          /* piece length delivered to the parent */
+    uint32_t bounce;       /* 1 = unaligned → bounce buffer (aligned path) */
+    uint64_t pv_byte;      /* backing byte offset (pe_start-resolved) */
+    uint32_t parent_off;   /* offset within the parent request window */
+    uint64_t sub_offset;   /* backing offset actually issued (aligned down when bounce) */
+    uint32_t sub_len;      /* issued length (aligned up when bounce, else == len) */
+    uint32_t bounce_skip;  /* bytes skipped inside the bounce window (bounce only) */
+    ULONG    logical;      /* backing logical sector size (bounce rounding) */
+    PUCHAR   bounce_buf;   /* aligned bounce buffer (NULL for aligned pieces) */
+    PIRP     sub_irp;      /* sub-IRP; NULL if this piece was not issued */
+    IO_STATUS_BLOCK iosb;  /* UserIosb for the sub-IRP */
+    WL_READ_CTX *ctx;      /* owning fan-out context */
+} WL_READ_PIECE;
+
+typedef struct WL_READ_CTX {
+    PIRP                 parent;        /* the caller's IRP (completed once) */
+    PDEVICE_OBJECT       parent_dev;    /* the LV PDO (for completion boost) */
+    PNPAGED_LOOKASIDE_LIST lookaside;   /* ctx free-list (bus-owned) */
+    PUCHAR               parent_base;   /* mapped parent buffer base */
+    ULONG                total_len;     /* original request length */
+    size_t               pieces_issued; /* pieces actually sent */
+    volatile LONG        remaining;     /* sub-IRPs still in flight */
+    volatile NTSTATUS    status;        /* first failure latched (if any) */
+    WL_READ_PIECE        pieces[WL_MAX_READ_PIECES];
+} WL_READ_CTX;
+
 /* LV PDO extension. */
 typedef struct _WINLVM_LV_EXT {
     WL_EXT_KIND         kind;          /* WL_EXT_LV */
     PDEVICE_OBJECT      pdo;           /* this device */
     wl_vg_record       *record;       /* borrowed from the bus registry */
     size_t              lv_index;     /* index into record->view->lvs[] */
-    PDEVICE_OBJECT      backing_pdo;   /* PV disk PDO (referenced) */
+    /* Per-PV backing table — every PV this LV's stripes reference, each
+     * with its own ObReferenceObject (PDO + file). NEVER derefed through
+     * pv_tag at I/O time: removal frees tags under no I/O lock; these
+     * refs keep every backing alive while the child lives (Task 9
+     * multi-PV read fan-out). backing_pdo[0] == historical backing_pdo. */
+    PDEVICE_OBJECT      backing_pdo[WL_VG_MAX_PVS];
+    PFILE_OBJECT        backing_file[WL_VG_MAX_PVS];
+    ULONG               backing_logical[WL_VG_MAX_PVS];
+    ULONG               backing_physical[WL_VG_MAX_PVS];
+    uint32_t            pv_slot[WL_VG_MAX_PVS]; /* record slot for each idx */
+    size_t              backing_count; /* distinct PVs in this LV */
+    /* Volume-level sector size for geometry/alignment answers: the
+     * strictest member bounds — logical min, physical max (a volume on
+     * mixed 512e/4Kn members must be addressable by every backing). */
+    ULONG               logical_sector;
+    ULONG               physical_sector;
     ULONGLONG           byte_size;
     UNICODE_STRING      ifname;        /* volume interface, if registered */
     WCHAR               devname[64];   /* \Device\WinLvm<uuid> (mountmgr) */

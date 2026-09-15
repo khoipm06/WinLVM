@@ -2,9 +2,9 @@
  *
  * Extent→PV mapping is delegated to the core mapper (wl_map_begin/next):
  * per-PV pe_start (heterogeneous PVs), striped chunk math, overflow checks
- * and dead-PV refusal all live there and fail closed. The v22 pass-through
- * forwards ONE backing IRP, so a request spanning a segment/PV boundary is
- * refused whole (multi-piece fan-out is the W3 write path). */
+ * and dead-PV refusal all live there and fail closed. Single aligned piece
+ * → forwarded parent IRP (fast path). Anything else → read fan-out: one
+ * sub-IRP per mapped piece (Task 9 multi-PV, W2), completed exactly once. */
 #include "winlvm.h"
 
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) {
@@ -72,10 +72,251 @@ static NTSTATUS WinLvmForwardCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, P
     return STATUS_SUCCESS;
 }
 
-/* Pass-through: one backing IRP for the whole request. The mapper refuses
- * (err) when the request crosses a segment/PV boundary or touches a dead
- * PV — the WHOLE IRP fails, never a partial map. Backing offsets are the
- * mapper's per-PV pe_start + extent + position math. */
+/* Maps [lv_byte, lv_byte + len) to pieces and fills pieces[]. Returns piece
+ * count, or 0 on refusal/overflow (caller completes the parent IRP). */
+static size_t LvMapToPieces(WINLVM_LV_EXT *ext,
+                            const lvmcore_volume_group *view,
+                            uint64_t lv_byte, uint32_t len,
+                            WL_READ_PIECE *pieces, size_t cap) {
+    wl_map_iter it;
+    wl_map_begin(&it, view, ext->record, ext->lv_index, lv_byte, len);
+    size_t n = 0;
+    uint32_t parent_off = 0;
+    for (;;) {
+        uint32_t pv_slot;
+        uint64_t pv_byte, piece_len;
+        int r = wl_map_next(&it, &pv_slot, &pv_byte, &piece_len);
+        if (r == 0) break;
+        if (r < 0 || n >= cap) return 0; /* refusal / too many pieces: fail whole */
+        /* mapper pieces never exceed len, but guard anyway */
+        if (piece_len == 0 || piece_len > (uint64_t)len ||
+            parent_off + (uint32_t)piece_len > len) return 0;
+
+        size_t backing_idx = SIZE_MAX;
+        for (size_t k = 0; k < ext->backing_count; k++) {
+            if (ext->pv_slot[k] == pv_slot) {
+                backing_idx = k;
+                break;
+            }
+        }
+        if (backing_idx == SIZE_MAX) return 0; /* map says PV we don't back */
+        ULONG logical = ext->backing_logical[backing_idx];
+        if (logical == 0 || (logical & (logical - 1)) != 0) return 0;
+
+        WL_READ_PIECE *pc = &pieces[n];
+        RtlZeroMemory(pc, sizeof(*pc));
+        pc->pv_slot = pv_slot;
+        pc->backing_idx = (uint32_t)backing_idx;
+        pc->len = (uint32_t)piece_len;
+        pc->parent_off = parent_off;
+        pc->pv_byte = pv_byte;
+        pc->logical = logical;
+
+        uint64_t mask = (uint64_t)logical - 1;
+        if ((pv_byte & mask) == 0 && (piece_len & mask) == 0) {
+            pc->bounce = 0;
+            pc->sub_offset = pv_byte;
+            pc->sub_len = (uint32_t)piece_len;
+        } else {
+            uint64_t win_start = pv_byte & ~mask;
+            uint64_t win_end;
+            if (piece_len > UINT64_MAX - pv_byte) return 0;
+            if (mask > UINT64_MAX - (pv_byte + piece_len)) return 0;
+            win_end = (pv_byte + piece_len + mask) & ~mask;
+            if (win_end - win_start > 0xFFFFFFFFULL) return 0;
+            pc->bounce = 1;
+            pc->sub_offset = win_start;
+            pc->sub_len = (uint32_t)(win_end - win_start);
+            pc->bounce_skip = (uint32_t)(pv_byte - win_start);
+        }
+        if ((uint64_t)pc->parent_off + pc->len > len) return 0;
+        parent_off += pc->len;
+        n++;
+    }
+    return n;
+}
+
+/* Completion for ONE fan-out sub-IRP. Frees the sub-IRP/MDL/bounce, copies
+ * a bounce piece into the parent buffer, and on the LAST in-flight piece
+ * completes the parent IRP exactly once and returns the ctx to the
+ * lookaside. Any failure latches the first status (never a partial
+ * success: Information = 0 on failure). */
+static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                       PVOID Context) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    WL_READ_PIECE *pc = (WL_READ_PIECE *)Context;
+    WL_READ_CTX *wctx = pc->ctx;
+    NTSTATUS st = Irp->IoStatus.Status;
+
+    if (!NT_SUCCESS(st)) {
+        InterlockedCompareExchange((volatile LONG *)&wctx->status, (LONG)st,
+                                   (LONG)STATUS_SUCCESS);
+    } else if (pc->bounce && pc->iosb.Information > pc->bounce_skip) {
+        ULONG_PTR avail = pc->iosb.Information - pc->bounce_skip;
+        if (avail > pc->len) avail = pc->len;
+        RtlCopyMemory(wctx->parent_base + pc->parent_off,
+                      pc->bounce_buf + pc->bounce_skip, (size_t)avail);
+    }
+
+    if (Irp->MdlAddress) IoFreeMdl(Irp->MdlAddress);
+    IoFreeIrp(Irp);
+    if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
+
+    if (InterlockedDecrement(&wctx->remaining) == 0) {
+        PIRP parent = wctx->parent;
+        NTSTATUS final = (NTSTATUS)wctx->status;
+        parent->IoStatus.Status = final;
+        parent->IoStatus.Information = NT_SUCCESS(final) ? wctx->total_len : 0;
+        IoCompleteRequest(parent, IO_NO_INCREMENT);
+        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+    }
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+/* Read fan-out: map the request, build a sub-IRP per piece (each sized for
+ * ITS backing's stack — ISSUE-21: multi-PV means the deepest member governs
+ * the child PDO, each sub-IRP the piece's own target), then send. Aligned
+ * pieces MDL directly over the parent buffer slice; unaligned pieces read
+ * an aligned bounce window and copy back in completion. */
+static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+    uint64_t lv_byte = (uint64_t)irpSp->Parameters.Read.ByteOffset.QuadPart;
+    uint32_t len = irpSp->Parameters.Read.Length;
+
+    const lvmcore_volume_group *view = ext->record->view;
+    if (!view || !g_bus_ext) {
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_REMOVED;
+    }
+    if (!Irp->MdlAddress) { /* DO_DIRECT_IO child: must have a locked MDL */
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    WL_READ_CTX *wctx = (WL_READ_CTX *)ExAllocateFromNPagedLookasideList(
+        &g_bus_ext->read_ctx_lookaside);
+    if (!wctx) {
+        Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(wctx, sizeof(*wctx));
+    wctx->parent = Irp;
+    wctx->parent_dev = DeviceObject;
+    wctx->lookaside = &g_bus_ext->read_ctx_lookaside;
+    wctx->parent_base = (PUCHAR)MmGetSystemAddressForMdlSafe(
+        Irp->MdlAddress, NormalPagePriority);
+    wctx->total_len = len;
+    wctx->status = STATUS_SUCCESS;
+    if (!wctx->parent_base) {
+        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    size_t n = LvMapToPieces(ext, view, lv_byte, len, wctx->pieces,
+                             WL_MAX_READ_PIECES);
+    if (n == 0) {
+        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Build ALL sub-IRPs first: any failed build fails the WHOLE request
+     * (never a partial fan-out) — undo what was built, complete the parent
+     * with the failure, return the ctx. */
+    size_t built = 0;
+    NTSTATUS fail = STATUS_SUCCESS;
+    for (size_t i = 0; i < n && fail == STATUS_SUCCESS; i++) {
+        WL_READ_PIECE *pc = &wctx->pieces[i];
+        pc->ctx = wctx;
+        PDEVICE_OBJECT backing = ext->backing_pdo[pc->backing_idx];
+        if (!backing || !ext->backing_file[pc->backing_idx]) {
+            fail = STATUS_DEVICE_REMOVED;
+            break;
+        }
+        /* fresh IRP: one stack location consumed by us, the rest by the
+         * backing's whole stack — ISSUE-21 */
+        PIRP sub = IoAllocateIrp((CCHAR)(backing->StackSize + 1), FALSE);
+        if (!sub) {
+            fail = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        PMDL mdl = NULL;
+        if (pc->bounce) {
+            pc->bounce_buf = (PUCHAR)ExAllocatePoolZero(
+                NonPagedPool, pc->sub_len, WINLVM_WIN_TAG);
+            if (!pc->bounce_buf) {
+                IoFreeIrp(sub);
+                fail = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            mdl = IoAllocateMdl(pc->bounce_buf, pc->sub_len, FALSE, FALSE, NULL);
+            if (mdl) MmBuildMdlForNonPagedPool(mdl);
+        } else {
+            /* parent buffer slice: partial MDL over the already-locked
+             * parent MDL — no new locking, exactly the aligned request */
+            mdl = IoBuildPartialMdl(Irp->MdlAddress,
+                                    wctx->parent_base + pc->parent_off,
+                                    pc->len);
+        }
+        if (!mdl) {
+            if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
+            IoFreeIrp(sub);
+            fail = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        sub->MdlAddress = mdl;
+
+        PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(sub);
+        nextSp->MajorFunction = IRP_MJ_READ;
+        nextSp->FileObject = ext->backing_file[pc->backing_idx];
+        nextSp->Parameters.Read.ByteOffset.QuadPart = (LONGLONG)pc->sub_offset;
+        nextSp->Parameters.Read.Length = pc->sub_len;
+        sub->UserIosb = &pc->iosb;
+        IoSetCompletionRoutine(sub, WinLvmFanOutCompletion, pc, TRUE, TRUE, TRUE);
+        pc->sub_irp = sub;
+        built++;
+    }
+
+    if (fail != STATUS_SUCCESS) {
+        for (size_t i = 0; i < built; i++) {
+            WL_READ_PIECE *pc = &wctx->pieces[i];
+            if (pc->sub_irp && pc->sub_irp->MdlAddress)
+                IoFreeMdl(pc->sub_irp->MdlAddress);
+            if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
+            if (pc->sub_irp) IoFreeIrp(pc->sub_irp);
+        }
+        ExFreeToNPagedLookasideList(wctx->lookaside, wctx);
+        Irp->IoStatus.Status = fail;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return fail;
+    }
+
+    InterlockedExchange(&wctx->remaining, (LONG)built);
+    for (size_t i = 0; i < built; i++) {
+        WL_READ_PIECE *pc = &wctx->pieces[i];
+        IoCallDriver(ext->backing_pdo[pc->backing_idx], pc->sub_irp);
+    }
+    /* Parent IRP is completed by the last fan-out completion; the ctx is
+     * freed there too — never touch wctx after this point. */
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+/* Fast path + fan-out dispatch. One fully-mapped aligned piece → the
+ * existing VM-verified forwarded-IRP path; anything else → LvFanOutRead. */
 static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
@@ -99,29 +340,49 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     uint32_t pv_slot;
     uint64_t piece_len;
     wl_map_begin(&it, view, ext->record, ext->lv_index, lv_byte, len);
-    if (wl_map_next(&it, &pv_slot, &pv_byte, &piece_len) != 1 ||
-        piece_len != len) {
-        /* Multi-piece (cross-segment/PV/stripe) or unmappable: fail whole —
-         * a partial forward would silently serve corrupt data. */
+    int r = wl_map_next(&it, &pv_slot, &pv_byte, &piece_len);
+    if (r < 0) {
+        /* unmappable: fail whole — a partial forward would silently serve
+         * corrupt data. */
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* v22 PDOs are single-backing (CreateLvPdo resolved ONE record slot
-     * every stripe lives on), so the mapper's pv_slot is always the PDO's
-     * slot and ext->backing_pdo is the correct target. That reference is
-     * child-PDO-owned (ObReferenceObject at create) — unlike a pv_tag
-     * deref, removal cannot free it while this child lives. */
-    PDEVICE_OBJECT backing = ext->backing_pdo;
+    if (r == 1 && piece_len == len) {
+        /* Single piece. The backing slice exists only when it is aligned to
+         * that member's logical sector: forwarded IRPs cannot bounce. */
+        size_t backing_idx = SIZE_MAX;
+        for (size_t k = 0; k < ext->backing_count; k++) {
+            if (ext->pv_slot[k] == pv_slot) {
+                backing_idx = k;
+                break;
+            }
+        }
+        if (backing_idx != SIZE_MAX) {
+            ULONG logical = ext->backing_logical[backing_idx];
+            uint64_t mask = (uint64_t)logical - 1;
+            if (logical && (pv_byte & mask) == 0 && (piece_len & mask) == 0) {
+                /* Child-PDO-owned reference (ObReferenceObject at create) —
+                 * unlike a pv_tag deref, removal cannot free it while this
+                 * child lives. */
+                PDEVICE_OBJECT backing = ext->backing_pdo[backing_idx];
 
-    IoCopyCurrentIrpStackLocationToNext(Irp);
-    PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
-    nextSp->Parameters.Read.ByteOffset.QuadPart = (LONGLONG)pv_byte;
+                IoCopyCurrentIrpStackLocationToNext(Irp);
+                PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
+                nextSp->Parameters.Read.ByteOffset.QuadPart = (LONGLONG)pv_byte;
 
-    IoSetCompletionRoutine(Irp, WinLvmForwardCompletion, NULL, TRUE, TRUE, TRUE);
-    return IoCallDriver(backing, Irp);
+                IoSetCompletionRoutine(Irp, WinLvmForwardCompletion, NULL,
+                                       TRUE, TRUE, TRUE);
+                return IoCallDriver(backing, Irp);
+            }
+        }
+    }
+
+    /* Multi-piece (cross-segment/PV/stripe), or a single piece that needs
+     * bouncing: fan out with per-piece sub-IRPs. */
+    return LvFanOutRead(DeviceObject, Irp);
 }
 
 NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -159,6 +420,15 @@ NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_DEVICE_REMOVED;
+    }
+    /* Write fan-out is W3 — a multi-PV LV fails closed rather than write
+     * one stripe and corrupt the rest. Single-backing LVs (backing_count
+     * == 1) keep the full write path. */
+    if (ext->backing_count > 1) {
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_NOT_SUPPORTED;
     }
     /* Honor LVM2 system_id: a VG owned by another host must not be
      * written by us. (view is pinned by the child-PDO ref — refs == 0
@@ -211,8 +481,11 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_DEVICE_REMOVED;
     }
+    /* Forward the flush to the first backing member. A multi-PV LV has no
+     * data writes (blocked above), so flushing one member is sufficient for
+     * the read-path phase; W3's write fan-out adds per-member flushes. */
     IoSkipCurrentIrpStackLocation(Irp);
-    return IoCallDriver(ext->backing_pdo, Irp);
+    return IoCallDriver(ext->backing_pdo[0], Irp);
 }
 
 NTSTATUS WinLvmShutdown(PDEVICE_OBJECT DeviceObject, PIRP Irp) {

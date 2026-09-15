@@ -24,13 +24,57 @@ void winlvm_probe_scratch_free(void *p) {
     if (p) ExFreePoolWithTag(p, WINLVM_WIN_TAG);
 }
 
-/* Release a per-PV backing tag: interface link copy + disk PDO reference. */
+/* Release a per-PV backing tag: interface link copy + disk refs. */
 static void WinLvmFreePvTag(WINLVM_PV_TAG *tag) {
     if (!tag) return;
     if (tag->disk_ifname.Buffer)
         ExFreePoolWithTag(tag->disk_ifname.Buffer, WINLVM_WIN_TAG);
     if (tag->backing_pdo) ObDereferenceObject(tag->backing_pdo);
+    if (tag->backing_file) ObDereferenceObject(tag->backing_file);
     ExFreePoolWithTag(tag, WINLVM_WIN_TAG);
+}
+
+/* Query the backing disk's native sector sizes (512/512e/4Kn). Sync IOCTL
+ * against the disk class FDO (`target_disk` comes from IoGetDeviceObjectPointer
+ * — the class driver answers IOCTL_STORAGE_QUERY_PROPERTY; the raw PDO does
+ * not). winbtrfs dev_ioctl (btrfs.c:2942) is the pattern. Late/driver-lower
+ * stacks answer StorageAccessAlignmentProperty with a descriptor; a failure
+ * fails closed to 512/512 everywhere (winlvm_read/winlvm_write already treat
+ * 512 as the safe floor). */
+static void WinLvmQuerySectorSize(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_file,
+                                  ULONG *logical_out, ULONG *physical_out) {
+    ULONG logical = 512, physical = 512;
+    if (disk_pdo && disk_file) {
+        STORAGE_PROPERTY_QUERY q;
+        RtlZeroMemory(&q, sizeof(q));
+        q.PropertyId = StorageAccessAlignmentProperty;
+        q.QueryType = PropertyStandardQuery;
+        STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR d;
+        RtlZeroMemory(&d, sizeof(d));
+
+        KEVENT ev;
+        KeInitializeEvent(&ev, NotificationEvent, FALSE);
+        IO_STATUS_BLOCK iosb;
+        PIRP irp = IoBuildDeviceIoControlRequest(
+            IOCTL_STORAGE_QUERY_PROPERTY, disk_pdo, &q, sizeof(q),
+            &d, sizeof(d), FALSE, &ev, &iosb);
+        if (irp) {
+            PIO_STACK_LOCATION irpSp = IoGetNextIrpStackLocation(irp);
+            irpSp->FileObject = disk_file;
+            NTSTATUS status = IoCallDriver(disk_pdo, irp);
+            if (status == STATUS_PENDING)
+                KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, NULL);
+            if (NT_SUCCESS(status)) {
+                if (d.BytesPerLogicalSector >= 512 &&
+                    d.BytesPerPhysicalSector >= d.BytesPerLogicalSector) {
+                    logical = d.BytesPerLogicalSector;
+                    physical = d.BytesPerPhysicalSector;
+                }
+            }
+        }
+    }
+    *logical_out = logical;
+    *physical_out = physical;
 }
 
 static NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
@@ -97,8 +141,14 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
     ext->pdo = PhysicalDeviceObject;
     KeInitializeSpinLock(&ext->lock);
     wl_vg_registry_init(ext->vg_records, WL_VG_MAX); /* idempotent after zero */
+    /* Read fan-out piece context cache (winlvm_io.c): DISPATCH_LEVEL
+     * paging I/O allocates pieces from here, never ExAllocatePool. */
+    ExInitializeNPagedLookasideList(&ext->read_ctx_lookaside, NULL, NULL,
+                                    POOL_NX_ALLOCATION, sizeof(WL_READ_CTX),
+                                    WINLVM_WIN_TAG, 0);
     ext->bus_pdo = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
     if (!ext->bus_pdo) {
+        ExDeleteNPagedLookasideList(&ext->read_ctx_lookaside);
         IoDeleteDevice(fdo);
         return STATUS_NO_SUCH_DEVICE;
     }
@@ -271,7 +321,9 @@ void WinLvmProbeWorker(PVOID context) {
             goto out_block;
         }
 
-        /* Per-PV backing tag: interface link + disk PDO (referenced). */
+        /* Per-PV backing tag: interface link + disk PDO/file (referenced)
+         * + native sector sizes (StorageAccessAlignmentProperty query —
+         * PASSIVE_LEVEL here, the probe worker is the right IRQL). */
         WINLVM_PV_TAG *tag = ExAllocatePoolZero(NonPagedPool,
             sizeof(WINLVM_PV_TAG), WINLVM_WIN_TAG);
         if (!tag) {
@@ -279,9 +331,13 @@ void WinLvmProbeWorker(PVOID context) {
             goto out_block;
         }
         tag->backing_pdo = work->target_disk;
+        tag->backing_file = work->target_file;
         tag->disk_ifname = work->ifname;
         work->ifname.Buffer = NULL; /* ownership moved into the tag */
         ObReferenceObject(work->target_disk);
+        ObReferenceObject(work->target_file);
+        WinLvmQuerySectorSize(work->target_disk, work->target_file,
+                              &tag->logical_sector, &tag->physical_sector);
 
         /* Registry transitions run under the bus lock (the state machine
          * mutates only shared record slots). PDO creation happens after
@@ -368,17 +424,26 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     if (!view || lv_index >= view->lv_count) return FALSE;
     const lvmcore_logical_volume *lv0 = &view->lvs[lv_index];
 
-    /* v22 glue is single-backing pass-through per PDO. Resolve the ONE
-     * record PV slot every stripe of this LV lives on; a multi-PV LV
-     * (fan-out is W3) must NOT get a PDO — it would read from one disk
-     * and silently serve corrupt data for the other PV's extents. */
-    size_t pv_slot = SIZE_MAX;
-    for (size_t s = 0; s < lv0->segment_count; s++) {
+    /* The PDO references EVERY PV its stripes touch (Task 9 multi-PV read
+     * fan-out — striped-2pv/linear-2pv must map byte-exact at W2). One
+     * ObReferenceObject per distinct PV slot: the backing refs are
+     * child-owned so removal of any member cannot free under the child,
+     * and the read path never derefs pv_tag at I/O time (tags ARE freed
+     * by REMOVAL; the child's own refs are not). Striped/linear multi-PV
+     * reads fan out via wl_map_begin/next (winlvm_io.c). Write stays
+     * single-backing until W3 (WinLvmWrite fails closed on
+     * backing_count > 1). */
+    size_t slots[WL_VG_MAX_PVS];
+    size_t slot_count = 0;
+    ULONG max_stack = 0;
+    ULONG min_logical = 0, max_physical = 0;
+    BOOLEAN table_ok = TRUE;
+    for (size_t s = 0; s < lv0->segment_count && table_ok; s++) {
         const lvmcore_segment *seg = &lv0->segments[s];
-        for (size_t t = 0; t < seg->stripe_count_used; t++) {
+        for (size_t t = 0; t < seg->stripe_count_used && table_ok; t++) {
             const lvmcore_physical_volume *pv =
                 lvmcore_vg_find_pv(view, seg->stripes[t].pv_key);
-            if (!pv) return FALSE;
+            if (!pv) { table_ok = FALSE; break; }
             size_t slot = SIZE_MAX;
             for (size_t k = 0; k < record->pv_count; k++) {
                 if (RtlEqualMemory(record->pv_uuid[k], pv->id, 32)) {
@@ -386,15 +451,35 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
                     break;
                 }
             }
-            if (slot == SIZE_MAX) return FALSE;
-            if (pv_slot == SIZE_MAX) pv_slot = slot;
-            else if (pv_slot != slot) return FALSE; /* cross-PV LV: W3 fan-out */
+            if (slot == SIZE_MAX) { table_ok = FALSE; break; }
+            /* dedupe: one backing ref per distinct record slot */
+            size_t known = 0;
+            for (; known < slot_count; known++)
+                if (slots[known] == slot) break;
+            if (known == slot_count) {
+                const WINLVM_PV_TAG *tag =
+                    (const WINLVM_PV_TAG *)record->pv_tag[slot];
+                if (!tag || !tag->backing_pdo || !tag->backing_file) {
+                    /* a declared PV of this LV has no arrived backing —
+                     * wl_vg_arrival's per-LV completeness gate should have
+                     * filtered this, but fail closed on inconsistency */
+                    table_ok = FALSE;
+                    break;
+                }
+                slots[slot_count++] = slot;
+                if ((ULONG)tag->backing_pdo->StackSize > max_stack)
+                    max_stack = (ULONG)tag->backing_pdo->StackSize;
+                if (min_logical == 0 || tag->logical_sector < min_logical)
+                    min_logical = tag->logical_sector;
+                if (tag->physical_sector > max_physical)
+                    max_physical = tag->physical_sector;
+            }
         }
     }
-    if (pv_slot == SIZE_MAX) return FALSE; /* no stripes (empty LV) */
-    const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)record->pv_tag[pv_slot];
-    if (!tag || !tag->backing_pdo) return FALSE;
-    PDEVICE_OBJECT backing_disk = tag->backing_pdo;
+    if (!table_ok || slot_count == 0)
+        return FALSE; /* missing backing / empty LV: no PDO */
+    if (min_logical == 0) min_logical = 512;
+    if (max_physical == 0) max_physical = min_logical;
 
     /* Overflow-safe total size; 0 = overflow or absent — fail closed
      * with no volume rather than a lie of a device. */
@@ -427,14 +512,28 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     ext->pdo = lv_pdo;
     ext->record = record;
     ext->lv_index = lv_index;
-    ext->backing_pdo = backing_disk;
-    ObReferenceObject(backing_disk);
-
+    ext->backing_count = slot_count;
+    for (size_t i = 0; i < slot_count; i++) {
+        const WINLVM_PV_TAG *tag =
+            (const WINLVM_PV_TAG *)record->pv_tag[slots[i]];
+        ext->backing_pdo[i] = tag->backing_pdo;
+        ext->backing_file[i] = tag->backing_file;
+        ext->backing_logical[i] = tag->logical_sector;
+        ext->backing_physical[i] = tag->physical_sector;
+        ext->pv_slot[i] = (uint32_t)slots[i]; /* mapper slot → backing idx */
+        ObReferenceObject(tag->backing_pdo);
+        ObReferenceObject(tag->backing_file);
+    }
+    ext->logical_sector = min_logical;
+    ext->physical_sector = max_physical;
     ext->byte_size = byte_size;
 
     /* ISSUE-21: forwarded IRPs need a stack location for the backing
-     * disk's whole stack or IoCallDriver writes past the IRP — BSOD. */
-    lv_pdo->StackSize = (UCHAR)(backing_disk->StackSize + 1);
+     * disk's whole stack or IoCallDriver writes past the IRP — BSOD.
+     * With multi-PV fan-out the parent IRP can be forwarded to ANY member,
+     * so StackSize must fit the DEEPEST backing stack, not just [0]. */
+    lv_pdo->StackSize = (UCHAR)(max_stack + 1);
+    if (lv_pdo->StackSize < 1) lv_pdo->StackSize = 1;
     lv_pdo->Flags |= DO_DIRECT_IO;
     lv_pdo->Flags &= ~DO_DEVICE_INITIALIZING;
 
@@ -450,19 +549,17 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
         bus->children[bus->child_count++] = lv_pdo;
         wl_vg_ref(record); /* child-PDO refcount: reconciles refuse to swap
                             * a view under live children (refs == 0 gate) */
-    } else {
-        /* over cap: undo rather than corrupt the array */
         KeReleaseSpinLock(&bus->lock, old);
-        if (ext->ifname.Buffer) {
-            IoSetDeviceInterfaceState(&ext->ifname, FALSE);
-            RtlFreeUnicodeString(&ext->ifname);
-        }
-        ObDereferenceObject(backing_disk);
-        IoDeleteDevice(lv_pdo);
-        return FALSE;
+        return TRUE;
     }
+    /* over cap: undo rather than corrupt the array */
     KeReleaseSpinLock(&bus->lock, old);
-    return TRUE;
+    for (size_t i = 0; i < slot_count; i++) {
+        ObDereferenceObject(ext->backing_pdo[i]);
+        ObDereferenceObject(ext->backing_file[i]);
+    }
+    IoDeleteDevice(lv_pdo);
+    return FALSE;
 }
 
 /* --------------------------------------------------------------- */
@@ -543,12 +640,18 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 RtlFreeUnicodeString(&ce->ifname);
             }
             /* Children sweep deletes directly (never sees REMOVE_DEVICE),
-             * so undo the child-PDO ref + activation claim here too. */
+             * so undo the child-PDO ref + activation claim + per-PV
+             * backing refs here too. */
             if (ce->record) {
                 wl_vg_lv_set_activated(ce->record, ce->lv_index, 0);
                 wl_vg_unref(ce->record);
             }
-            ObDereferenceObject(ce->backing_pdo);
+            for (size_t k = 0; k < ce->backing_count; k++) {
+                if (ce->backing_pdo[k]) ObDereferenceObject(ce->backing_pdo[k]);
+                if (ce->backing_file[k]) ObDereferenceObject(ce->backing_file[k]);
+                ce->backing_pdo[k] = NULL;
+                ce->backing_file[k] = NULL;
+            }
             IoDeleteDevice(ext->children[i]);
         }
         ext->child_count = 0;
@@ -573,6 +676,14 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
             g_disk_notify_cookie = NULL;
         }
+        /* Read-fan-out lookaside: children are gone (their sweep ran
+         * above), so no in-flight piece context can touch the list.
+         * Residual race: a sub-IRP completing after its child PDO was
+         * deleted would free its ctx into this list — same async-teardown
+         * window as the probe worker / bus REMOVE race (W3 work-queue
+         * drain). The ctx is never dereferenced out of the list, so a
+         * leaked ctx is a leak, not a UAF. */
+        ExDeleteNPagedLookasideList(&ext->read_ctx_lookaside);
         IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
         IoDetachDevice(ext->bus_pdo);
         if (g_bus_ext == ext) g_bus_ext = NULL;

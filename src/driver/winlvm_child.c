@@ -126,7 +126,7 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     break;
                 }
             }
-            /* Release the child-PDO ref taken by CreateLvPdo: reconciles
+            /* Release the child-PDO refs taken by CreateLvPdo: reconciles
              * gate view swaps on refs == 0, so a dead/removed child must
              * not pin the old view forever. Clearing the activation bit
              * lets a later re-arrival re-create this volume (PnP REMOVE
@@ -137,7 +137,13 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             }
             KeReleaseSpinLock(&g_bus_ext->lock, old);
         }
-        ObDereferenceObject(lvext->backing_pdo);
+        /* Balance the per-PV backing refs from CreateLvPdo. */
+        for (size_t i = 0; i < lvext->backing_count; i++) {
+            if (lvext->backing_pdo[i]) ObDereferenceObject(lvext->backing_pdo[i]);
+            if (lvext->backing_file[i]) ObDereferenceObject(lvext->backing_file[i]);
+            lvext->backing_pdo[i] = NULL;
+            lvext->backing_file[i] = NULL;
+        }
         IoDeleteDevice(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
