@@ -28,9 +28,13 @@
 #include <ntddvol.h>
 #include <wdmguid.h>
 #include "lvm_read.h"
+#include "winlvm_vg.h"
 
 #define WINLVM_WIN_TAG ((unsigned long)'WMLV')
 #define WL_MAX_CHILDREN 32
+/* Arena cap per accepted VG view: user metadata text may reach
+ * LVMCORE_MAX_METADATA_BYTES (1 MiB) plus PV/LV/segment arrays. */
+#define WINLVM_VIEW_ARENA_CAP (2u * 1024 * 1024)
 
 /* Tracing (shared by winlvm.c / winlvm_bus.c / winlvm_child.c). */
 #define WL_TRACE(msg) DbgPrint("winlvm: " msg "\n")
@@ -45,16 +49,23 @@ static const WCHAR WinLvmHwId[] = L"WinLvm\\Volume\0WinLvmVolume\0";  /* REG_MUL
 
 typedef enum { WL_EXT_BUS = 0x31425553, WL_EXT_LV = 0x32564C53 } WL_EXT_KIND;
 
-/* One cached volume group (single-PV groups in this phase). */
+/* Glue-side per-PV backing: the arrived disk behind one PV slot of a
+ * record. Core stores an opaque tag pointer per PV (pv_tag[]); this is
+ * what it points at. Disk PDO and interface link are referenced/owned. */
 typedef struct {
-    winlvm_volume_group vg;        /* as parsed by lvm_read.c */
-    PDEVICE_OBJECT       backing_pdo; /* disk PDO holding the PV (referenced) */
-    UNICODE_STRING       disk_ifname; /* \??\ disk interface link (owned) —
-                                          * matches REMOVAL notifications to
-                                          * this record (surprise-removal
-                                          * teardown, winlvm_bus.c) */
-    volatile LONG        dead;     /* backing disk removed: fail new I/O */
-} WINLVM_VG_RECORD;
+    PDEVICE_OBJECT backing_pdo; /* disk PDO holding the PV (referenced) */
+    UNICODE_STRING disk_ifname; /* \??\ disk interface link (owned) — maps */
+                                /* REMOVAL notifications back to the PV    */
+} WINLVM_PV_TAG;
+
+/* A parsed VG view: arena + the view struct. The record's `view` points
+ * at the embedded lvmcore_volume_group; the block is owned by the bus
+ * (freed only at bus REMOVE, or on a refs==0 RECONCILED swap). */
+typedef struct {
+    lvmcore_arena        arena;
+    lvmcore_volume_group vg;
+    uint8_t              buf[WINLVM_VIEW_ARENA_CAP];
+} WINLVM_VIEW_BLOCK;
 
 /* Bus FDO extension. */
 typedef struct _WINLVM_BUS_EXT {
@@ -62,8 +73,13 @@ typedef struct _WINLVM_BUS_EXT {
     PDEVICE_OBJECT      fdo;           /* this device */
     PDEVICE_OBJECT      pdo;           /* root-enumerated PDO below */
     PDEVICE_OBJECT      bus_pdo;       /* attach point (same as pdo here) */
-    KSPIN_LOCK          lock;          /* children/vgs */
-    WINLVM_VG_RECORD   *vgs;           /* single cached VG for now */
+    KSPIN_LOCK          lock;          /* children/vg_records */
+    /* Multi-VG registry (W2 Task 8): fixed array of records keyed by VG
+     * UUID, with one glue-owned view arena per accepted record. Records
+     * are never freed individually — the v22 UAF class is dead at the
+     * root (bus REMOVE sweeps them). */
+    wl_vg_record        vg_records[WL_VG_MAX];
+    WINLVM_VIEW_BLOCK  *vg_views[WL_VG_MAX]; /* arena per record slot */
     PDEVICE_OBJECT      children[WL_MAX_CHILDREN];
     size_t              child_count;
     WMILIB_CONTEXT      wmi;           /* zero-GUID wmilib context (START reg) */
@@ -73,8 +89,8 @@ typedef struct _WINLVM_BUS_EXT {
 typedef struct _WINLVM_LV_EXT {
     WL_EXT_KIND         kind;          /* WL_EXT_LV */
     PDEVICE_OBJECT      pdo;           /* this device */
-    WINLVM_VG_RECORD   *record;       /* borrowed from the bus */
-    size_t              lv_index;     /* index into record->vg.lvs[] */
+    wl_vg_record       *record;       /* borrowed from the bus registry */
+    size_t              lv_index;     /* index into record->view->lvs[] */
     PDEVICE_OBJECT      backing_pdo;   /* PV disk PDO (referenced) */
     ULONGLONG           byte_size;
     UNICODE_STRING      ifname;        /* volume interface, if registered */

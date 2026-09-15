@@ -38,7 +38,9 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             Irp->IoStatus.Information = (ULONG_PTR)id;
             Irp->IoStatus.Status = STATUS_SUCCESS;
         } else if (type == BusQueryInstanceID) {
-            winlvm_logical_volume *lv = &lvext->record->vg.lvs[lvext->lv_index];
+            const lvmcore_volume_group *view = lvext->record->view;
+            if (!view || lvext->lv_index >= view->lv_count) break;
+            const lvmcore_logical_volume *lv = &view->lvs[lvext->lv_index];
             WCHAR inst[40];
             /* instance = LV UUID, guaranteed unique per device */
             size_t i = 0;
@@ -123,6 +125,15 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     g_bus_ext->child_count--;
                     break;
                 }
+            }
+            /* Release the child-PDO ref taken by CreateLvPdo: reconciles
+             * gate view swaps on refs == 0, so a dead/removed child must
+             * not pin the old view forever. Clearing the activation bit
+             * lets a later re-arrival re-create this volume (PnP REMOVE
+             * on a dead VG → disk re-insert → fresh devnode). */
+            if (lvext->record) {
+                wl_vg_lv_set_activated(lvext->record, lvext->lv_index, 0);
+                wl_vg_unref(lvext->record);
             }
             KeReleaseSpinLock(&g_bus_ext->lock, old);
         }

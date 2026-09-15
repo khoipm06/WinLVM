@@ -24,6 +24,15 @@ void winlvm_probe_scratch_free(void *p) {
     if (p) ExFreePoolWithTag(p, WINLVM_WIN_TAG);
 }
 
+/* Release a per-PV backing tag: interface link copy + disk PDO reference. */
+static void WinLvmFreePvTag(WINLVM_PV_TAG *tag) {
+    if (!tag) return;
+    if (tag->disk_ifname.Buffer)
+        ExFreePoolWithTag(tag->disk_ifname.Buffer, WINLVM_WIN_TAG);
+    if (tag->backing_pdo) ObDereferenceObject(tag->backing_pdo);
+    ExFreePoolWithTag(tag, WINLVM_WIN_TAG);
+}
+
 static NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
     if (g_disk_notify_cookie) return STATUS_SUCCESS;
     return IoRegisterPlugPlayNotification(
@@ -87,6 +96,7 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
     ext->fdo = fdo;
     ext->pdo = PhysicalDeviceObject;
     KeInitializeSpinLock(&ext->lock);
+    wl_vg_registry_init(ext->vg_records, WL_VG_MAX); /* idempotent after zero */
     ext->bus_pdo = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
     if (!ext->bus_pdo) {
         IoDeleteDevice(fdo);
@@ -122,32 +132,46 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
     /* Backing-disk surprise removal: the probe only listens to ARRIVALS,
      * so a removed PV left a live VG record pointing at a dead PDO — IRPs
      * forwarded there wedged the VM minutes after the removal
-     * (2026-09-13 surprise-removal test). Tear the record down. */
+     * (2026-09-13 surprise-removal test). Tear the PV down.
+     * W2 Task 8: the registry is multi-PV; match the link against every
+     * PV's per-slot tag and mark the PV GONE (record stays — re-insert). */
     if (IsEqualGUID(&data->Event, &GUID_DEVICE_INTERFACE_REMOVAL)) {
         WINLVM_BUS_EXT *bus = g_bus_ext;
         if (!bus) return STATUS_SUCCESS;
+        wl_vg_record *hit = NULL;
+        size_t hit_pv = 0;
         KIRQL old;
         KeAcquireSpinLock(&bus->lock, &old);
-        WINLVM_VG_RECORD *record = bus->vgs;
-        WINLVM_VG_RECORD *hit = NULL;
-        if (record && record->disk_ifname.Buffer &&
-            RtlEqualUnicodeString(&record->disk_ifname,
-                                  data->SymbolicLinkName, TRUE)) {
-            hit = record;
+        for (size_t i = 0; i < WL_VG_MAX && !hit; i++) {
+            wl_vg_record *r = &bus->vg_records[i];
+            if (!r->vg_uuid[0]) continue;
+            for (size_t p = 0; p < r->pv_count; p++) {
+                const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)r->pv_tag[p];
+                if (tag && tag->disk_ifname.Buffer &&
+                    RtlEqualUnicodeString(&tag->disk_ifname,
+                                          data->SymbolicLinkName, TRUE)) {
+                    hit = r;
+                    hit_pv = p;
+                    break;
+                }
+            }
         }
         if (hit) {
-            /* Mark dead first so in-flight dispatch fails new I/O cleanly;
-             * actual record free happens after child PDOs are gone
-             * (IRP_MN_REMOVE_DEVICE drops them — winlvm_child.c). */
-            InterlockedExchange(&hit->dead, 1);
+            /* Mark the PV GONE (dead recomputed, per-LV all-gone set) BEFORE
+             * dropping the tag so dispatch fails closed on the next IRP
+             * (2026-09-13 lesson). The record itself survives for re-insert. */
+            wl_vg_pv_removed(bus->vg_records, WL_VG_MAX, hit->pv_uuid[hit_pv]);
+            WINLVM_PV_TAG *tag = (WINLVM_PV_TAG *)hit->pv_tag[hit_pv];
+            hit->pv_tag[hit_pv] = NULL;
+            KeReleaseSpinLock(&bus->lock, old);
+            if (tag) WinLvmFreePvTag(tag);
+            WL_TRACE("bus: backing disk removed, invalidating VG");
+            /* Re-report relations: children of an all-gone PV complete their
+             * own removal path on the next QDR cycle. */
+            IoInvalidateDeviceRelations(bus->pdo, BusRelations);
+            return STATUS_SUCCESS;
         }
         KeReleaseSpinLock(&bus->lock, old);
-        if (hit) {
-            WL_TRACE("bus: backing disk removed, invalidating VG");
-            /* Re-report relations: children with a dead record complete
-             * their own removal path on the next QDR cycle. */
-            IoInvalidateDeviceRelations(bus->pdo, BusRelations);
-        }
         return STATUS_SUCCESS;
     }
 
@@ -188,10 +212,17 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
     return STATUS_SUCCESS;
 }
 
-static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
-                                         WINLVM_VG_RECORD *record,
-                                         size_t lv_index,
-                                         PDEVICE_OBJECT backing_disk);
+static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
+                                            wl_vg_record *record,
+                                            size_t lv_index);
+
+/* W3 UPDATE_LV seam, absent: keeps the OLD view serving (fail closed —
+ * never free/fake under live children). Returns unavailable, so a
+ * higher-seqno late arrival leaves the record stale with the old view. */
+wl_update_result WinLvmUpdateLvSeam(void *ctx, const char *lv_uuid) {
+    (void)ctx; (void)lv_uuid;
+    return WL_UPDATE_UNAVAILABLE;
+}
 
 void WinLvmProbeWorker(PVOID context) {
     WINLVM_PROBE_WORK *work = (WINLVM_PROBE_WORK *)context;
@@ -204,97 +235,172 @@ void WinLvmProbeWorker(PVOID context) {
         dsrc.file = work->target_file;
         KeInitializeEvent(&dsrc.done, NotificationEvent, FALSE);
 
-        winlvm_byte_source src;
+        /* Adapter: the lvmcore byte source has the same read-callback
+         * contract as winlvm_byte_source — the disk source IS the impl. */
+        lvmcore_byte_source src;
         src.impl = &dsrc;
         src.size = ~0ULL;
         src.read = winlvm_disk_source_read;
 
-        winlvm_volume_group *vg = ExAllocatePoolZero(NonPagedPool,
-            sizeof(winlvm_volume_group), WINLVM_WIN_TAG);
-        if (vg) {
-            winlvm_lvm_err err;
-            if (winlvm_read_vg(&src, vg, &err)) {
-                WL_TRACE_1("probe: VG parsed, lvs=%u", (unsigned)vg->lv_count);
-                KIRQL old;
-                KeAcquireSpinLock(&bus->lock, &old);
-                WINLVM_VG_RECORD *record = bus->vgs;
-                KeReleaseSpinLock(&bus->lock, old);
-
-                int created = 0;
-                if (!record) {
-                    record = ExAllocatePoolZero(NonPagedPool,
-                        sizeof(WINLVM_VG_RECORD), WINLVM_WIN_TAG);
-                    if (record) {
-                        record->vg = *vg;
-                        ObReferenceObject(work->target_disk);
-                        record->backing_pdo = work->target_disk;
-                        /* keep the disk interface link so a later REMOVAL
-                         * notification can find this record again */
-                        if (work->ifname.Buffer)
-                            record->disk_ifname = work->ifname;
-                        else
-                            RtlZeroMemory(&record->disk_ifname,
-                                          sizeof(record->disk_ifname));
-                        work->ifname.Buffer = NULL; /* ownership moved */
-                        KeAcquireSpinLock(&bus->lock, &old);
-                        if (!bus->vgs) { bus->vgs = record; created = 1; }
-                        else {
-                            /* single-PV groups only for now: a second VG on
-                             * another disk is dropped leak-free */
-                            WINLVM_VG_RECORD *r = bus->vgs;
-                            if (r != record) {
-                                KeReleaseSpinLock(&bus->lock, old);
-                                ObDereferenceObject(work->target_disk);
-                                /* disk_ifname is a MANUAL NonPagedPool copy
-                                 * (see ifname stash above) — tagged free,
-                                 * never RtlFreeUnicodeString (no header) */
-                                if (record->disk_ifname.Buffer)
-                                    ExFreePoolWithTag(record->disk_ifname.Buffer,
-                                                      WINLVM_WIN_TAG);
-                                ExFreePoolWithTag(record, WINLVM_WIN_TAG);
-                                record = NULL;
-                                KeAcquireSpinLock(&bus->lock, &old);
-                            }
-                        }
-                        KeReleaseSpinLock(&bus->lock, old);
-                    }
-                } else if (record->backing_pdo != work->target_disk) {
-                    /* a different disk carrying (a copy of) the same VG:
-                     * single-PV phase — ignore, no duplicate LV devnodes */
-                    record = NULL;
-                }
-
-                /* re-notifies of the same PV must not re-create LV PDOs:
-                 * duplicates would collide on the LV-UUID instance ID */
-                if (record && created) {
-                    for (size_t i = 0; i < vg->lv_count; i++) {
-                        if (!vg->lvs[i].mappable) continue;
-                        WinLvmProbeWorkerCreateLvPdo(bus, record, i,
-                                                     work->target_disk);
-                    }
-                    IoInvalidateDeviceRelations(bus->pdo, BusRelations);
-                }
-            } else {
-                WL_TRACE_1("probe: parse failed: %s", err.message);
-            }
-            ExFreePoolWithTag(vg, WINLVM_WIN_TAG);
+        /* Per-arrival view arena: label + parse live here. Consumed by the
+         * record only on first-arrival create / refs==0 reconcile; frees
+         * here otherwise (core ownership contract). */
+        WINLVM_VIEW_BLOCK *block = ExAllocatePoolZero(NonPagedPool,
+            sizeof(WINLVM_VIEW_BLOCK), WINLVM_WIN_TAG);
+        if (!block) {
+            WL_TRACE("probe: view block alloc failed");
+            goto out;
         }
+        lvmcore_arena_init(&block->arena, block->buf, sizeof(block->buf));
+
+        lvmcore_pv_label label;
+        lvmcore_err lerr;
+        lvmcore_status st = lvmcore_read_pv_label(&src, &block->arena,
+                                                  &label, &lerr);
+        if (st != LVMCORE_OK) {
+            WL_TRACE_1("probe: label read failed: %s", lerr.message);
+            goto out_block;
+        }
+
+        lvmcore_volume_group *vg_out = &block->vg;
+        lvmcore_err verr;
+        st = lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &block->arena,
+                             vg_out, &verr);
+        if (st != LVMCORE_OK) {
+            WL_TRACE_1("probe: lvmcore read_vg failed: %s", verr.message);
+            goto out_block;
+        }
+
+        /* Per-PV backing tag: interface link + disk PDO (referenced). */
+        WINLVM_PV_TAG *tag = ExAllocatePoolZero(NonPagedPool,
+            sizeof(WINLVM_PV_TAG), WINLVM_WIN_TAG);
+        if (!tag) {
+            WL_TRACE("probe: tag alloc failed");
+            goto out_block;
+        }
+        tag->backing_pdo = work->target_disk;
+        tag->disk_ifname = work->ifname;
+        work->ifname.Buffer = NULL; /* ownership moved into the tag */
+        ObReferenceObject(work->target_disk);
+
+        /* Registry transitions run under the bus lock (the state machine
+         * mutates only shared record slots). PDO creation happens after
+         * release — PASSIVE_LEVEL, IoCreateDevice. */
+        KIRQL old;
+        size_t slot = 0;
+        size_t newly[WL_VG_MAX_LVS];
+        size_t newly_count = 0;
+        KeAcquireSpinLock(&bus->lock, &old);
+        int existed = wl_vg_find(bus->vg_records, WL_VG_MAX,
+                                 vg_out->id) >= 0;
+        wl_arrival_result res = wl_vg_arrival(
+            bus->vg_records, WL_VG_MAX, &slot, vg_out,
+            label.pv_uuid, tag, WinLvmUpdateLvSeam, NULL,
+            newly, WL_VG_MAX_LVS, &newly_count);
+        /* View arena kept by the record only when it was stored: brand-new
+         * record (created now) or a refs==0 reconcile swap. */
+        int view_kept = (res == WL_ARR_RECONCILED) ||
+                        (!existed && (res == WL_ARR_COMPLETED ||
+                                      res == WL_ARR_PENDING));
+        if (view_kept) {
+            if (res == WL_ARR_RECONCILED && bus->vg_views[slot]) {
+                ExFreePoolWithTag(bus->vg_views[slot], WINLVM_WIN_TAG);
+            }
+            bus->vg_views[slot] = block;
+            block = NULL; /* relocated into the bus extension */
+        }
+        /* Claim the freshly-activatable LVs UNDER THE LOCK: the core leaves
+         * lv_activated[] untouched (wl_collect_newly excludes claimed LVs),
+         * so the first arrival for this VG wins — a concurrent worker for
+         * another PV of the same VG never double-creates a PDO. */
+        for (size_t i = 0; i < newly_count; i++)
+            wl_vg_lv_set_activated(&bus->vg_records[slot], newly[i], 1);
+        KeReleaseSpinLock(&bus->lock, old);
+
+        /* Tag ownership: the record stores it on every accepted result
+         * except REJECTED / DUPLICATE, and on STALE_SEQNO only when the
+         * serving view has a slot for this PV UUID. */
+        if (res == WL_ARR_REJECTED || res == WL_ARR_DUPLICATE) {
+            WinLvmFreePvTag(tag);
+            tag = NULL;
+        } else if (res == WL_ARR_STALE_SEQNO) {
+            wl_vg_record *r = &bus->vg_records[slot];
+            int kept = 0;
+            for (size_t p = 0; p < r->pv_count; p++)
+                if (r->pv_tag[p] == tag) { kept = 1; break; }
+            if (!kept) { WinLvmFreePvTag(tag); tag = NULL; }
+        }
+
+        /* Freshly-activatable LVs become child PDOs (single-PV backing
+         * per PDO; multi-PV fan-out is W3). Transient create failures
+         * release the claim so a future arrival retries this LV. */
+        if (newly_count > 0) {
+            wl_vg_record *r = &bus->vg_records[slot];
+            for (size_t i = 0; i < newly_count; i++) {
+                if (!WinLvmProbeWorkerCreateLvPdo(bus, r, newly[i])) {
+                    KIRQL kl;
+                    KeAcquireSpinLock(&bus->lock, &kl);
+                    wl_vg_lv_set_activated(r, newly[i], 0);
+                    KeReleaseSpinLock(&bus->lock, &kl);
+                }
+            }
+            IoInvalidateDeviceRelations(bus->pdo, BusRelations);
+        }
+
+out_block:
+        if (block) ExFreePoolWithTag(block, WINLVM_WIN_TAG);
     }
 
+out:
     ObDereferenceObject(work->target_file);  /* pair from IoGetDeviceObjectPointer */
     if (work->ifname.Buffer)              /* never stored on a record */
         ExFreePoolWithTag(work->ifname.Buffer, WINLVM_WIN_TAG);
     ExFreePoolWithTag(work, WINLVM_WIN_TAG);
 }
 
-static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
-                                         WINLVM_VG_RECORD *record,
-                                         size_t lv_index,
-                                         PDEVICE_OBJECT backing_disk) {
+static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
+                                            wl_vg_record *record,
+                                            size_t lv_index) {
     /* Named device object: mountmgr requires QUERY_DEVICE_NAME to answer
      * with a \Device namespace name it can open; the volume interface
      * (\??\Volume{guid}) symlink is NOT a valid answer there. */
-    winlvm_logical_volume *lv0 = &record->vg.lvs[lv_index];
+    const lvmcore_volume_group *view = record->view;
+    if (!view || lv_index >= view->lv_count) return FALSE;
+    const lvmcore_logical_volume *lv0 = &view->lvs[lv_index];
+
+    /* v22 glue is single-backing pass-through per PDO. Resolve the ONE
+     * record PV slot every stripe of this LV lives on; a multi-PV LV
+     * (fan-out is W3) must NOT get a PDO — it would read from one disk
+     * and silently serve corrupt data for the other PV's extents. */
+    size_t pv_slot = SIZE_MAX;
+    for (size_t s = 0; s < lv0->segment_count; s++) {
+        const lvmcore_segment *seg = &lv0->segments[s];
+        for (size_t t = 0; t < seg->stripe_count_used; t++) {
+            const lvmcore_physical_volume *pv =
+                lvmcore_vg_find_pv(view, seg->stripes[t].pv_key);
+            if (!pv) return FALSE;
+            size_t slot = SIZE_MAX;
+            for (size_t k = 0; k < record->pv_count; k++) {
+                if (RtlEqualMemory(record->pv_uuid[k], pv->id, 32)) {
+                    slot = k;
+                    break;
+                }
+            }
+            if (slot == SIZE_MAX) return FALSE;
+            if (pv_slot == SIZE_MAX) pv_slot = slot;
+            else if (pv_slot != slot) return FALSE; /* cross-PV LV: W3 fan-out */
+        }
+    }
+    if (pv_slot == SIZE_MAX) return FALSE; /* no stripes (empty LV) */
+    const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)record->pv_tag[pv_slot];
+    if (!tag || !tag->backing_pdo) return FALSE;
+    PDEVICE_OBJECT backing_disk = tag->backing_pdo;
+
+    /* Overflow-safe total size; 0 = overflow or absent — fail closed
+     * with no volume rather than a lie of a device. */
+    uint64_t byte_size = wl_lv_byte_size(view, lv_index);
+    if (byte_size == 0) return FALSE;
+
     WCHAR namebuf[64];
     RtlZeroMemory(namebuf, sizeof(namebuf));
     UNICODE_STRING devName;
@@ -302,7 +408,7 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     devName.MaximumLength = sizeof(namebuf);
     NTSTATUS status = RtlUnicodeStringPrintf(&devName, L"\\Device\\WinLvm%hs",
                                              lv0->id);
-    if (!NT_SUCCESS(status)) return;
+    if (!NT_SUCCESS(status)) return FALSE;
 
     PDEVICE_OBJECT lv_pdo = NULL;
     status = IoCreateDevice(bus->fdo->DriverObject,
@@ -311,7 +417,7 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
                                      FALSE, &lv_pdo);
     if (!NT_SUCCESS(status)) {
         WL_TRACE_1("pdo create failed 0x%x", (unsigned)status);
-        return;
+        return FALSE;
     }
 
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)lv_pdo->DeviceExtension;
@@ -324,11 +430,7 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     ext->backing_pdo = backing_disk;
     ObReferenceObject(backing_disk);
 
-    winlvm_logical_volume *lv = &record->vg.lvs[lv_index];
-    ext->byte_size = 0;
-    for (size_t s = 0; s < lv->segment_count; s++)
-        ext->byte_size += lv->segments[s].extent_count
-                          * record->vg.extent_size_sectors * 512ULL;
+    ext->byte_size = byte_size;
 
     /* ISSUE-21: forwarded IRPs need a stack location for the backing
      * disk's whole stack or IoCallDriver writes past the IRP — BSOD. */
@@ -344,8 +446,11 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
 
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
-    if (bus->child_count < WL_MAX_CHILDREN) bus->children[bus->child_count++] = lv_pdo;
-    else {
+    if (bus->child_count < WL_MAX_CHILDREN) {
+        bus->children[bus->child_count++] = lv_pdo;
+        wl_vg_ref(record); /* child-PDO refcount: reconciles refuse to swap
+                            * a view under live children (refs == 0 gate) */
+    } else {
         /* over cap: undo rather than corrupt the array */
         KeReleaseSpinLock(&bus->lock, old);
         if (ext->ifname.Buffer) {
@@ -354,9 +459,10 @@ static VOID WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
         }
         ObDereferenceObject(backing_disk);
         IoDeleteDevice(lv_pdo);
-        return;
+        return FALSE;
     }
     KeReleaseSpinLock(&bus->lock, old);
+    return TRUE;
 }
 
 /* --------------------------------------------------------------- */
@@ -436,14 +542,28 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 IoSetDeviceInterfaceState(&ce->ifname, FALSE);
                 RtlFreeUnicodeString(&ce->ifname);
             }
+            /* Children sweep deletes directly (never sees REMOVE_DEVICE),
+             * so undo the child-PDO ref + activation claim here too. */
+            if (ce->record) {
+                wl_vg_lv_set_activated(ce->record, ce->lv_index, 0);
+                wl_vg_unref(ce->record);
+            }
             ObDereferenceObject(ce->backing_pdo);
             IoDeleteDevice(ext->children[i]);
         }
         ext->child_count = 0;
-        if (ext->vgs) {
-            ObDereferenceObject(ext->vgs->backing_pdo);
-            ExFreePoolWithTag(ext->vgs, WINLVM_WIN_TAG);
-            ext->vgs = NULL;
+        /* Registry sweep: records are embedded bus-ext slots never freed
+         * individually; their arena blocks and per-PV tags return here. */
+        for (size_t i = 0; i < WL_VG_MAX; i++) {
+            wl_vg_record *r = &ext->vg_records[i];
+            for (size_t p = 0; p < r->pv_count; p++) {
+                WINLVM_PV_TAG *tag = (WINLVM_PV_TAG *)r->pv_tag[p];
+                if (tag) { WinLvmFreePvTag(tag); r->pv_tag[p] = NULL; }
+            }
+            if (ext->vg_views[i]) {
+                ExFreePoolWithTag(ext->vg_views[i], WINLVM_WIN_TAG);
+                ext->vg_views[i] = NULL;
+            }
         }
         /* Drop the disk-interface registration with the bus: leaving the
          * cookie set makes the next devnode cycle's START skip
@@ -471,11 +591,14 @@ static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     KeAcquireSpinLock(&bus->lock, &old);
     size_t n = 0;
     /* dead-VG children are not reported — PnP sends them REMOVE, which
-     * detaches them from the record (surprise-removal teardown) */
+     * detaches them from the record (surprise-removal teardown). Test is
+     * PER-LV: in a multi-PV VG only the children whose own PVs all went
+     * away drop (an LV on a surviving PV keeps its backing). */
     for (size_t i = 0; i < bus->child_count; i++) {
         WINLVM_LV_EXT *lext =
             (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
-        if (lext->record && lext->record->dead) continue;
+        if (lext->record && wl_vg_lv_all_gone(lext->record, lext->lv_index))
+            continue;
         bus->children[n] = bus->children[i];
         if (n != i) bus->children[i] = NULL;
         n++;

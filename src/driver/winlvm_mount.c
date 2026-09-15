@@ -53,7 +53,12 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        winlvm_logical_volume *lv = &ext->record->vg.lvs[ext->lv_index];
+        const lvmcore_volume_group *view = ext->record->view;
+        if (!view || ext->lv_index >= view->lv_count) {
+            Irp->IoStatus.Information = 0;
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        const lvmcore_logical_volume *lv = &view->lvs[ext->lv_index];
         PMOUNTDEV_UNIQUE_ID uniqueId = (PMOUNTDEV_UNIQUE_ID)Irp->AssociatedIrp.SystemBuffer;
         uniqueId->UniqueIdLength = 32; /* raw 32-char LV UUID (dashes stripped) */
 

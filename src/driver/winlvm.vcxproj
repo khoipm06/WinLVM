@@ -53,7 +53,7 @@
       <LanguageStandard>stdcpp14</LanguageStandard>
       <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\lvmcore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
    </ClCompile>
     <Link>
@@ -70,9 +70,10 @@
     <Inf Include="winlvm.inf" />
  </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="winlvm.h" />
+<ClInclude Include="winlvm.h" />
     <ClInclude Include="lvm_read.h" />
- </ItemGroup>
+    <ClInclude Include="winlvm_vg.h" />
+  </ItemGroup>
   <ItemGroup>
     <ClCompile Include="winlvm.c" />
     <ClCompile Include="winlvm_bus.c" />
@@ -80,6 +81,10 @@
     <ClCompile Include="winlvm_power.c" />
     <ClCompile Include="winlvm_io.c" />
     <ClCompile Include="winlvm_mount.c" />
+    <ClCompile Include="winlvm_vg.c" />
+    <ClCompile Include="..\lvmcore\crc32.c" />
+    <ClCompile Include="..\lvmcore\arena.c" />
+    <ClCompile Include="..\lvmcore\parser.c" />
     <ClCompile Include="lvm_read.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

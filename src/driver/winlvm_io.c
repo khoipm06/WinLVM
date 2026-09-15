@@ -1,38 +1,11 @@
 /* winlvm_io.c — LV read/write: extent translation + IRP forwarding.
  *
- * Linear single-segment LVs pass through with a byte-offset shift (the
- * winmd pass-through pattern); multi-segment LVs fan out into per-segment
- * sub-IRPs. LUKS-backed PVs decrypt in place after the read completes —
- * the Phase 6 integration point. */
+ * Extent→PV mapping is delegated to the core mapper (wl_map_begin/next):
+ * per-PV pe_start (heterogeneous PVs), striped chunk math, overflow checks
+ * and dead-PV refusal all live there and fail closed. The v22 pass-through
+ * forwards ONE backing IRP, so a request spanning a segment/PV boundary is
+ * refused whole (multi-piece fan-out is the W3 write path). */
 #include "winlvm.h"
-
-static uint64_t LvSegmentMap(WINLVM_LV_EXT *ext, uint64_t lv_byte,
-                             size_t *seg_out, uint64_t *off_in_seg) {
-    winlvm_volume_group *vg = &ext->record->vg;
-    winlvm_logical_volume *lv = &vg->lvs[ext->lv_index];
-    uint64_t bytes_per_ext = vg->extent_size_sectors * 512ULL;
-    for (size_t s = 0; s < lv->segment_count; s++) {
-        uint64_t seg_bytes = lv->segments[s].extent_count * bytes_per_ext;
-        if (lv_byte < seg_bytes) {
-            *seg_out = s;
-            *off_in_seg = lv_byte;
-            return 1;
-        }
-        lv_byte -= seg_bytes;
-    }
-    return 0;
-}
-
-static uint64_t LvPvByteOffset(WINLVM_LV_EXT *ext, size_t seg_index,
-                               uint64_t off_in_seg) {
-    winlvm_volume_group *vg = &ext->record->vg;
-    winlvm_logical_volume *lv = &vg->lvs[ext->lv_index];
-    winlvm_segment *seg = &lv->segments[seg_index];
-    uint64_t bytes_per_ext = vg->extent_size_sectors * 512ULL;
-    /* single-PV groups only in this phase: stripes[0] names pv0 */
-    uint64_t pv_ext = seg->stripes[0].start_extent;
-    return vg->pvs[0].pe_start * 512ULL + pv_ext * bytes_per_ext + off_in_seg;
-}
 
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) {
     WINLVM_DISK_SOURCE *src = (WINLVM_DISK_SOURCE *)impl;
@@ -99,30 +72,56 @@ static NTSTATUS WinLvmForwardCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, P
     return STATUS_SUCCESS;
 }
 
-/* Pass-through: I/O entirely within one segment forwards with a shifted
- * byte offset (winmd's linear.c pattern). Parameters is a union, so
- * Read.ByteOffset and Write.ByteOffset alias the same storage. */
+/* Pass-through: one backing IRP for the whole request. The mapper refuses
+ * (err) when the request crosses a segment/PV boundary or touches a dead
+ * PV — the WHOLE IRP fails, never a partial map. Backing offsets are the
+ * mapper's per-PV pe_start + extent + position math. */
 static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 
-    size_t seg;
-    uint64_t off_in_seg;
-    if (!LvSegmentMap(ext, (uint64_t)irpSp->Parameters.Read.ByteOffset.QuadPart,
-                      &seg, &off_in_seg)) {
-        Irp->IoStatus.Status = STATUS_END_OF_FILE;
+    /* Parameters is a union: Read.ByteOffset aliases Write.ByteOffset,
+     * Read.Length aliases Write.Length — one mapper serves both. */
+    uint64_t lv_byte = (uint64_t)irpSp->Parameters.Read.ByteOffset.QuadPart;
+    uint32_t len = irpSp->Parameters.Read.Length;
+
+    const lvmcore_volume_group *view = ext->record->view
+        ? ext->record->view : NULL;
+    if (!view) {
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_END_OF_FILE;
+        return STATUS_DEVICE_REMOVED;
     }
+
+    wl_map_iter it;
+    uint64_t pv_byte;
+    uint32_t pv_slot;
+    uint64_t piece_len;
+    wl_map_begin(&it, view, ext->record, ext->lv_index, lv_byte, len);
+    if (wl_map_next(&it, &pv_slot, &pv_byte, &piece_len) != 1 ||
+        piece_len != len) {
+        /* Multi-piece (cross-segment/PV/stripe) or unmappable: fail whole —
+         * a partial forward would silently serve corrupt data. */
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* v22 PDOs are single-backing (CreateLvPdo resolved ONE record slot
+     * every stripe lives on), so the mapper's pv_slot is always the PDO's
+     * slot and ext->backing_pdo is the correct target. That reference is
+     * child-PDO-owned (ObReferenceObject at create) — unlike a pv_tag
+     * deref, removal cannot free it while this child lives. */
+    PDEVICE_OBJECT backing = ext->backing_pdo;
 
     IoCopyCurrentIrpStackLocationToNext(Irp);
     PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
-    nextSp->Parameters.Read.ByteOffset.QuadPart =
-        (LONGLONG)LvPvByteOffset(ext, seg, off_in_seg);
+    nextSp->Parameters.Read.ByteOffset.QuadPart = (LONGLONG)pv_byte;
 
     IoSetCompletionRoutine(Irp, WinLvmForwardCompletion, NULL, TRUE, TRUE, TRUE);
-    return IoCallDriver(ext->backing_pdo, Irp);
+    return IoCallDriver(backing, Irp);
 }
 
 NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -162,8 +161,15 @@ NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return STATUS_DEVICE_REMOVED;
     }
     /* Honor LVM2 system_id: a VG owned by another host must not be
-     * written by us. */
-    if (ext->record->vg.system_id[0] != '\0') {
+     * written by us. (view is pinned by the child-PDO ref — refs == 0
+     * reconciles refuse to swap while this PDO lives.) */
+    const lvmcore_volume_group *view = ext->record->view;
+    if (!view) {
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_REMOVED;
+    }
+    if (view->system_id[0] != '\0') {
         Irp->IoStatus.Status = STATUS_MEDIA_WRITE_PROTECTED;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_MEDIA_WRITE_PROTECTED;
