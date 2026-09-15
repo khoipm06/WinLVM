@@ -231,6 +231,16 @@ if(ZSTD_EXE)
   add_test(NAME test_lvmcore_serialize
     COMMAND test_lvmcore_serialize "${CORPUS_OUT}")
 
+  # W2 Task 8: multi-VG registry + PV arrival state machine host core.
+  # Pure logic test on synthetic VGs — no corpus dependency.
+  add_executable(test_winlvm_vg
+    tests/lvmcore/test_winlvm_vg.c
+    src/driver/winlvm_vg.c
+  )
+  target_include_directories(test_winlvm_vg PRIVATE src/driver)
+  target_link_libraries(test_winlvm_vg PRIVATE lvmcore)
+  add_test(NAME test_winlvm_vg COMMAND test_winlvm_vg)
+
   add_executable(lvmcore_dump_vgcfg
     tests/lvmcore/lvmcore_dump_vgcfg.c
   )
