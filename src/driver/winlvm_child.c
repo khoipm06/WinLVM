@@ -99,6 +99,7 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_REMOVE_DEVICE: {
+        WinLvmIoGateRemove(&lvext->io_gate);
         /* PnP removes a child directly: deactivate interface, drop self
          * from the bus children array (else next QDR reports a freed PDO),
          * release refs, delete self.

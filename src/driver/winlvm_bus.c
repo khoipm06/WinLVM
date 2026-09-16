@@ -502,6 +502,12 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)lv_pdo->DeviceExtension;
     RtlZeroMemory(ext, sizeof(*ext));
     ext->kind = WL_EXT_LV;  /* dispatch discriminator — MUST precede any IRP */
+    if (!NT_SUCCESS(WinLvmIoGateInit(&ext->io_gate))) {
+        IoDeleteDevice(lv_pdo);
+        return FALSE;
+    }
+    ext->io_gate.device = lv_pdo;
+    ext->io_gate.dispatch = WinLvmRead;
     RtlCopyMemory(ext->devname, namebuf, sizeof(namebuf));
     ext->pdo = lv_pdo;
     ext->record = record;
@@ -629,6 +635,7 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
              * the child's WMI provider entry (H5) and volume interface. */
             IoWMIRegistrationControl(ext->children[i], WMIREG_ACTION_DEREGISTER);
             WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)ext->children[i]->DeviceExtension;
+            WinLvmIoGateRemove(&ce->io_gate);
             if (ce->ifname.Buffer) {
                 IoSetDeviceInterfaceState(&ce->ifname, FALSE);
                 RtlFreeUnicodeString(&ce->ifname);

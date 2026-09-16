@@ -35,6 +35,34 @@
 /* Arena cap per accepted VG view: user metadata text may reach
  * LVMCORE_MAX_METADATA_BYTES (1 MiB) plus PV/LV/segment arrays. */
 #define WINLVM_VIEW_ARENA_CAP (2u * 1024 * 1024)
+#define WINLVM_IO_QUEUE_LIMIT 64u
+
+typedef enum {
+    WL_IO_RUNNING = 0,
+    WL_IO_QUIESCING = 1,
+    WL_IO_QUIESCED = 2,
+    WL_IO_REMOVING = 3
+} WL_IO_STATE;
+
+typedef struct {
+    KSPIN_LOCK lock;
+    IO_CSQ csq;
+    LIST_ENTRY queued;
+    KEVENT drained;
+    volatile LONG state;
+    volatile LONG active;
+    ULONG queued_count;
+    PDEVICE_OBJECT device;
+    PDRIVER_DISPATCH dispatch;
+} WL_IO_GATE;
+
+NTSTATUS WinLvmIoGateInit(WL_IO_GATE *gate);
+BOOLEAN WinLvmIoGateEnter(WL_IO_GATE *gate);
+void WinLvmIoGateLeave(WL_IO_GATE *gate);
+NTSTATUS WinLvmIoGateQueue(WL_IO_GATE *gate, PIRP Irp);
+NTSTATUS WinLvmIoGateBeginQuiesce(WL_IO_GATE *gate);
+void WinLvmIoGateResume(WL_IO_GATE *gate, PDEVICE_OBJECT DeviceObject);
+void WinLvmIoGateRemove(WL_IO_GATE *gate);
 
 /* Tracing (shared by winlvm.c / winlvm_bus.c / winlvm_child.c). */
 #define WL_TRACE(msg) DbgPrint("winlvm: " msg "\n")
@@ -179,6 +207,7 @@ typedef struct WL_READ_CTX {
     size_t               pieces_issued; /* pieces actually sent */
     volatile LONG        remaining;     /* sub-IRPs still in flight */
     volatile NTSTATUS    status;        /* first failure latched (if any) */
+    WL_IO_GATE          *gate;
     WL_READ_PIECE        pieces[WL_MAX_READ_PIECES];
 } WL_READ_CTX;
 
@@ -208,6 +237,7 @@ typedef struct _WINLVM_LV_EXT {
     UNICODE_STRING      ifname;        /* volume interface, if registered */
     WCHAR               devname[64];   /* \Device\WinLvm<uuid> (mountmgr) */
     WMILIB_CONTEXT      wmi;           /* zero-GUID wmilib context (START reg) */
+    WL_IO_GATE           io_gate;      /* atomic admission + quiesce queue */
 } WINLVM_LV_EXT;
 
 /* Kernel-side byte source: IRP_MJ_READ against the disk PDO. */

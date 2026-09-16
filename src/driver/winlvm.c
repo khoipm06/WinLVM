@@ -209,6 +209,33 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     return WinLvmChildPnp(DeviceObject, Irp);
 }
 
+static NTSTATUS WinLvmValidateUpdateLv(const WINLVM_UPDATE_LV_REQUEST *request,
+                                       ULONG input_length) {
+    if (!request || input_length < sizeof(*request) ||
+        request->header.size < sizeof(*request) || request->header.version != 1)
+        return STATUS_INVALID_PARAMETER;
+    if (request->lv_uuid[WL_VG_UUID_LEN - 1] != '\0')
+        return STATUS_INVALID_PARAMETER;
+    if (request->byte_size == 0 || request->logical_sector < 512 ||
+        request->physical_sector < request->logical_sector ||
+        (request->logical_sector & (request->logical_sector - 1)) != 0 ||
+        (request->physical_sector & (request->physical_sector - 1)) != 0)
+        return STATUS_INVALID_PARAMETER;
+    if (!g_bus_ext)
+        return STATUS_DEVICE_NOT_READY;
+
+    for (size_t i = 0; i < g_bus_ext->child_count; i++) {
+        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension;
+        const lvmcore_volume_group *view = lv->record ? lv->record->view : NULL;
+        if (!view || lv->lv_index >= view->lv_count)
+            continue;
+        if (RtlCompareMemory(view->lvs[lv->lv_index].id, request->lv_uuid,
+                             WL_VG_UUID_LEN) == WL_VG_UUID_LEN)
+            return STATUS_SUCCESS;
+    }
+    return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
 NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
@@ -220,6 +247,39 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (METHOD_FROM_CTL_CODE(code) != METHOD_BUFFERED) {
         status = STATUS_INVALID_DEVICE_REQUEST;
     } else if (*(WL_EXT_KIND *)DeviceObject->DeviceExtension == WL_EXT_CONTROL) {
+        if (code == IOCTL_WINLVM_UPDATE_LV) {
+            if (Irp->AssociatedIrp.SystemBuffer == NULL) {
+                status = STATUS_BUFFER_TOO_SMALL;
+            } else {
+            status = WinLvmValidateUpdateLv(
+                (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer,
+                input_length);
+            if (status == STATUS_SUCCESS) {
+                const WINLVM_UPDATE_LV_REQUEST *request =
+                    (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
+                WINLVM_LV_EXT *target = NULL;
+                for (size_t i = 0; i < g_bus_ext->child_count; i++) {
+                    WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension;
+                    const lvmcore_volume_group *view = lv->record ? lv->record->view : NULL;
+                    if (view && lv->lv_index < view->lv_count &&
+                        RtlCompareMemory(view->lvs[lv->lv_index].id, request->lv_uuid,
+                                         WL_VG_UUID_LEN) == WL_VG_UUID_LEN) {
+                        target = lv;
+                        break;
+                    }
+                }
+                if (!target) {
+                    status = STATUS_OBJECT_NAME_NOT_FOUND;
+                } else {
+                    status = WinLvmIoGateBeginQuiesce(&target->io_gate);
+                    if (status == STATUS_SUCCESS) {
+                        status = STATUS_NOT_SUPPORTED;
+                        WinLvmIoGateResume(&target->io_gate, target->pdo);
+                    }
+                }
+            }
+            }
+        }
         const BOOLEAN known = code == IOCTL_WINLVM_INVENTORY || code == IOCTL_WINLVM_REFRESH ||
                               code == IOCTL_WINLVM_QUIESCE_VG || code == IOCTL_WINLVM_RESUME_VG ||
                               code == IOCTL_WINLVM_ACTIVATE_LV || code == IOCTL_WINLVM_DEACTIVATE_LV ||
@@ -243,6 +303,22 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                         status = STATUS_BUFFER_TOO_SMALL;
                         information = sizeof(WINLVM_INVENTORY);
                     }
+                } else if (code == IOCTL_WINLVM_QUIESCE_VG) {
+                    status = STATUS_SUCCESS;
+                    if (g_bus_ext) {
+                        for (size_t i = 0; i < g_bus_ext->child_count; i++) {
+                            WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension;
+                            NTSTATUS gate_status = WinLvmIoGateBeginQuiesce(&lv->io_gate);
+                            if (gate_status != STATUS_SUCCESS && gate_status != STATUS_PENDING) status = gate_status;
+                        }
+                    }
+                } else if (code == IOCTL_WINLVM_RESUME_VG) {
+                    if (g_bus_ext) {
+                        for (size_t i = 0; i < g_bus_ext->child_count; i++) {
+                            WinLvmIoGateResume(&((WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension)->io_gate, g_bus_ext->children[i]);
+                        }
+                    }
+                    status = STATUS_SUCCESS;
                 } else {
                     status = STATUS_NOT_IMPLEMENTED;
                 }
