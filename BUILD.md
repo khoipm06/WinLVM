@@ -71,3 +71,19 @@ Test-signing during Phase 2 development uses the WDK's `MakeCert` /
 
 Production signing (Microsoft attestation + third-party UEFI CA for the
 DXE driver) is the Phase 8 concern (`ROADMAP.md` §Phase 8).
+
+## 3. Git hooks (commit discipline)
+
+A pre-commit hook enforces the repo's commit rules (`AGENTS.md` R1/R6/R7):
+forbidden paths (dev artifacts, VM images, secrets, agent docs, `third_party/`
+submodule churn), whitespace errors, and atomic commit granularity.
+
+Install it once per clone (POSIX sh — works under Git-for-Windows too):
+
+```
+cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+The script is versioned at `scripts/hooks/pre-commit`; re-copy it after pulling
+changes. `git commit --no-verify` bypasses it — use only when you know what you
+are doing.

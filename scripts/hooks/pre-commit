@@ -1,0 +1,74 @@
+#!/bin/sh
+# winlvm pre-commit hook
+#
+# Enforces repository commit hygiene:
+#   1. Disallowed artifact types: disk images, logs, keys, and
+#      secrets, disk images, submodule churn (third_party/).
+#   2. No whitespace errors in staged changes (git diff --cached --check).
+#   3. Atomic commits: one feature unit per commit (heuristic).
+#
+# Install:  cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Override: git commit --no-verify   (only when you know what you're doing)
+#
+# POSIX sh only — must run under Git-for-Windows' sh.exe too.
+
+set -u
+
+violations=0
+
+staged=$(git diff --cached --name-only)
+
+# --- 1. Disallowed artifact types --------------------------------------
+for f in $staged; do
+    case "$f" in
+        third_party/*)
+            echo "pre-commit: REJECTED - submodule churn: $f (never commit third_party pointer changes)"
+            violations=$((violations + 1))
+            ;;
+        *.qcow2|*.vhd|*.vmdk|*.vhdx|*.iso|*.dmp|*.raw|*.bin|*.pem|*.key|*.p12|*.pfx|*.ppk)
+            echo "pre-commit: REJECTED - binary/VM/secret artifact: $f"
+            violations=$((violations + 1))
+            ;;
+        *.img|*.img.zst)
+            echo "pre-commit: REJECTED - disk image artifact: $f"
+            violations=$((violations + 1))
+            ;;
+        *.log)
+            echo "pre-commit: REJECTED - log file: $f"
+            violations=$((violations + 1))
+            ;;
+    esac
+done
+
+# --- 2. Whitespace errors ----------------------------------------------
+# NOTE: never use `git diff --cached --check --quiet` here — --quiet implies
+# --exit-code, so git exits 1 whenever the diff is non-empty (any staged
+# change), not only on whitespace errors. Capture output instead.
+ws_errors=$(git diff --cached --check)
+if [ -n "$ws_errors" ]; then
+    echo "pre-commit: REJECTED - whitespace errors in staged changes:"
+    printf '%s\n' "$ws_errors"
+    violations=$((violations + 1))
+fi
+
+# --- 3. Atomicity heuristic --------------------------------------------
+file_count=0
+area_count=0
+if [ -n "$staged" ]; then
+    file_count=$(printf '%s\n' "$staged" | wc -l)
+    area_count=$(printf '%s\n' "$staged" | sed 's#/.*##' | sort -u | wc -l)
+fi
+if [ "$file_count" -ge 10 ]; then
+    echo "pre-commit: REJECTED - $file_count files in one commit. Split into atomic feature units (max 9). Use --no-verify to override."
+    violations=$((violations + 1))
+fi
+if [ "$area_count" -ge 5 ]; then
+    echo "pre-commit: REJECTED - commit spans $area_count top-level areas. Split by feature. Use --no-verify to override."
+    violations=$((violations + 1))
+fi
+
+if [ "$violations" -ne 0 ]; then
+    echo "pre-commit: $violations violation(s) - commit blocked."
+    exit 1
+fi
+exit 0
