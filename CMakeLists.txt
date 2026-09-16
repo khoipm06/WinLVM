@@ -57,6 +57,10 @@ target_include_directories(lvmfmt PUBLIC src/lvmfmt/include)
 add_executable(lvmdump src/tools/lvmdump/main.cpp)
 target_link_libraries(lvmdump PRIVATE lvmfmt)
 
+# lvm.exe — bounded multi-call offline metadata CLI.
+add_executable(lvm src/tools/lvm/main.cpp)
+target_link_libraries(lvm PRIVATE lvmfmt)
+
 # ---------------------------------------------------------------------------
 # Corpus. Ground truth lives in corpus/ as zstd-compressed images; tests need
 # them decompressed. Only the non-LUKS images are unpacked — LUKS containers
@@ -265,13 +269,16 @@ add_executable(winlvm_tests
   tests/test_units.cpp
   tests/test_corpus.cpp
   tests/test_service.cpp
+  tests/test_lvm_cli.cpp
 )
 target_include_directories(winlvm_tests PRIVATE src)
 target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol)
 target_compile_definitions(winlvm_tests PRIVATE
   WINLVM_CORPUS_EXPECTED="${CORPUS_SRC}/expected"
   WINLVM_CORPUS_IMAGES="${CORPUS_OUT}"
+  WINLVM_LVM_EXE="$<TARGET_FILE:lvm>"
 )
+add_dependencies(winlvm_tests lvm)
 if(TARGET corpus)
   add_dependencies(winlvm_tests corpus)
 endif()
