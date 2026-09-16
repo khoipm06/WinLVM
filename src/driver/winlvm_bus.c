@@ -77,9 +77,11 @@ static void WinLvmQuerySectorSize(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_fil
     *physical_out = physical;
 }
 
+static NTSTATUS WinLvmQueueProbeForInterface(const UNICODE_STRING *ifname);
+
 static NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
     if (g_disk_notify_cookie) return STATUS_SUCCESS;
-    return IoRegisterPlugPlayNotification(
+    NTSTATUS status = IoRegisterPlugPlayNotification(
         EventCategoryDeviceInterfaceChange,
         PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
         (PVOID)&GUID_DEVINTERFACE_DISK,
@@ -87,6 +89,12 @@ static NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
         WinLvmPnpDiskNotify,
         NULL,
         &g_disk_notify_cookie);
+    if (!NT_SUCCESS(status))
+        WL_TRACE_1("register: notification registration failed 0x%x",
+                   (unsigned)status);
+    else
+        WL_TRACE("register: notification registered");
+    return status;
 }
 
 typedef struct {
@@ -99,9 +107,8 @@ static VOID WinLvmRegisterWorker(PVOID context) {
     WL_TRACE("register worker entry");
     /* F10 fix: PnP START transaction holds devnode lock across post-start.
      * DelayedWorkQueue can execute immediately on another core before PnP
-     * unwinds, so IoRegisterPlugPlayNotification(INCLUDE_EXISTING) callback's
-     * IoGetDeviceObjectPointer deadlocks with the open devnode lock.
-     * 2s relative delay lets the START transaction close completely. */
+     * unwinds, so synchronous disk enumeration must wait until this delay
+     * lets the START transaction close completely. */
     LARGE_INTEGER delay;
     delay.QuadPart = -20000000LL;  /* 2 seconds relative (100ns units) */
     KeDelayExecutionThread(KernelMode, FALSE, &delay);
@@ -109,7 +116,12 @@ static VOID WinLvmRegisterWorker(PVOID context) {
     /* Bus may have been removed while this worker sat queued: registering
      * then would leave a cookie pointing at a dead bus and block the next
      * devnode cycle from re-registering. */
-    if (g_bus_ext) WinLvmRegisterDiskNotify(work->driver);
+    if (g_bus_ext) {
+        NTSTATUS status = WinLvmRegisterDiskNotify(work->driver);
+        if (!NT_SUCCESS(status))
+            WL_TRACE_1("register worker: notification registration failed 0x%x",
+                       (unsigned)status);
+    }
     ExFreePoolWithTag(work, WINLVM_WIN_TAG);
 }
 
@@ -221,35 +233,32 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
 
     if (!IsEqualGUID(&data->Event, &GUID_DEVICE_INTERFACE_ARRIVAL)) return STATUS_SUCCESS;
 
+    NTSTATUS queue_status = WinLvmQueueProbeForInterface(data->SymbolicLinkName);
+    return queue_status;
+}
+
+static NTSTATUS WinLvmQueueProbeForInterface(const UNICODE_STRING *ifname) {
+    if (!ifname || !ifname->Buffer || !ifname->Length ||
+        ifname->Length > 0xFFFEu - sizeof(WCHAR)) {
+        return STATUS_INVALID_PARAMETER;
+    }
     WINLVM_PROBE_WORK *work = ExAllocatePoolZero(NonPagedPool,
         sizeof(WINLVM_PROBE_WORK), WINLVM_WIN_TAG);
-    if (!work) return STATUS_INSUFFICIENT_RESOURCES;
-
-    /* stash the arrival link: the worker stores it on the VG record so a
-     * later REMOVAL notification can match this disk back to the record.
-     * (No RtlDuplicateUnicodeString — that's ntifs-only; manual copy.) */
-    {
-        USHORT n = data->SymbolicLinkName->Length;
-        PWCHAR buf = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
-            n + sizeof(WCHAR), WINLVM_WIN_TAG);
-        if (buf) {
-            RtlCopyMemory(buf, data->SymbolicLinkName->Buffer, n);
-            work->ifname.Buffer = buf;
-            work->ifname.Length = n;
-            work->ifname.MaximumLength = (USHORT)(n + sizeof(WCHAR));
-        } else {
-            RtlZeroMemory(&work->ifname, sizeof(work->ifname));
-        }
+    if (!work) {
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    NTSTATUS status = IoGetDeviceObjectPointer(data->SymbolicLinkName,
-        FILE_READ_ATTRIBUTES, &work->target_file, &work->target_disk);
-    if (!NT_SUCCESS(status)) {
-        WL_TRACE_1("notify: pointer failed 0x%x", (unsigned)status);
+    USHORT n = ifname->Length;
+    PWCHAR buf = (PWCHAR)ExAllocatePoolZero(NonPagedPool,
+        n + sizeof(WCHAR), WINLVM_WIN_TAG);
+    if (!buf) {
         ExFreePoolWithTag(work, WINLVM_WIN_TAG);
-        return status;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
-    /* The pointer keeps the file object referenced; the worker releases it. */
+    RtlCopyMemory(buf, ifname->Buffer, n);
+    work->ifname.Buffer = buf;
+    work->ifname.Length = n;
+    work->ifname.MaximumLength = (USHORT)(n + sizeof(WCHAR));
 
     ExInitializeWorkItem(&work->item, WinLvmProbeWorker, work);
     ExQueueWorkItem(&work->item, DelayedWorkQueue);
@@ -272,6 +281,16 @@ void WinLvmProbeWorker(PVOID context) {
     WINLVM_PROBE_WORK *work = (WINLVM_PROBE_WORK *)context;
     WINLVM_BUS_EXT *bus = g_bus_ext;
     WL_TRACE("probe worker start");
+
+    NTSTATUS pointer_status = IoGetDeviceObjectPointer(&work->ifname,
+                                                       FILE_READ_ATTRIBUTES,
+                                                       &work->target_file,
+                                                       &work->target_disk);
+    if (!NT_SUCCESS(pointer_status)) {
+        ExFreePoolWithTag(work->ifname.Buffer, WINLVM_WIN_TAG);
+        ExFreePoolWithTag(work, WINLVM_WIN_TAG);
+        return;
+    }
 
     if (bus) {
         WINLVM_DISK_SOURCE dsrc;
@@ -415,7 +434,9 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
      * with a \Device namespace name it can open; the volume interface
      * (\??\Volume{guid}) symlink is NOT a valid answer there. */
     const lvmcore_volume_group *view = record->view;
-    if (!view || lv_index >= view->lv_count) return FALSE;
+    if (!view || lv_index >= view->lv_count) {
+        return FALSE;
+    }
     const lvmcore_logical_volume *lv0 = &view->lvs[lv_index];
 
     /* The PDO references EVERY PV its stripes touch (Task 9 multi-PV read
@@ -470,15 +491,18 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
             }
         }
     }
-    if (!table_ok || slot_count == 0)
+    if (!table_ok || slot_count == 0) {
         return FALSE; /* missing backing / empty LV: no PDO */
+    }
     if (min_logical == 0) min_logical = 512;
     if (max_physical == 0) max_physical = min_logical;
 
     /* Overflow-safe total size; 0 = overflow or absent — fail closed
      * with no volume rather than a lie of a device. */
     uint64_t byte_size = wl_lv_byte_size(view, lv_index);
-    if (byte_size == 0) return FALSE;
+    if (byte_size == 0) {
+        return FALSE;
+    }
 
     WCHAR namebuf[64];
     RtlZeroMemory(namebuf, sizeof(namebuf));
@@ -487,7 +511,9 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     devName.MaximumLength = sizeof(namebuf);
     NTSTATUS status = RtlUnicodeStringPrintf(&devName, L"\\Device\\WinLvm%hs",
                                              lv0->id);
-    if (!NT_SUCCESS(status)) return FALSE;
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
 
     PDEVICE_OBJECT lv_pdo = NULL;
     status = IoCreateDevice(bus->fdo->DriverObject,
