@@ -251,12 +251,23 @@ if(ZSTD_EXE)
 endif()
 enable_testing()
 
+add_library(winlvm_service_protocol STATIC
+  src/service/protocol.cpp
+  src/service/mutation.cpp
+)
+target_include_directories(winlvm_service_protocol PUBLIC src)
+
+add_executable(winlvm_svc src/service/main.cpp)
+target_link_libraries(winlvm_svc PRIVATE winlvm_service_protocol)
+
 add_executable(winlvm_tests
   tests/test_main.cpp
   tests/test_units.cpp
   tests/test_corpus.cpp
+  tests/test_service.cpp
 )
-target_link_libraries(winlvm_tests PRIVATE lvmfmt)
+target_include_directories(winlvm_tests PRIVATE src)
+target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol)
 target_compile_definitions(winlvm_tests PRIVATE
   WINLVM_CORPUS_EXPECTED="${CORPUS_SRC}/expected"
   WINLVM_CORPUS_IMAGES="${CORPUS_OUT}"
