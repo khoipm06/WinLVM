@@ -47,7 +47,46 @@
 static const WCHAR WinLvmDeviceId[] = L"WinLvm\\Volume";
 static const WCHAR WinLvmHwId[] = L"WinLvm\\Volume\0WinLvmVolume\0";  /* REG_MULTI_SZ */
 
-typedef enum { WL_EXT_BUS = 0x31425553, WL_EXT_LV = 0x32564C53 } WL_EXT_KIND;
+typedef enum {
+    WL_EXT_BUS = 0x31425553,
+    WL_EXT_LV = 0x32564C53,
+    WL_EXT_CONTROL = 0x3343544C
+} WL_EXT_KIND;
+
+#define WINLVM_CONTROL_DEVICE_NAME L"\\Device\\WinLvmControl"
+#define WINLVM_CONTROL_DOS_NAME    L"\\DosDevices\\WinLvmControl"
+
+#define IOCTL_WINLVM_INVENTORY      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_REFRESH        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_QUIESCE_VG     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_RESUME_VG      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_ACTIVATE_LV    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_DEACTIVATE_LV  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_UPDATE_LV      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+
+typedef struct {
+    ULONG version;
+    ULONG size;
+} WINLVM_CONTROL_REQUEST;
+
+typedef struct {
+    WINLVM_CONTROL_REQUEST header;
+    CHAR lv_uuid[WL_VG_UUID_LEN];
+    ULONGLONG byte_size;
+    ULONG logical_sector;
+    ULONG physical_sector;
+} WINLVM_UPDATE_LV_REQUEST;
+
+typedef struct {
+    ULONG version;
+    ULONG size;
+    ULONG record_count;
+    ULONG reserved;
+} WINLVM_INVENTORY;
+
+typedef struct {
+    WL_EXT_KIND kind;
+} WINLVM_CONTROL_EXT;
 
 /* Glue-side per-PV backing: the arrived disk behind one PV slot of a
  * record. Core stores an opaque tag pointer per PV (pv_tag[]); this is
@@ -181,6 +220,8 @@ typedef struct {
 /* Globals (winlvm.c). */
 extern WINLVM_BUS_EXT *g_bus_ext;      /* set by AddDevice, cleared on REMOVE */
 extern PVOID            g_disk_notify_cookie;
+extern PDEVICE_OBJECT   g_control_device;
+extern BOOLEAN          g_control_link_created;
 
 /* Dispatchers. */
 DRIVER_INITIALIZE DriverEntry;

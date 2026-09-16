@@ -17,8 +17,14 @@
  * arrival callback may fire before AddDevice, so it must be null-checked. */
 WINLVM_BUS_EXT *g_bus_ext = NULL;
 PVOID           g_disk_notify_cookie = NULL;
+PDEVICE_OBJECT  g_control_device = NULL;
+BOOLEAN         g_control_link_created = FALSE;
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNICODE_STRING device_name;
+    UNICODE_STRING dos_name;
+    NTSTATUS status;
+
     UNREFERENCED_PARAMETER(RegistryPath);
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = WinLvmCreateClose;
@@ -35,6 +41,26 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->DriverExtension->AddDevice           = WinLvmAddDevice;
     DriverObject->DriverUnload                         = WinLvmUnload;
 
+    RtlInitUnicodeString(&device_name, WINLVM_CONTROL_DEVICE_NAME);
+    status = IoCreateDevice(DriverObject, sizeof(WINLVM_CONTROL_EXT), &device_name,
+                            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
+                            &g_control_device);
+    if (!NT_SUCCESS(status)) {
+        g_control_device = NULL;
+        return status;
+    }
+    ((WINLVM_CONTROL_EXT *)g_control_device->DeviceExtension)->kind = WL_EXT_CONTROL;
+
+    RtlInitUnicodeString(&dos_name, WINLVM_CONTROL_DOS_NAME);
+    status = IoCreateSymbolicLink(&dos_name, &device_name);
+    if (!NT_SUCCESS(status)) {
+        IoDeleteDevice(g_control_device);
+        g_control_device = NULL;
+        return status;
+    }
+    g_control_link_created = TRUE;
+    g_control_device->Flags &= ~DO_DEVICE_INITIALIZING;
+
     /* PnP registration happens at bus START (WinLvmPnp IRP_MN_START_DEVICE),
      * not here: existing-disk callbacks fired in DriverEntry would race
      * ahead of AddDevice and see g_bus_ext == NULL, so their probes would
@@ -44,7 +70,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 }
 
 void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
+    UNICODE_STRING dos_name;
+
     UNREFERENCED_PARAMETER(DriverObject);
+    RtlInitUnicodeString(&dos_name, WINLVM_CONTROL_DOS_NAME);
+    if (g_control_link_created) {
+        IoDeleteSymbolicLink(&dos_name);
+        g_control_link_created = FALSE;
+    }
+    if (g_control_device) {
+        IoDeleteDevice(g_control_device);
+        g_control_device = NULL;
+    }
     if (g_disk_notify_cookie) {
         IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
         g_disk_notify_cookie = NULL;
@@ -173,14 +210,56 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
-    if (kind != WL_EXT_LV) {
-        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_INVALID_DEVICE_REQUEST;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    ULONG input_length = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG output_length = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+    ULONG_PTR information = 0;
+
+    if (METHOD_FROM_CTL_CODE(code) != METHOD_BUFFERED) {
+        status = STATUS_INVALID_DEVICE_REQUEST;
+    } else if (*(WL_EXT_KIND *)DeviceObject->DeviceExtension == WL_EXT_CONTROL) {
+        const BOOLEAN known = code == IOCTL_WINLVM_INVENTORY || code == IOCTL_WINLVM_REFRESH ||
+                              code == IOCTL_WINLVM_QUIESCE_VG || code == IOCTL_WINLVM_RESUME_VG ||
+                              code == IOCTL_WINLVM_ACTIVATE_LV || code == IOCTL_WINLVM_DEACTIVATE_LV ||
+                              code == IOCTL_WINLVM_UPDATE_LV;
+        if (code != IOCTL_WINLVM_UPDATE_LV && known &&
+            input_length >= sizeof(WINLVM_CONTROL_REQUEST) &&
+            Irp->AssociatedIrp.SystemBuffer != NULL) {
+            const WINLVM_CONTROL_REQUEST *request =
+                (const WINLVM_CONTROL_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
+            if (request->size >= sizeof(*request) && request->version == 1) {
+                if (code == IOCTL_WINLVM_INVENTORY) {
+                    if (output_length >= sizeof(WINLVM_INVENTORY)) {
+                        WINLVM_INVENTORY *inventory =
+                            (WINLVM_INVENTORY *)Irp->AssociatedIrp.SystemBuffer;
+                        RtlZeroMemory(inventory, sizeof(*inventory));
+                        inventory->version = 1;
+                        inventory->size = sizeof(*inventory);
+                        status = STATUS_SUCCESS;
+                        information = sizeof(*inventory);
+                    } else {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                        information = sizeof(WINLVM_INVENTORY);
+                    }
+                } else {
+                    status = STATUS_NOT_IMPLEMENTED;
+                }
+            } else {
+                status = STATUS_INVALID_PARAMETER;
+            }
+        } else if (code != IOCTL_WINLVM_UPDATE_LV && known) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+    } else if (*(WL_EXT_KIND *)DeviceObject->DeviceExtension == WL_EXT_LV) {
+        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+        status = WinLvmMountIoctl(DeviceObject, Irp, lv);
+        information = Irp->IoStatus.Information;
     }
-    WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
-    Irp->IoStatus.Status = WinLvmMountIoctl(DeviceObject, Irp, lv);
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = information;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return Irp->IoStatus.Status;
+    return status;
 }
