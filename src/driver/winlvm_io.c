@@ -147,7 +147,7 @@ static size_t LvMapToPieces(WINLVM_LV_EXT *ext,
 /* Completion for ONE fan-out sub-IRP. Frees the sub-IRP/MDL/bounce, copies
  * a bounce piece into the parent buffer, and on the LAST in-flight piece
  * completes the parent IRP exactly once and returns the ctx to the pool.
- * Any failure latches the first status (never a partial
+ * Any failure or short read latches failure (never a partial
  * success: Information = 0 on failure). */
 static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
                                        PVOID Context) {
@@ -159,11 +159,31 @@ static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
     if (!NT_SUCCESS(st)) {
         InterlockedCompareExchange((volatile LONG *)&wctx->status, (LONG)st,
                                    (LONG)STATUS_SUCCESS);
-    } else if (pc->bounce && pc->iosb.Information > pc->bounce_skip) {
-        ULONG_PTR avail = pc->iosb.Information - pc->bounce_skip;
-        if (avail > pc->len) avail = pc->len;
-        RtlCopyMemory(wctx->parent_base + pc->parent_off,
-                      pc->bounce_buf + pc->bounce_skip, (size_t)avail);
+    } else {
+        ULONG_PTR copied = 0;
+        if (pc->bounce) {
+            if (Irp->IoStatus.Information > pc->bounce_skip) {
+                ULONG_PTR avail = Irp->IoStatus.Information - pc->bounce_skip;
+                if (avail > pc->len) avail = pc->len;
+                RtlCopyMemory(wctx->parent_base + pc->parent_off,
+                              pc->bounce_buf + pc->bounce_skip, (size_t)avail);
+                copied = avail;
+            }
+        } else {
+            /* Aligned piece: MDL maps directly into parent buffer slice.
+             * Irp->IoStatus.Information is bytes actually transferred. */
+            copied = Irp->IoStatus.Information;
+        }
+        if (copied < pc->len) {
+            /* Short read on any piece fails the WHOLE request — we never
+             * return partial data to the caller. */
+            InterlockedCompareExchange((volatile LONG *)&wctx->status,
+                                       (LONG)STATUS_END_OF_FILE,
+                                       (LONG)STATUS_SUCCESS);
+        } else {
+            /* Accumulate bytes successfully copied for this piece. */
+            InterlockedAdd64((volatile LONG64 *)&wctx->bytes_copied, (LONG64)copied);
+        }
     }
 
     if (Irp->MdlAddress) IoFreeMdl(Irp->MdlAddress);
@@ -174,7 +194,7 @@ static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         PIRP parent = wctx->parent;
         NTSTATUS final = (NTSTATUS)wctx->status;
         parent->IoStatus.Status = final;
-        parent->IoStatus.Information = NT_SUCCESS(final) ? wctx->total_len : 0;
+        parent->IoStatus.Information = NT_SUCCESS(final) ? wctx->bytes_copied : 0;
         IoCompleteRequest(parent, IO_NO_INCREMENT);
         WinLvmIoGateLeave(wctx->gate);
         ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
@@ -297,7 +317,10 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         nextSp->FileObject = ext->backing_file[pc->backing_idx];
         nextSp->Parameters.Read.ByteOffset.QuadPart = (LONGLONG)pc->sub_offset;
         nextSp->Parameters.Read.Length = pc->sub_len;
-        sub->UserIosb = &pc->iosb;
+        /* No UserIosb: the storage stack never fills it for raw
+         * IoAllocateIrp IRPs — completion reads Irp->IoStatus instead.
+         * (Leaving it set here is what made the old bounce copy read a
+         * zeroed iosb and silently skip every copy.) */
         IoSetCompletionRoutine(sub, WinLvmFanOutCompletion, pc, TRUE, TRUE, TRUE);
         pc->sub_irp = sub;
         built++;

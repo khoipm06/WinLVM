@@ -195,7 +195,6 @@ typedef struct {
     ULONG    logical;      /* backing logical sector size (bounce rounding) */
     PUCHAR   bounce_buf;   /* aligned bounce buffer (NULL for aligned pieces) */
     PIRP     sub_irp;      /* sub-IRP; NULL if this piece was not issued */
-    IO_STATUS_BLOCK iosb;  /* UserIosb for the sub-IRP */
     WL_READ_CTX *ctx;      /* owning fan-out context */
 } WL_READ_PIECE;
 
@@ -204,6 +203,7 @@ typedef struct WL_READ_CTX {
     PDEVICE_OBJECT       parent_dev;    /* the LV PDO (for completion boost) */
     PUCHAR               parent_base;   /* mapped parent buffer base */
     ULONG                total_len;     /* original request length */
+    size_t               bytes_copied;  /* bytes actually copied to parent */
     size_t               pieces_issued; /* pieces actually sent */
     volatile LONG        remaining;     /* sub-IRPs still in flight */
     volatile NTSTATUS    status;        /* first failure latched (if any) */
