@@ -320,10 +320,15 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     }
                     status = STATUS_SUCCESS;
                 } else if (code == IOCTL_WINLVM_REFRESH) {
-                    /* Re-probe all existing disk interfaces by re-registering the
-                     * notification with INCLUDE_EXISTING_INTERFACES. The callback
-                     * will fire for each current disk interface and queue probes. */
+                    /* Re-probe all existing disk interfaces: unregister the
+                     * existing notification (if any), then re-register with
+                     * INCLUDE_EXISTING_INTERFACES so the callback fires for
+                     * all currently-present disks. */
                     if (g_bus_ext) {
+                        if (g_disk_notify_cookie) {
+                            IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
+                            g_disk_notify_cookie = NULL;
+                        }
                         NTSTATUS reg_status = IoRegisterPlugPlayNotification(
                             EventCategoryDeviceInterfaceChange,
                             PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
