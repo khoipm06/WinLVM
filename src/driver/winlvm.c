@@ -319,6 +319,27 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                         }
                     }
                     status = STATUS_SUCCESS;
+                } else if (code == IOCTL_WINLVM_REFRESH) {
+                    /* Re-probe all existing disk interfaces by re-registering the
+                     * notification with INCLUDE_EXISTING_INTERFACES. The callback
+                     * will fire for each current disk interface and queue probes. */
+                    if (g_bus_ext) {
+                        NTSTATUS reg_status = IoRegisterPlugPlayNotification(
+                            EventCategoryDeviceInterfaceChange,
+                            PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+                            (PVOID)&GUID_DEVINTERFACE_DISK,
+                            g_bus_ext->fdo->DriverObject,
+                            WinLvmPnpDiskNotify,
+                            NULL,
+                            &g_disk_notify_cookie);
+                        if (NT_SUCCESS(reg_status)) {
+                            WL_TRACE("refresh: disk notify re-registered");
+                        } else {
+                            WL_TRACE_1("refresh: disk notify re-registration failed 0x%x",
+                                       (unsigned)reg_status);
+                        }
+                    }
+                    status = STATUS_SUCCESS;
                 } else {
                     status = STATUS_NOT_IMPLEMENTED;
                 }
