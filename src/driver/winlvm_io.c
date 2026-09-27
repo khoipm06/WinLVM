@@ -458,6 +458,13 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind != WL_EXT_LV) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     if (!WinLvmIoGateEnter(&ext->io_gate)) {
         NTSTATUS q = WinLvmIoGateQueue(&ext->io_gate, Irp);
@@ -465,7 +472,7 @@ NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = q == STATUS_RETRY ? STATUS_DEVICE_BUSY : q;
         Irp->IoStatus.Information = 0; IoCompleteRequest(Irp, IO_NO_INCREMENT); return Irp->IoStatus.Status;
     }
-    if (ext->kind != WL_EXT_LV || ext->record->dead) {
+    if (ext->record->dead) {
         WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         Irp->IoStatus.Information = 0;
@@ -496,6 +503,13 @@ NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind != WL_EXT_LV) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     if (!WinLvmIoGateEnter(&ext->io_gate)) {
         NTSTATUS q = WinLvmIoGateQueue(&ext->io_gate, Irp);
@@ -503,7 +517,7 @@ NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = q == STATUS_RETRY ? STATUS_DEVICE_BUSY : q;
         Irp->IoStatus.Information = 0; IoCompleteRequest(Irp, IO_NO_INCREMENT); return Irp->IoStatus.Status;
     }
-    if (ext->kind != WL_EXT_LV || ext->record->dead) {
+    if (ext->record->dead) {
         WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         Irp->IoStatus.Information = 0;
@@ -580,19 +594,19 @@ static NTSTATUS WinLvmFlushCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVO
 }
 
 NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind != WL_EXT_LV) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     if (!WinLvmIoGateEnter(&ext->io_gate)) {
         NTSTATUS q = WinLvmIoGateQueue(&ext->io_gate, Irp);
         if (q == STATUS_SUCCESS) return STATUS_PENDING;
         Irp->IoStatus.Status = q == STATUS_RETRY ? STATUS_DEVICE_BUSY : q;
         Irp->IoStatus.Information = 0; IoCompleteRequest(Irp, IO_NO_INCREMENT); return Irp->IoStatus.Status;
-    }
-    if (ext->kind != WL_EXT_LV) {
-        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
-        Irp->IoStatus.Information = 0;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        WinLvmIoGateLeave(&ext->io_gate);
-        return STATUS_INVALID_DEVICE_REQUEST;
     }
     /* Surprise-removed backing disk: fail closed like WinLvmRead/Write —
      * forwarding into the removed disk stack (or through the freed record)

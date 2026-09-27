@@ -225,9 +225,21 @@ NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
  * half in winlvm_child.c. Extension kind is at offset 0 in both. */
 NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind == WL_EXT_CONTROL) {
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_NOT_SUPPORTED;
+    }
     if (kind == WL_EXT_BUS)
         return WinLvmBusPnp(DeviceObject, Irp);
-    return WinLvmChildPnp(DeviceObject, Irp);
+    if (kind == WL_EXT_LV)
+        return WinLvmChildPnp(DeviceObject, Irp);
+
+    Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_NOT_SUPPORTED;
 }
 
 static NTSTATUS WinLvmValidateUpdateLv(const WINLVM_UPDATE_LV_REQUEST *request,

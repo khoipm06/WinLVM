@@ -8,6 +8,13 @@
 #include "winlvm.h"
 
 NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    if (kind != WL_EXT_LV) {
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_NOT_SUPPORTED;
+    }
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
     WL_TRACE_1("child pnp minor 0x%x", (unsigned)irpSp->MinorFunction);
