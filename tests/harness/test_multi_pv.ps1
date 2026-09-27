@@ -304,7 +304,7 @@ $TestCases = @{
             @{ Off = 167641088; Len = 131072; Exp = 'fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471' }
         )
         PayloadToken = 'Case: linear-2pv'
-        PayloadRawOffset = 9962496
+        PayloadRawOffset = 9438208
         PayloadRawLength = 127
     }
     'striped-2pv' = @{
@@ -319,7 +319,7 @@ $TestCases = @{
             @{ Off = 33423360;  Len = 131072; Exp = 'fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471' }
         )
         PayloadToken = 'Case: striped-2pv'
-        PayloadRawOffset = 9962496
+        PayloadRawOffset = 8913920
         PayloadRawLength = 127
     }
 }
