@@ -10,7 +10,7 @@ cd /d C:\winlvm
 REM Check if a newly deployed source archive is present to rebuild the driver
 if exist C:\winlvm\winlvm_src.tgz (
     echo --- STEP 1: EXTRACT SOURCE --- >> C:\winlvm\write_exec.log
-    tar -xzf C:\winlvm\winlvm_src.tgz >> C:\winlvm\write_exec.log 2>&1
+    tar -xzmf C:\winlvm\winlvm_src.tgz >> C:\winlvm\write_exec.log 2>&1
     if errorlevel 1 (
         echo EXTRACT-FAIL >> C:\winlvm\write_exec.log
         set TEST_RC=1
@@ -20,6 +20,9 @@ if exist C:\winlvm\winlvm_src.tgz (
     del /f /q C:\winlvm\winlvm_src.tgz >> C:\winlvm\write_exec.log 2>&1
 
     echo --- STEP 2: BUILD DRIVER --- >> C:\winlvm\write_exec.log
+    if exist C:\winlvm\driver\x64\Release\*.obj (
+        del /q /f C:\winlvm\driver\x64\Release\*.obj >> C:\winlvm\write_exec.log 2>&1
+    )
     "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\amd64\MSBuild.exe" C:\winlvm\driver\winlvm.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /v:m /nologo >> C:\winlvm\write_exec.log 2>&1
     if errorlevel 1 (
         echo BUILD-FAIL >> C:\winlvm\write_exec.log
@@ -27,6 +30,16 @@ if exist C:\winlvm\winlvm_src.tgz (
         goto finish
     )
     echo BUILD-PASS >> C:\winlvm\write_exec.log
+
+    echo --- STEP 3: REINSTALL DRIVER --- >> C:\winlvm\write_exec.log
+    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe" remove "ROOT\winlvm" >> C:\winlvm\write_exec.log 2>&1
+    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe" install C:\winlvm\driver\x64\Release\winlvm\winlvm.inf "ROOT\winlvm" >> C:\winlvm\write_exec.log 2>&1
+    if errorlevel 2 (
+        echo INSTALL-FAIL >> C:\winlvm\write_exec.log
+        set TEST_RC=3
+        goto finish
+    )
+    echo INSTALL-PASS >> C:\winlvm\write_exec.log
 )
 
 echo --- STEP: EXECUTE WRITE I/O TEST SCRIPT --- >> C:\winlvm\write_exec.log

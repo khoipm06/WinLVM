@@ -15,12 +15,12 @@
 #>
 
 param(
-    [Parameter(Mandatory=$false)]
-    [string]$TargetDevice = '',
-
-    [Parameter(Mandatory=$false)]
+    [Parameter(Position=0, Mandatory=$false)]
     [ValidateSet('all','sector','stripe-seam','pv-seam')]
-    [string]$TestCase = 'all'
+    [string]$TestCase = 'all',
+
+    [Parameter(Position=1, Mandatory=$false)]
+    [string]$TargetDevice = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,7 +37,7 @@ function Write-Log {
 function Write-Marker {
     param([string]$TestName, [bool]$Passed)
     $marker = if ($Passed) { 'PASS' } else { 'FAIL' }
-    Write-Log "$TestName: $marker"
+    Write-Log "$($TestName): $marker"
 }
 
 # Ensure log directory exists
@@ -53,13 +53,26 @@ Write-Log "TestCase: $TestCase"
 
 # Auto-detect target device if not provided
 if (-not $TargetDevice) {
-    $volumes = Get-Volume | Where-Object { $_.DriveLetter -eq 'E' }
-    if ($volumes.Count -eq 1) {
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $cimVol = Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -match 'E' }
+        if ($cimVol) {
+            $TargetDevice = "\\.\E:"
+            Write-Log "Auto-detected target device via Win32_Volume: $TargetDevice"
+            break
+        }
+        $vol = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq 'E' }
+        if ($vol) {
+            $TargetDevice = "\\.\E:"
+            Write-Log "Auto-detected target device via Get-Volume: $TargetDevice"
+            break
+        }
+        if ($TargetDevice) { break }
+        Start-Sleep -Milliseconds 1000
+    }
+    if (-not $TargetDevice) {
+        # Fall back to \\.\E: directly if exists in Win32_Volume or filesystem
         $TargetDevice = "\\.\E:"
-        Write-Log "Auto-detected target device: $TargetDevice"
-    } else {
-        Write-Log "ERROR: Could not auto-detect drive E:. Specify -TargetDevice explicitly."
-        exit 1
+        Write-Log "Defaulting to target device: $TargetDevice"
     }
 } else {
     Write-Log "Using specified target device: $TargetDevice"
@@ -123,6 +136,17 @@ public class WinLvmWriteIO : IDisposable
         IntPtr lpOverlapped);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        IntPtr hDevice,
+        uint dwIoControlCode,
+        IntPtr lpInBuffer,
+        uint nInBufferSize,
+        out long lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool FlushFileBuffers(IntPtr hFile);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -147,7 +171,7 @@ public class WinLvmWriteIO : IDisposable
         {
             uint err = GetLastError();
             throw new System.ComponentModel.Win32Exception((int)err,
-                $"CreateFile failed for {devicePath}, error 0x{err:X}");
+                string.Format("CreateFile failed for {0}, error 0x{1:X}", devicePath, err));
         }
     }
 
@@ -164,6 +188,19 @@ public class WinLvmWriteIO : IDisposable
 
     ~WinLvmWriteIO() { Dispose(); }
 
+    public long GetLength()
+    {
+        long length = 0;
+        uint bytesReturned;
+        const uint IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C;
+        if (DeviceIoControl(_handle, IOCTL_DISK_GET_LENGTH_INFO, IntPtr.Zero, 0,
+                            out length, 8, out bytesReturned, IntPtr.Zero))
+        {
+            return length;
+        }
+        return -1;
+    }
+
     public bool SetPosition(long offset)
     {
         long newPos;
@@ -179,7 +216,7 @@ public class WinLvmWriteIO : IDisposable
         if (!ok || bytesRead != count)
         {
             uint err = GetLastError();
-            throw new IOException($"ReadFile failed at offset {offset}, count {count}, error 0x{err:X}");
+            throw new IOException(string.Format("ReadFile failed at offset {0}, count {1}, error 0x{2:X}", offset, count, err));
         }
         return buffer;
     }
@@ -192,7 +229,7 @@ public class WinLvmWriteIO : IDisposable
         if (!ok || bytesWritten != data.Length)
         {
             uint err = GetLastError();
-            throw new IOException($"WriteFile failed at offset {offset}, count {data.Length}, error 0x{err:X}");
+            throw new IOException(string.Format("WriteFile failed at offset {0}, count {1}, error 0x{2:X}", offset, data.Length, err));
         }
     }
 
@@ -201,7 +238,7 @@ public class WinLvmWriteIO : IDisposable
         if (!FlushFileBuffers(_handle))
         {
             uint err = GetLastError();
-            throw new IOException($"FlushFileBuffers failed, error 0x{err:X}");
+            throw new IOException(string.Format("FlushFileBuffers failed, error 0x{0:X}", err));
         }
     }
 }
@@ -243,6 +280,8 @@ $restorePassed = $true
 try {
     Write-Log "Opening device: $TargetDevice"
     $disk = New-Object WinLvmWriteIO $TargetDevice
+    $capacity = $disk.GetLength()
+    Write-Log "Volume capacity: $capacity bytes ($([math]::Round($capacity / 1MB, 2)) MiB)"
 
     # Test 1: Sector-aligned write (512 bytes at 1 MiB)
     if ($TestCase -eq 'all' -or $TestCase -eq 'sector') {
@@ -265,40 +304,48 @@ try {
 
     # Test 2: Stripe-seam write (128 KiB spanning 64 KiB boundary)
     if ($TestCase -eq 'all' -or $TestCase -eq 'stripe-seam') {
-        Write-Log "--- Test 2: Stripe-seam write (128 KiB at 64 KiB boundary) ---"
-        $original = $disk.ReadBytes($STRIPE_SEAM_OFFSET, $STRIPE_SEAM_SIZE)
-        $pattern = Get-TestPattern -Size $STRIPE_SEAM_SIZE -Seed 0xFEEDFACE
-        $disk.WriteBytes($STRIPE_SEAM_OFFSET, $pattern)
-        $disk.Flush()
-        $readback = $disk.ReadBytes($STRIPE_SEAM_OFFSET, $STRIPE_SEAM_SIZE)
-        $verify = Compare-Bytes -Expected $pattern -Actual $readback
-        Write-Marker "STRIPE-SEAM-WRITE" $verify
-        if (-not $verify) { $allPassed = $false }
-        # Restore
-        $disk.WriteBytes($STRIPE_SEAM_OFFSET, $original)
-        $disk.Flush()
-        $restored = $disk.ReadBytes($STRIPE_SEAM_OFFSET, $STRIPE_SEAM_SIZE)
-        $restoreOk = Compare-Bytes -Expected $original -Actual $restored
-        if (-not $restoreOk) { $restorePassed = $false; Write-Log "STRIPE-SEAM RESTORE FAILED" }
+        if ($capacity -gt 0 -and $capacity -lt ($STRIPE_SEAM_OFFSET + $STRIPE_SEAM_SIZE)) {
+            Write-Log "SKIP: Stripe-seam write ($STRIPE_SEAM_OFFSET + $STRIPE_SEAM_SIZE) exceeds volume capacity $capacity"
+        } else {
+            Write-Log "--- Test 2: Stripe-seam write (128 KiB at 64 KiB boundary) ---"
+            $original = $disk.ReadBytes($STRIPE_SEAM_OFFSET, $STRIPE_SEAM_SIZE)
+            $pattern = Get-TestPattern -Size $STRIPE_SEAM_SIZE -Seed 0xFEEDFACE
+            $disk.WriteBytes($STRIPE_SEAM_OFFSET, $pattern)
+            $disk.Flush()
+            $readback = $disk.ReadBytes($STRIPE_SEAM_OFFSET, $STRIPE_SEAM_SIZE)
+            $verify = Compare-Bytes -Expected $pattern -Actual $readback
+            Write-Marker "STRIPE-SEAM-WRITE" $verify
+            if (-not $verify) { $allPassed = $false }
+            # Restore
+            $disk.WriteBytes($STRIPE_SEAM_OFFSET, $original)
+            $disk.Flush()
+            $restored = $disk.ReadBytes($STRIPE_SEAM_OFFSET, $STRIPE_SEAM_SIZE)
+            $restoreOk = Compare-Bytes -Expected $original -Actual $restored
+            if (-not $restoreOk) { $restorePassed = $false; Write-Log "STRIPE-SEAM RESTORE FAILED" }
+        }
     }
 
     # Test 3: PV-seam write (128 KiB spanning 80 MiB boundary)
     if ($TestCase -eq 'all' -or $TestCase -eq 'pv-seam') {
-        Write-Log "--- Test 3: PV-seam write (128 KiB at 80 MiB boundary) ---"
-        $original = $disk.ReadBytes($PV_SEAM_OFFSET, $PV_SEAM_SIZE)
-        $pattern = Get-TestPattern -Size $PV_SEAM_SIZE -Seed 0xCAFEBABE
-        $disk.WriteBytes($PV_SEAM_OFFSET, $pattern)
-        $disk.Flush()
-        $readback = $disk.ReadBytes($PV_SEAM_OFFSET, $PV_SEAM_SIZE)
-        $verify = Compare-Bytes -Expected $pattern -Actual $readback
-        Write-Marker "PV-SEAM-WRITE" $verify
-        if (-not $verify) { $allPassed = $false }
-        # Restore
-        $disk.WriteBytes($PV_SEAM_OFFSET, $original)
-        $disk.Flush()
-        $restored = $disk.ReadBytes($PV_SEAM_OFFSET, $PV_SEAM_SIZE)
-        $restoreOk = Compare-Bytes -Expected $original -Actual $restored
-        if (-not $restoreOk) { $restorePassed = $false; Write-Log "PV-SEAM RESTORE FAILED" }
+        if ($capacity -gt 0 -and $capacity -lt ($PV_SEAM_OFFSET + $PV_SEAM_SIZE)) {
+            Write-Log "SKIP: PV-seam write ($PV_SEAM_OFFSET + $PV_SEAM_SIZE) exceeds volume capacity $capacity (striped-2pv is 32 MiB, PV-seam is for linear-2pv)"
+        } else {
+            Write-Log "--- Test 3: PV-seam write (128 KiB at 80 MiB boundary) ---"
+            $original = $disk.ReadBytes($PV_SEAM_OFFSET, $PV_SEAM_SIZE)
+            $pattern = Get-TestPattern -Size $PV_SEAM_SIZE -Seed 0xCAFEBABE
+            $disk.WriteBytes($PV_SEAM_OFFSET, $pattern)
+            $disk.Flush()
+            $readback = $disk.ReadBytes($PV_SEAM_OFFSET, $PV_SEAM_SIZE)
+            $verify = Compare-Bytes -Expected $pattern -Actual $readback
+            Write-Marker "PV-SEAM-WRITE" $verify
+            if (-not $verify) { $allPassed = $false }
+            # Restore
+            $disk.WriteBytes($PV_SEAM_OFFSET, $original)
+            $disk.Flush()
+            $restored = $disk.ReadBytes($PV_SEAM_OFFSET, $PV_SEAM_SIZE)
+            $restoreOk = Compare-Bytes -Expected $original -Actual $restored
+            if (-not $restoreOk) { $restorePassed = $false; Write-Log "PV-SEAM RESTORE FAILED" }
+        }
     }
 
     $disk.Dispose()

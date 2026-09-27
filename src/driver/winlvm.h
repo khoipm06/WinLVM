@@ -161,14 +161,14 @@ typedef struct _WINLVM_BUS_EXT {
     WMILIB_CONTEXT      wmi;           /* zero-GUID wmilib context (START reg) */
 } WINLVM_BUS_EXT;
 
-/* ---- READ fan-out context (winlvm_io.c) ------------------------------
+/* ---- I/O fan-out context (winlvm_io.c) ------------------------------
  * Lifetime diagram (all in winlvm_io.c):
- *   caller IRP (WinLvmRead)
+ *   caller IRP (WinLvmRead / WinLvmWrite)
  *     └─ wl_map_begin/next → N pieces (cap WL_MAX_READ_PIECES)
- *     └─ one WL_READ_CTX from nonpaged pool, ctx->remaining = N
+ *     └─ one WL_IO_CTX from nonpaged pool, ctx->remaining = N
  *     └─ per piece: sub-IRP = IoAllocateIrp(backing->StackSize + 1, FALSE)
  *             (ISSUE-21), MDL over the parent buffer (aligned) or a
- *             sector-aligned bounce (unaligned), IoSetCompletionRoutine
+ *             sector-aligned bounce (unaligned read), IoSetCompletionRoutine
  *     └─ completion: free sub-IRP/MDL/bounce, InterlockedDecrement
  *             remaining; last one frees the ctx (back to pool) and
  *             completes the PARENT IRP exactly once.
@@ -178,11 +178,11 @@ typedef struct _WINLVM_BUS_EXT {
  * forward declaration. */
 #define WL_MAX_READ_PIECES 256
 
-typedef struct WL_READ_CTX WL_READ_CTX;
+typedef struct WL_IO_CTX WL_IO_CTX;
 
-/* One sub-read of a fan-out. Parent buffer slice = [parent_off,
+/* One sub-I/O of a fan-out. Parent buffer slice = [parent_off,
  * parent_off + len): aligned pieces build a fresh MDL directly over the
- * locked parent slice; unaligned pieces read an aligned window into
+ * locked parent slice; unaligned read pieces read an aligned window into
  * bounce_buf and copy the slice back in the completion routine. */
 typedef struct {
     uint32_t pv_slot;      /* record PV slot (mapper output) */
@@ -197,21 +197,25 @@ typedef struct {
     ULONG    logical;      /* backing logical sector size (bounce rounding) */
     PUCHAR   bounce_buf;   /* aligned bounce buffer (NULL for aligned pieces) */
     PIRP     sub_irp;      /* sub-IRP; NULL if this piece was not issued */
-    WL_READ_CTX *ctx;      /* owning fan-out context */
-} WL_READ_PIECE;
+    WL_IO_CTX *ctx;        /* owning fan-out context */
+} WL_IO_PIECE;
 
-typedef struct WL_READ_CTX {
+typedef struct WL_IO_CTX {
     PIRP                 parent;        /* the caller's IRP (completed once) */
     PDEVICE_OBJECT       parent_dev;    /* the LV PDO (for completion boost) */
     PUCHAR               parent_base;   /* mapped parent buffer base */
     ULONG                total_len;     /* original request length */
-    size_t               bytes_copied;  /* bytes actually copied to parent */
+    size_t               bytes_copied;  /* bytes actually transferred */
     size_t               pieces_issued; /* pieces actually sent */
     volatile LONG        remaining;     /* sub-IRPs still in flight */
     volatile NTSTATUS    status;        /* first failure latched (if any) */
     WL_IO_GATE          *gate;
-    WL_READ_PIECE        pieces[WL_MAX_READ_PIECES];
-} WL_READ_CTX;
+    UCHAR                major_function; /* IRP_MJ_READ or IRP_MJ_WRITE */
+    WL_IO_PIECE          pieces[WL_MAX_READ_PIECES];
+} WL_IO_CTX;
+
+typedef WL_IO_PIECE WL_READ_PIECE;
+typedef WL_IO_CTX   WL_READ_CTX;
 
 /* LV PDO extension. */
 typedef struct _WINLVM_LV_EXT {
