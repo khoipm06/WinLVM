@@ -270,6 +270,7 @@ add_executable(winlvm_tests
   tests/test_corpus.cpp
   tests/test_service.cpp
   tests/test_lvm_cli.cpp
+  tests/test_mount_ioctl.cpp
 )
 target_include_directories(winlvm_tests PRIVATE src)
 target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol)
