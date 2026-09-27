@@ -176,7 +176,7 @@ typedef struct _WINLVM_BUS_EXT {
  *   status and Information = 0 — never a partial completion.
  * Struct + logic live in ONE place (winlvm_io.c); size visible here for
  * forward declaration. */
-#define WL_MAX_READ_PIECES 64
+#define WL_MAX_READ_PIECES 256
 
 typedef struct WL_READ_CTX WL_READ_CTX;
 

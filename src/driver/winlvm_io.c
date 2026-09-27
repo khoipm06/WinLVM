@@ -301,13 +301,13 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         } else {
             /* parent buffer slice: partial MDL over the already-locked
              * parent MDL — no new locking, exactly the aligned request.
-             * IoAllocateMdl allocates the target MDL; IoBuildPartialMdl
-             * (VOID return, WDK contract) maps the source slice into it. */
-            mdl = IoAllocateMdl(NULL, pc->len, FALSE, FALSE, NULL);
+             * VirtualAddress passed to IoAllocateMdl and IoBuildPartialMdl MUST
+             * be relative to the parent MDL's user-mode virtual address
+             * (MmGetMdlVirtualAddress), NOT the system PTE address (0x12E fix). */
+            PVOID va = (PUCHAR)MmGetMdlVirtualAddress(Irp->MdlAddress) + pc->parent_off;
+            mdl = IoAllocateMdl(va, pc->len, FALSE, FALSE, NULL);
             if (mdl)
-                IoBuildPartialMdl(Irp->MdlAddress, mdl,
-                                  (PUCHAR)wctx->parent_base + pc->parent_off,
-                                  pc->len);
+                IoBuildPartialMdl(Irp->MdlAddress, mdl, va, pc->len);
         }
         if (!mdl) {
             if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
