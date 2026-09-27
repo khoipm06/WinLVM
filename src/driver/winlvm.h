@@ -64,9 +64,10 @@ NTSTATUS WinLvmIoGateBeginQuiesce(WL_IO_GATE *gate);
 void WinLvmIoGateResume(WL_IO_GATE *gate, PDEVICE_OBJECT DeviceObject);
 void WinLvmIoGateRemove(WL_IO_GATE *gate);
 
-/* Tracing (shared by winlvm.c / winlvm_bus.c / winlvm_child.c). */
-#define WL_TRACE(msg) DbgPrint("winlvm: " msg "\n")
-#define WL_TRACE_1(msg, a) DbgPrint("winlvm: " msg "\n", a)
+void WinLvmLog(const char *fmt, ...);
+#define WL_TRACE(msg) WinLvmLog("winlvm: " msg "\n")
+#define WL_TRACE_1(msg, a) WinLvmLog("winlvm: " msg "\n", a)
+#define WL_TRACE_2(msg, a, b) WinLvmLog("winlvm: " msg "\n", a, b)
 
 /* Device ID and Hardware IDs reported by child LV PDOs.
  * WDM contract: DeviceID MUST have the form <enumerator>\<device-id> with a
@@ -91,6 +92,7 @@ typedef enum {
 #define IOCTL_WINLVM_ACTIVATE_LV    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define IOCTL_WINLVM_DEACTIVATE_LV  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define IOCTL_WINLVM_UPDATE_LV      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_GET_LOG        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_DATA)
 
 typedef struct {
     ULONG version;
@@ -285,6 +287,7 @@ void WinLvmWmiInit(PDEVICE_OBJECT DeviceObject);
 /* winlvm_bus.c / winlvm_child.c — kind halves of WinLvmPnp. */
 DRIVER_DISPATCH WinLvmBusPnp;
 DRIVER_DISPATCH WinLvmChildPnp;
+void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus);
 
 /* winlvm_io.c */
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len);

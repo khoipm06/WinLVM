@@ -12,6 +12,7 @@
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext) {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    WL_TRACE_1("mount ioctl: 0x%08x", (unsigned)code);
 
     if (code == IOCTL_MOUNTDEV_QUERY_DEVICE_NAME) {
         /* MSDN contract (mountmgr/ni-mountmgr-ioctl_mountdev_query_device_name):
@@ -154,8 +155,31 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
         return STATUS_SUCCESS;
     }
 
-    if (code == IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME) {
-        return STATUS_NOT_IMPLEMENTED;
+    if (code == IOCTL_DISK_GET_DRIVE_LAYOUT_EX) {
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DRIVE_LAYOUT_INFORMATION_EX)) {
+            Irp->IoStatus.Information = sizeof(DRIVE_LAYOUT_INFORMATION_EX);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        PDRIVE_LAYOUT_INFORMATION_EX layout = (PDRIVE_LAYOUT_INFORMATION_EX)Irp->AssociatedIrp.SystemBuffer;
+        RtlZeroMemory(layout, sizeof(DRIVE_LAYOUT_INFORMATION_EX));
+        layout->PartitionStyle = PARTITION_STYLE_MBR;
+        layout->PartitionCount = 1;
+        layout->Mbr.Signature = 0x574C564D; /* 'WLVM' */
+        layout->Mbr.CheckSum = 0;
+
+        PPARTITION_INFORMATION_EX entry = &layout->PartitionEntry[0];
+        entry->PartitionStyle = PARTITION_STYLE_MBR;
+        entry->StartingOffset.QuadPart = 0;
+        entry->PartitionLength.QuadPart = (LONGLONG)ext->byte_size;
+        entry->PartitionNumber = 1;
+        entry->RewritePartition = FALSE;
+        entry->Mbr.PartitionType = 0x07; /* PARTITION_IFS (Installable File System, NTFS/raw) */
+        entry->Mbr.BootIndicator = FALSE;
+        entry->Mbr.RecognizedPartition = TRUE;
+        entry->Mbr.HiddenSectors = 0;
+
+        Irp->IoStatus.Information = sizeof(DRIVE_LAYOUT_INFORMATION_EX);
+        return STATUS_SUCCESS;
     }
 
     /* Raw-volume semantics: diskspd/format-style tools open \\.\E: while a

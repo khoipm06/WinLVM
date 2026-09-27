@@ -216,12 +216,14 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     const lvmcore_volume_group *view = ext->record->view;
     if (!view || !g_bus_ext) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_DEVICE_REMOVED;
     }
     if (!Irp->MdlAddress) { /* DO_DIRECT_IO child: must have a locked MDL */
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -231,6 +233,7 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_READ_CTX *wctx = (WL_READ_CTX *)ExAllocatePoolWithTag(
         NonPagedPool, sizeof(WL_READ_CTX), WINLVM_WIN_TAG);
     if (!wctx) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -246,6 +249,7 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     wctx->status = STATUS_SUCCESS;
     if (!wctx->parent_base) {
         ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -256,6 +260,7 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                              WL_MAX_READ_PIECES);
     if (n == 0) {
         ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -335,12 +340,14 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             if (pc->sub_irp) IoFreeIrp(pc->sub_irp);
         }
         ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = fail;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return fail;
     }
 
+    IoMarkIrpPending(Irp);
     InterlockedExchange(&wctx->remaining, (LONG)built);
     for (size_t i = 0; i < built; i++) {
         WL_READ_PIECE *pc = &wctx->pieces[i];
@@ -348,7 +355,7 @@ static NTSTATUS LvFanOutRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
     /* Parent IRP is completed by the last fan-out completion; the ctx is
      * freed there too — never touch wctx after this point. */
-    return STATUS_MORE_PROCESSING_REQUIRED;
+    return STATUS_PENDING;
 }
 
 /* Fast path + fan-out dispatch. One fully-mapped aligned piece → the
@@ -365,6 +372,7 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     const lvmcore_volume_group *view = ext->record->view
         ? ext->record->view : NULL;
     if (!view) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -380,6 +388,7 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (r < 0) {
         /* unmappable: fail whole — a partial forward would silently serve
          * corrupt data. */
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -407,6 +416,7 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
                 IoCopyCurrentIrpStackLocationToNext(Irp);
                 PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
+                nextSp->FileObject = ext->backing_file[backing_idx];
                 nextSp->Parameters.Read.ByteOffset.QuadPart = (LONGLONG)pv_byte;
 
                 IoSetCompletionRoutine(Irp, WinLvmGateCompletion, ext,
@@ -414,6 +424,14 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 return IoCallDriver(backing, Irp);
             }
         }
+    }
+
+    if (irpSp->MajorFunction == IRP_MJ_WRITE) {
+        WinLvmIoGateLeave(&ext->io_gate);
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_NOT_SUPPORTED;
     }
 
     /* Multi-piece (cross-segment/PV/stripe), or a single piece that needs
@@ -430,6 +448,7 @@ NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Information = 0; IoCompleteRequest(Irp, IO_NO_INCREMENT); return Irp->IoStatus.Status;
     }
     if (ext->kind != WL_EXT_LV || ext->record->dead) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -437,12 +456,14 @@ NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     if (irpSp->Parameters.Read.Length == 0) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_SUCCESS;
     }
     if ((ULONGLONG)irpSp->Parameters.Read.ByteOffset.QuadPart >= ext->byte_size) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_END_OF_FILE;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -453,23 +474,29 @@ NTSTATUS WinLvmRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         irpSp->Parameters.Read.Length =
             (ULONG)(ext->byte_size - irpSp->Parameters.Read.ByteOffset.QuadPart);
     }
-    NTSTATUS status = LvForwardIo(DeviceObject, Irp);
-    if (status != STATUS_MORE_PROCESSING_REQUIRED) WinLvmIoGateLeave(&ext->io_gate);
-    return status;
+    return LvForwardIo(DeviceObject, Irp);
 }
 
 NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WINLVM_LV_EXT *ext = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+    if (!WinLvmIoGateEnter(&ext->io_gate)) {
+        NTSTATUS q = WinLvmIoGateQueue(&ext->io_gate, Irp);
+        if (q == STATUS_SUCCESS) return STATUS_PENDING;
+        Irp->IoStatus.Status = q == STATUS_RETRY ? STATUS_DEVICE_BUSY : q;
+        Irp->IoStatus.Information = 0; IoCompleteRequest(Irp, IO_NO_INCREMENT); return Irp->IoStatus.Status;
+    }
     if (ext->kind != WL_EXT_LV || ext->record->dead) {
-        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
         WinLvmIoGateLeave(&ext->io_gate);
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_DEVICE_REMOVED;
     }
     /* Write fan-out is W3 — a multi-PV LV fails closed rather than write
      * one stripe and corrupt the rest. Single-backing LVs (backing_count
      * == 1) keep the full write path. */
     if (ext->backing_count > 1) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -480,23 +507,29 @@ NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
      * reconciles refuse to swap while this PDO lives.) */
     const lvmcore_volume_group *view = ext->record->view;
     if (!view) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_DEVICE_REMOVED;
     }
     if (view->system_id[0] != '\0') {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_MEDIA_WRITE_PROTECTED;
+        Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_MEDIA_WRITE_PROTECTED;
     }
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     if (irpSp->Parameters.Write.Length == 0) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_SUCCESS;
     }
     if ((ULONGLONG)irpSp->Parameters.Write.ByteOffset.QuadPart >= ext->byte_size) {
+        WinLvmIoGateLeave(&ext->io_gate);
         Irp->IoStatus.Status = STATUS_END_OF_FILE;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -507,9 +540,7 @@ NTSTATUS WinLvmWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         irpSp->Parameters.Write.Length =
             (ULONG)(ext->byte_size - irpSp->Parameters.Write.ByteOffset.QuadPart);
     }
-    NTSTATUS status = LvForwardIo(DeviceObject, Irp);
-    if (status != STATUS_MORE_PROCESSING_REQUIRED) WinLvmIoGateLeave(&ext->io_gate);
-    return status;
+    return LvForwardIo(DeviceObject, Irp);
 }
 
 NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -522,6 +553,7 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
     if (ext->kind != WL_EXT_LV) {
         Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         WinLvmIoGateLeave(&ext->io_gate);
         return STATUS_INVALID_DEVICE_REQUEST;
@@ -539,7 +571,9 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     /* Forward the flush to the first backing member. A multi-PV LV has no
      * data writes (blocked above), so flushing one member is sufficient for
      * the read-path phase; W3's write fan-out adds per-member flushes. */
-    IoSkipCurrentIrpStackLocation(Irp);
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
+    nextSp->FileObject = ext->backing_file[0];
     IoSetCompletionRoutine(Irp, WinLvmGateCompletion, ext, TRUE, TRUE, TRUE);
     return IoCallDriver(ext->backing_pdo[0], Irp);
 }

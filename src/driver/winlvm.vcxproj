@@ -78,6 +78,7 @@
     <ClCompile Include="winlvm.c" />
     <ClCompile Include="winlvm_bus.c" />
     <ClCompile Include="winlvm_child.c" />
+    <ClCompile Include="winlvm_gate.c" />
     <ClCompile Include="winlvm_power.c" />
     <ClCompile Include="winlvm_io.c" />
     <ClCompile Include="winlvm_mount.c" />
@@ -88,5 +89,8 @@
     <ClCompile Include="lvm_read.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="FixInfClass" BeforeTargets="Inf2Cat">
+    <Exec Command="powershell -NoProfile -Command &quot;if (Test-Path '$(OutDir)winlvm.inf') { (Get-Content '$(OutDir)winlvm.inf') -replace 'Class\s*=\s*Volume', 'Class=System' -replace 'ClassGuid\s*=\s*\{71[aA]27[cC0-9dD]+-[a-fA-F0-9-]+\}', 'ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}' | Set-Content '$(OutDir)winlvm.inf' }&quot;" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

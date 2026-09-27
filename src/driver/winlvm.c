@@ -12,6 +12,28 @@
  */
 #include <initguid.h>
 #include "winlvm.h"
+#include <ntstrsafe.h>
+
+#define WINLVM_LOG_BUFFER_SIZE 32768
+static char g_kernel_log[WINLVM_LOG_BUFFER_SIZE] = {0};
+static volatile LONG g_kernel_log_pos = 0;
+
+void WinLvmLog(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buf[256];
+    NTSTATUS st = RtlStringCbVPrintfA(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (!NT_SUCCESS(st)) return;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "%s", buf);
+
+    size_t len = strlen(buf);
+    LONG pos = InterlockedAdd(&g_kernel_log_pos, (LONG)len) - (LONG)len;
+    if (pos + (LONG)len < WINLVM_LOG_BUFFER_SIZE) {
+        RtlCopyMemory(&g_kernel_log[pos], buf, len);
+    }
+}
 
 /* Globals. g_bus_ext is set by AddDevice and cleared on REMOVE; the disk
  * arrival callback may fire before AddDevice, so it must be null-checked. */
@@ -166,9 +188,8 @@ NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         ? &((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->wmi
         : &((WINLVM_LV_EXT *)DeviceObject->DeviceExtension)->wmi;
 
-    NTSTATUS status = STATUS_SUCCESS;
-    SYSCTL_IRP_DISPOSITION disposition =
-        WmiSystemControl(wmi, DeviceObject, Irp, &status);
+    SYSCTL_IRP_DISPOSITION disposition = IrpNotWmi;
+    NTSTATUS status = WmiSystemControl(wmi, DeviceObject, Irp, &disposition);
 
     switch (disposition) {
     case IrpProcessed:
@@ -278,13 +299,23 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     }
                 }
             }
+        }
+        }
+        if (code == IOCTL_WINLVM_GET_LOG) {
+            ULONG to_copy = (ULONG)g_kernel_log_pos;
+            if (to_copy > WINLVM_LOG_BUFFER_SIZE) to_copy = WINLVM_LOG_BUFFER_SIZE;
+            if (output_length < to_copy) to_copy = output_length;
+            if (to_copy > 0 && Irp->AssociatedIrp.SystemBuffer) {
+                RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, g_kernel_log, to_copy);
             }
+            status = STATUS_SUCCESS;
+            information = to_copy;
         }
         const BOOLEAN known = code == IOCTL_WINLVM_INVENTORY || code == IOCTL_WINLVM_REFRESH ||
                               code == IOCTL_WINLVM_QUIESCE_VG || code == IOCTL_WINLVM_RESUME_VG ||
                               code == IOCTL_WINLVM_ACTIVATE_LV || code == IOCTL_WINLVM_DEACTIVATE_LV ||
                               code == IOCTL_WINLVM_UPDATE_LV;
-        if (code != IOCTL_WINLVM_UPDATE_LV && known &&
+        if (code != IOCTL_WINLVM_UPDATE_LV && code != IOCTL_WINLVM_GET_LOG && known &&
             input_length >= sizeof(WINLVM_CONTROL_REQUEST) &&
             Irp->AssociatedIrp.SystemBuffer != NULL) {
             const WINLVM_CONTROL_REQUEST *request =
@@ -321,10 +352,11 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     status = STATUS_SUCCESS;
                 } else if (code == IOCTL_WINLVM_REFRESH) {
                     /* Re-probe all existing disk interfaces: unregister the
-                     * existing notification (if any), then re-register with
-                     * INCLUDE_EXISTING_INTERFACES so the callback fires for
-                     * all currently-present disks. */
+                     * existing notification (if any), reset inactive records,
+                     * then re-register with INCLUDE_EXISTING_INTERFACES so the
+                     * callback fires for all currently-present disks. */
                     if (g_bus_ext) {
+                        WinLvmBusResetInactiveRecords(g_bus_ext);
                         if (g_disk_notify_cookie) {
                             IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
                             g_disk_notify_cookie = NULL;

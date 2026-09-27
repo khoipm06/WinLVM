@@ -34,6 +34,30 @@ static void WinLvmFreePvTag(WINLVM_PV_TAG *tag) {
     ExFreePoolWithTag(tag, WINLVM_WIN_TAG);
 }
 
+void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus) {
+    if (!bus) return;
+    KIRQL old;
+    KeAcquireSpinLock(&bus->lock, &old);
+    for (size_t i = 0; i < WL_VG_MAX; i++) {
+        wl_vg_record *r = &bus->vg_records[i];
+        if (r->vg_uuid[0] != '\0' && r->refs == 0) {
+            for (size_t p = 0; p < r->pv_count; p++) {
+                WINLVM_PV_TAG *tag = (WINLVM_PV_TAG *)r->pv_tag[p];
+                if (tag) {
+                    WinLvmFreePvTag(tag);
+                    r->pv_tag[p] = NULL;
+                }
+            }
+            if (bus->vg_views[i]) {
+                ExFreePoolWithTag(bus->vg_views[i], WINLVM_WIN_TAG);
+                bus->vg_views[i] = NULL;
+            }
+            RtlZeroMemory(r, sizeof(*r));
+        }
+    }
+    KeReleaseSpinLock(&bus->lock, old);
+}
+
 /* Query the backing disk's native sector sizes (512/512e/4Kn). Sync IOCTL
  * against the disk class FDO (`target_disk` comes from IoGetDeviceObjectPointer
  * — the class driver answers IOCTL_STORAGE_QUERY_PROPERTY; the raw PDO does
@@ -117,6 +141,10 @@ static VOID WinLvmRegisterWorker(PVOID context) {
      * then would leave a cookie pointing at a dead bus and block the next
      * devnode cycle from re-registering. */
     if (g_bus_ext) {
+        if (g_disk_notify_cookie) {
+            IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
+            g_disk_notify_cookie = NULL;
+        }
         NTSTATUS status = WinLvmRegisterDiskNotify(work->driver);
         if (!NT_SUCCESS(status))
             WL_TRACE_1("register worker: notification registration failed 0x%x",
@@ -283,7 +311,7 @@ void WinLvmProbeWorker(PVOID context) {
     WL_TRACE("probe worker start");
 
     NTSTATUS pointer_status = IoGetDeviceObjectPointer(&work->ifname,
-                                                       FILE_READ_ATTRIBUTES,
+                                                       FILE_READ_DATA | FILE_READ_ATTRIBUTES,
                                                        &work->target_file,
                                                        &work->target_disk);
     if (!NT_SUCCESS(pointer_status)) {
@@ -506,14 +534,15 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
 
     WCHAR namebuf[64];
     RtlZeroMemory(namebuf, sizeof(namebuf));
-    UNICODE_STRING devName;
-    devName.Buffer = namebuf;
-    devName.MaximumLength = sizeof(namebuf);
-    NTSTATUS status = RtlUnicodeStringPrintf(&devName, L"\\Device\\WinLvm%hs",
-                                             lv0->id);
+    NTSTATUS status = RtlStringCchPrintfW(namebuf, sizeof(namebuf) / sizeof(WCHAR),
+                                          L"\\Device\\WinLvm%hs", lv0->id);
     if (!NT_SUCCESS(status)) {
+        WL_TRACE_1("devname format failed 0x%x", (unsigned)status);
         return FALSE;
     }
+
+    UNICODE_STRING devName;
+    RtlInitUnicodeString(&devName, namebuf);
 
     PDEVICE_OBJECT lv_pdo = NULL;
     status = IoCreateDevice(bus->fdo->DriverObject,
@@ -652,13 +681,7 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return st;
     }
     case IRP_MN_REMOVE_DEVICE: {
-        IoSkipCurrentIrpStackLocation(Irp);
-        NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
-        /* forward down, then detach + delete children then self */
         for (size_t i = 0; i < ext->child_count; i++) {
-            /* Children are deleted directly here (never see their own
-             * REMOVE_DEVICE), so undo their per-device state explicitly:
-             * the child's WMI provider entry (H5) and volume interface. */
             IoWMIRegistrationControl(ext->children[i], WMIREG_ACTION_DEREGISTER);
             WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)ext->children[i]->DeviceExtension;
             WinLvmIoGateRemove(&ce->io_gate);
@@ -666,9 +689,6 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 IoSetDeviceInterfaceState(&ce->ifname, FALSE);
                 RtlFreeUnicodeString(&ce->ifname);
             }
-            /* Children sweep deletes directly (never sees REMOVE_DEVICE),
-             * so undo the child-PDO ref + activation claim + per-PV
-             * backing refs here too. */
             if (ce->record) {
                 wl_vg_lv_set_activated(ce->record, ce->lv_index, 0);
                 wl_vg_unref(ce->record);
@@ -682,8 +702,6 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoDeleteDevice(ext->children[i]);
         }
         ext->child_count = 0;
-        /* Registry sweep: records are embedded bus-ext slots never freed
-         * individually; their arena blocks and per-PV tags return here. */
         for (size_t i = 0; i < WL_VG_MAX; i++) {
             wl_vg_record *r = &ext->vg_records[i];
             for (size_t p = 0; p < r->pv_count; p++) {
@@ -695,25 +713,14 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 ext->vg_views[i] = NULL;
             }
         }
-        /* Drop the disk-interface registration with the bus: leaving the
-         * cookie set makes the next devnode cycle's START skip
-         * re-registration (WinLvmRegisterDiskNotify early-outs), so a
-         * disable/enable would silently stop finding LVs forever. */
-        if (g_disk_notify_cookie) {
-            IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
-            g_disk_notify_cookie = NULL;
-        }
-        /* Read-fan-out ctx lifetimes: children are gone (their sweep ran
-         * above), so no in-flight piece context remains; each ctx is freed
-         * by ITS OWN completion routine from nonpaged pool, so teardown
-         * never touches them here. Same async-teardown window as the probe
-         * worker / bus REMOVE race (W3 work-queue drain): a ctx leaked by
-         * that window is pool-leaked, not a UAF. */
         IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
-        IoDetachDevice(ext->bus_pdo);
+        PDEVICE_OBJECT lower = ext->bus_pdo;
+        IoDetachDevice(lower);
         if (g_bus_ext == ext) g_bus_ext = NULL;
         IoDeleteDevice(DeviceObject);
-        return st;
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(lower, Irp);
     }
     default:
         break;

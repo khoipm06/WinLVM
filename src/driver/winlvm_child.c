@@ -81,10 +81,12 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             UNICODE_STRING ifname;
             NTSTATUS ifst = IoRegisterDeviceInterface(DeviceObject,
                 &GUID_DEVINTERFACE_VOLUME, NULL, &ifname);
+            WL_TRACE_1("child start: reg ifname 0x%08x", (unsigned)ifst);
             if (NT_SUCCESS(ifst)) lvext->ifname = ifname;
         }
         if (lvext->ifname.Buffer) {
-            IoSetDeviceInterfaceState(&lvext->ifname, TRUE);
+            NTSTATUS set_st = IoSetDeviceInterfaceState(&lvext->ifname, TRUE);
+            WL_TRACE_1("child start: set ifstate 0x%08x", (unsigned)set_st);
         }
         /* Oracle H5: zero-GUID wmilib provider per LV PDO — the verifier
          * probe's ProviderId IS this self-started PDO; registration makes
@@ -99,21 +101,25 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_REMOVE_DEVICE: {
-        WinLvmIoGateRemove(&lvext->io_gate);
-        /* PnP removes a child directly: deactivate interface, drop self
-         * from the bus children array (else next QDR reports a freed PDO),
-         * release refs, delete self.
-         *
-         * The VG record is NOT freed here — it is owned by the bus FDO and
-         * freed in WinLvmBusPnp's REMOVE_DEVICE. The volume PDO stays
-         * delete-pending while ext4fsd holds the mount, and that stack can
-         * still forward flush/shutdown IRPs which read ext->record->dead.
-         * Freeing the record when the last child dropped off the array was
-         * the delayed-wedge UAF (2026-09-14 NMI repro; PnpSurpriseRemove:
-         * no delete until the surprise IRP succeeds AND handles close). */
+        /* WDK contract for bus driver child PDO removal:
+         * If the device is still physically present on the bus (record != NULL && !record->dead),
+         * the bus driver must NOT call IoDeleteDevice! It retains the PDO in its children list,
+         * deactivates the interface, and completes with STATUS_SUCCESS.
+         * Only when physically removed (record == NULL || record->dead) does it delete the PDO. */
         IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
         if (lvext->ifname.Buffer) {
             IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
+        }
+
+        BOOLEAN physically_removed = (lvext->record == NULL || lvext->record->dead);
+        if (!physically_removed) {
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_SUCCESS;
+        }
+
+        WinLvmIoGateRemove(&lvext->io_gate);
+        if (lvext->ifname.Buffer) {
             RtlFreeUnicodeString(&lvext->ifname);
         }
         if (g_bus_ext) {
@@ -127,14 +133,10 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                     break;
                 }
             }
-            /* Release the child-PDO refs taken by CreateLvPdo: reconciles
-             * gate view swaps on refs == 0, so a dead/removed child must
-             * not pin the old view forever. Clearing the activation bit
-             * lets a later re-arrival re-create this volume (PnP REMOVE
-             * on a dead VG → disk re-insert → fresh devnode). */
             if (lvext->record) {
                 wl_vg_lv_set_activated(lvext->record, lvext->lv_index, 0);
                 wl_vg_unref(lvext->record);
+                lvext->record = NULL;
             }
             KeReleaseSpinLock(&g_bus_ext->lock, old);
         }
@@ -145,9 +147,10 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             lvext->backing_pdo[i] = NULL;
             lvext->backing_file[i] = NULL;
         }
-        IoDeleteDevice(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
-        break;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        IoDeleteDevice(DeviceObject);
+        return STATUS_SUCCESS;
     }
     case IRP_MN_SURPRISE_REMOVAL:
         /* WDM contract (irp-mn-surprise-removal.md): all PnP drivers MUST
