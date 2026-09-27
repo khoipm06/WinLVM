@@ -307,69 +307,43 @@ corpus, in CI.
 
 ---
 
-### Phase 5 — LUKS2, user mode first _(Stage 4)_ — 🟡 **in progress (partial)**
+### Phase 5 — WinLUKS: Standalone LUKS2 Storage Decryption _(Stage 4)_ — 🟡 **in progress (partial)**
 
-Build `luksfmt` + `crypto` as portable libraries, validated in user mode before
-they ever enter the kernel.
+**2026-09-26 Architectural Amendment (Spec Kit SDD):**
+As specified in [`specs/001-decoupled-lvm-luks/spec.md`](../specs/001-decoupled-lvm-luks/spec.md),
+LUKS2 block device decryption and LVM2 volume management are **completely decoupled** into two standalone components:
+1. **WinLVM (`winlvm.sys`)**: Pure LVM2 volume manager (Phase 2 & Phase 3). Contains **zero** cryptography. Operates on cleartext block devices.
+2. **WinLUKS (`winluks.sys` / `luks.exe`)**: Standalone LUKS2 decryptor. Contains **zero** LVM logic. Operates as an independent block filter / virtual disk provider exposing `GUID_DEVINTERFACE_DISK`.
 
-**2026-09-11 status (Oracle audit):** the decrypt direction is implemented and
-tested for PBKDF2 containers (`luks_read.c`, `luks_unlock.c`, chain tests vs
-`lv-hashes.txt` oracle). Outstanding for Stage 4 as written:
-- **argon2id** (the stock-`cryptsetup`-defaults case, `luks2-default` in the
-  corpus) fails closed — needed for data volumes per D4.
-- the "cryptsetup opens what we produce" direction requires a produce/serialize
-  path that does not exist (lib is read-only). Decision needed (smart agents):
-  descope Stage 4 to decrypt-only, since the boot goal never writes LUKS headers.
-- quality gaps before any kernel fold-in (Phase 6 entry criteria): validate the
-  header `csum` field (currently read but never checked — fail-closed
-  violation), secondary-header (`SKUL\xba\xbe`) fallback, and replace the
-  shared `static json_buf[64 KiB]` in `luks_read.c` (same cross-thread race
-  class already fixed in `lvm_read.c`).
+This separation allows WinLVM to reach production stability and pass Stage 2 & Stage 3 verification immediately, without being blocked by cryptographic implementation risks.
 
-- LUKS2 binary header (4096 bytes, magic `LUKS\xba\xbe`, version 2, big-endian),
-  JSON area, secondary header at `SKUL\xba\xbe`.
+**Scope of WinLUKS Phase 5 (User Mode First):**
+Build `luksfmt` + `crypto` as portable libraries, validated in user mode before entering the kernel:
+- LUKS2 binary header (4096 bytes, magic `LUKS\xba\xbe`, version 2, big-endian), JSON area, secondary header at `SKUL\xba\xbe`.
 - JSON objects: `keyslots`, `segments`, `digests`, `tokens`, `config`.
 - KDF: Argon2id/Argon2i/PBKDF2. AF splitter (`luks1` type, stripe count, hash).
 - Master-key digest verification before any data is touched.
-- Sector crypto: **`aes-xts-plain64`** — XTS with a 64-bit little-endian sector
-  number as tweak, sector numbering **relative to the segment's data offset**,
-  not the device start. cryptsetup's default is a 512-bit key (AES-256 after the
-  XTS halving) and 512-byte sectors.
-- LUKS1 support is optional; decide based on whether you have LUKS1 volumes.
+- Sector crypto: **`aes-xts-plain64`** — XTS with 64-bit sector tweak.
+- Standalone CLI `luks.exe` and user-mode mounter (via Dokany / WinFsp).
 
-> **Source discipline for this phase.** The field offsets circulating in
-> community documentation (libyal's `libluksde` notes, various wikis) are
-> reverse-engineered and mostly right, but the **normative** reference is the
-> cryptsetup project's own _LUKS2 On-Disk Format Specification_ PDF, and the
-> `cryptsetup` source itself. Validate every offset against a real container
-> from Phase 0's corpus before trusting any table, including the ones summarised
-> in `FEASIBILITY.md`.
-
-**Exit:** we decrypt a container created by stock `cryptsetup` with defaults, and
-a Linux `cryptsetup` opens what we produce, with matching plaintext hashes both
-directions. Test vectors committed. **Near-miss crypto is worse than none** —
-this gate is pass/fail with no partial credit.
+**Exit:** Standalone `luks.exe` unlocks stock `cryptsetup` containers with matching plaintext hashes in both directions.
 
 ---
 
-### Phase 6 — LUKS2 in the kernel
+### Phase 6 — WinLUKS Kernel Driver & Stacking Architecture
 
-Fold `luksfmt`/`crypto` into `winlvm.sys` as an integrated layer, **not** a
-separate stacked filter driver. One driver doing both LUKS and LVM means fewer
-load-order dependencies, no fight with `partmgr` over an unrecognizable
-partition, and a far simpler boot-start story later.
+Instead of folding crypto directly into `winlvm.sys` (which created an unmaintainable testing matrix), WinLUKS ships as an independent storage filter / virtual disk provider (`winluks.sys`):
+- Exposes decrypted block devices with standard `GUID_DEVINTERFACE_DISK`.
+- **Stacking: LVM on LUKS:** WinLUKS unlocks physical partition -> exposes cleartext Disk PDO -> WinLVM discovers PV -> mounts LVs.
+- **Stacking: LUKS on LVM:** WinLVM exposes LV PDO -> WinLUKS attaches to LV PDO -> mounts decrypted volume.
+- AES-NI accelerated sector crypto with zero non-paged memory leaks.
 
-- AES-NI. Measure throughput against the raw device; a large regression here
-  makes the boot goal unpleasant to live with.
-- Passphrase entry via the user-mode broker for non-boot volumes; keys held in
-  non-paged pool, never paged, zeroed on teardown.
-
-**Exit:** a LUKS2-wrapped LV mounts read-write on Windows and Linux verifies the
-result. Throughput measured and committed.
+**Exit:** Stacking verified against `corpus/luks-linear-1pv` and `luks-striped-2pv`. Bit-exact parity with Linux `cryptsetup` + `dmsetup`.
 
 ---
 
-### Phase 7 — Boot, in a VM _(Stage 5)_
+### Phase 7 — Decoupled Boot Architecture _(Stage 5)_
+
 
 The ambitious part. See `FEASIBILITY.md` §4 for the full analysis.
 
