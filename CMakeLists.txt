@@ -48,6 +48,8 @@ add_library(lvmfmt STATIC
   src/lvmfmt/label.cpp
   src/lvmfmt/metadata.cpp
   src/lvmfmt/mapping.cpp
+  src/lvmfmt/allocator.cpp
+  src/lvmfmt/commit.cpp
 )
 target_include_directories(lvmfmt PUBLIC src/lvmfmt/include)
 
@@ -57,8 +59,15 @@ target_include_directories(lvmfmt PUBLIC src/lvmfmt/include)
 add_executable(lvmdump src/tools/lvmdump/main.cpp)
 target_link_libraries(lvmdump PRIVATE lvmfmt)
 
-# lvm.exe — bounded multi-call offline metadata CLI.
-add_executable(lvm src/tools/lvm/main.cpp)
+# lvm.exe — comprehensive LVM2 CLI control plane.
+add_executable(lvm
+  src/tools/lvm/main.cpp
+  src/tools/lvm/cmd_pv.cpp
+  src/tools/lvm/cmd_vg.cpp
+  src/tools/lvm/cmd_lv.cpp
+  src/tools/lvm/cmd_misc.cpp
+)
+target_include_directories(lvm PRIVATE src/tools/lvm)
 target_link_libraries(lvm PRIVATE lvmfmt)
 
 # ---------------------------------------------------------------------------
@@ -197,6 +206,7 @@ add_executable(winlvm_tests
   tests/test_service.cpp
   tests/test_lvm_cli.cpp
   tests/test_mount_ioctl.cpp
+  tests/test_lvm_control_plane.cpp
 )
 target_include_directories(winlvm_tests PRIVATE src)
 target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol)

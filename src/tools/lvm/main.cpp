@@ -6,6 +6,7 @@
 #include "lvmfmt/metadata.h"
 #include "lvmfmt/mapping.h"
 #include "lvmfmt/source.h"
+#include "subcommands.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -23,7 +24,9 @@ struct Image {
 
 int usage() {
   std::cerr << "usage: lvm.exe --image PATH {pvs|vgs|lvs|dump}\n"
-            << "       lvm.exe {version|pvs|vgs|lvs|vgscan|pvscan}\n";
+            << "       lvm.exe {version|pvs|vgs|lvs|vgscan|pvscan}\n"
+            << "       lvm.exe <command> [args...]\n"
+            << "       lvm.exe help [command]\n";
   return 2;
 }
 
@@ -165,24 +168,89 @@ int main(int argc, char** argv) {
   if (argc < 2) return usage();
   const std::string command = argv[1];
 
-  if (command == "version") {
+  std::vector<std::string> sub_args;
+  for (int i = 2; i < argc; i++) {
+    sub_args.emplace_back(argv[i]);
+  }
+
+  if (command == "--help" || command == "-h") {
+    return lvmfmt::cmd_help(sub_args);
+  }
+  if (command == "help") {
+    return lvmfmt::cmd_help(sub_args);
+  }
+  if (command == "version" || command == "--version") {
 #ifdef _WIN32
     return online_version();
 #else
-    std::cout << "WinLVM CLI version 1.0 (Windows LVM2 Subsystem)\n";
-    return 0;
+    return lvmfmt::cmd_version(sub_args);
 #endif
   }
 
+  // Backwards compatibility with offline checks when no extra arguments are passed
+  if (argc == 2) {
 #ifdef _WIN32
-  if (command == "pvs" || command == "vgs" || command == "lvs") return online_inventory();
-  if (command == "vgscan" || command == "pvscan" || command == "refresh") return online_vgscan();
+    if (command == "pvs" || command == "vgs" || command == "lvs") return online_inventory();
+    if (command == "vgscan" || command == "pvscan" || command == "refresh") return online_vgscan();
 #else
-  if (command == "pvs" || command == "vgs" || command == "lvs" || command == "dump") {
-    std::cerr << "error: --image is required; online device mode is unsupported\n";
-    return 2;
-  }
+    if (command == "pvs" || command == "vgs" || command == "lvs" || command == "dump") {
+      std::cerr << "error: --image is required; online device mode is unsupported\n";
+      return 2;
+    }
+    if (command == "vgscan") {
+      return usage();
+    }
 #endif
+  }
+
+  // PV subcommands
+  if (command == "pvcreate") return lvmfmt::cmd_pvcreate(sub_args);
+  if (command == "pvremove") return lvmfmt::cmd_pvremove(sub_args);
+  if (command == "pvs") return lvmfmt::cmd_pvs(sub_args);
+  if (command == "pvdisplay") return lvmfmt::cmd_pvdisplay(sub_args);
+  if (command == "pvscan") return lvmfmt::cmd_pvscan(sub_args);
+  if (command == "pvresize") return lvmfmt::cmd_pvresize(sub_args);
+  if (command == "pvchange") return lvmfmt::cmd_pvchange(sub_args);
+  if (command == "pvmove") return lvmfmt::cmd_pvmove(sub_args);
+  if (command == "pvck") return lvmfmt::cmd_pvck(sub_args);
+
+  // VG subcommands
+  if (command == "vgcreate") return lvmfmt::cmd_vgcreate(sub_args);
+  if (command == "vgremove") return lvmfmt::cmd_vgremove(sub_args);
+  if (command == "vgs") return lvmfmt::cmd_vgs(sub_args);
+  if (command == "vgdisplay") return lvmfmt::cmd_vgdisplay(sub_args);
+  if (command == "vgscan") return lvmfmt::cmd_vgscan(sub_args);
+  if (command == "vgchange") return lvmfmt::cmd_vgchange(sub_args);
+  if (command == "vgextend") return lvmfmt::cmd_vgextend(sub_args);
+  if (command == "vgreduce") return lvmfmt::cmd_vgreduce(sub_args);
+  if (command == "vgrename") return lvmfmt::cmd_vgrename(sub_args);
+  if (command == "vgcfgbackup") return lvmfmt::cmd_vgcfgbackup(sub_args);
+  if (command == "vgcfgrestore") return lvmfmt::cmd_vgcfgrestore(sub_args);
+  if (command == "vgck") return lvmfmt::cmd_vgck(sub_args);
+  if (command == "vgexport") return lvmfmt::cmd_vgexport(sub_args);
+  if (command == "vgimport") return lvmfmt::cmd_vgimport(sub_args);
+
+  // LV subcommands
+  if (command == "lvcreate") return lvmfmt::cmd_lvcreate(sub_args);
+  if (command == "lvremove") return lvmfmt::cmd_lvremove(sub_args);
+  if (command == "lvs") return lvmfmt::cmd_lvs(sub_args);
+  if (command == "lvdisplay") return lvmfmt::cmd_lvdisplay(sub_args);
+  if (command == "lvscan") return lvmfmt::cmd_lvscan(sub_args);
+  if (command == "lvchange") return lvmfmt::cmd_lvchange(sub_args);
+  if (command == "lvextend") return lvmfmt::cmd_lvextend(sub_args);
+  if (command == "lvreduce") return lvmfmt::cmd_lvreduce(sub_args);
+  if (command == "lvresize") return lvmfmt::cmd_lvresize(sub_args);
+  if (command == "lvrename") return lvmfmt::cmd_lvrename(sub_args);
+  if (command == "lvconvert") return lvmfmt::cmd_lvconvert(sub_args);
+
+  // Misc subcommands
+  if (command == "dumpconfig") return lvmfmt::cmd_dumpconfig(sub_args);
+  if (command == "formats") return lvmfmt::cmd_formats(sub_args);
+  if (command == "segtypes") return lvmfmt::cmd_segtypes(sub_args);
+  if (command == "tags") return lvmfmt::cmd_tags(sub_args);
+  if (command == "systemid") return lvmfmt::cmd_systemid(sub_args);
+  if (command == "lvmdiskscan") return lvmfmt::cmd_lvmdiskscan(sub_args);
+  if (command == "lvmdump") return lvmfmt::cmd_lvmdump(sub_args);
 
   return usage();
 }
