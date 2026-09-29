@@ -97,8 +97,15 @@ const PhysicalVolume* VolumeGroup::find_pv(std::string_view key) const {
 }
 
 const PhysicalVolume* VolumeGroup::find_pv_by_uuid(std::string_view uuid) const {
+  auto strip_hyphens = [](std::string_view s) {
+    std::string out;
+    out.reserve(32);
+    for (char c : s) if (c != '-') out.push_back(c);
+    return out;
+  };
+  std::string target = strip_hyphens(uuid);
   for (const auto& pv : pvs) {
-    if (pv.id == uuid) return &pv;
+    if (strip_hyphens(pv.id) == target) return &pv;
   }
   return nullptr;
 }
