@@ -7,6 +7,13 @@
 #include "lvmfmt/mapping.h"
 #include "lvmfmt/source.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winioctl.h>
+#include "../../winlvm_ioctl.h"
+#endif
+
 namespace {
 struct Image {
   lvmfmt::PvLabel label;
@@ -15,7 +22,8 @@ struct Image {
 };
 
 int usage() {
-  std::cerr << "usage: lvm.exe --image PATH {pvs|vgs|lvs|dump}\n";
+  std::cerr << "usage: lvm.exe --image PATH {pvs|vgs|lvs|dump}\n"
+            << "       lvm.exe {version|pvs|vgs|lvs|vgscan|pvscan}\n";
   return 2;
 }
 
@@ -73,26 +81,108 @@ int print_dump(const Image& image) {
             << image.metadata;
   return 0;
 }
+
+#ifdef _WIN32
+HANDLE open_control_device() {
+  return CreateFileW(WINLVM_USER_DEVICE_NAME,
+                     GENERIC_READ | GENERIC_WRITE,
+                     0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+int online_version() {
+  std::cout << "WinLVM CLI version 1.0 (Windows LVM2 Subsystem)\n";
+  HANDLE h = open_control_device();
+  if (h != INVALID_HANDLE_VALUE) {
+    std::cout << "Driver status: online (\\Device\\WinLvmControl connected)\n";
+    CloseHandle(h);
+  } else {
+    std::cout << "Driver status: offline / service stopped (error " << GetLastError() << ")\n";
+  }
+  return 0;
+}
+
+int online_vgscan() {
+  HANDLE h = open_control_device();
+  if (h == INVALID_HANDLE_VALUE) {
+    std::cerr << "error: WinLVM driver control device unavailable (error " << GetLastError() << ")\n";
+    return 5;
+  }
+  std::cout << "Re-probing physical volume disk interfaces...\n";
+  WINLVM_CONTROL_REQUEST req{1, sizeof(WINLVM_CONTROL_REQUEST)};
+  DWORD ret = 0;
+  if (!DeviceIoControl(h, IOCTL_WINLVM_REFRESH, &req, sizeof(req), nullptr, 0, &ret, nullptr)) {
+    std::cerr << "error: failed to trigger driver refresh (error " << GetLastError() << ")\n";
+    CloseHandle(h);
+    return 5;
+  }
+  std::cout << "Disk interface re-probe completed successfully.\n";
+  CloseHandle(h);
+  return 0;
+}
+
+int online_inventory() {
+  HANDLE h = open_control_device();
+  if (h == INVALID_HANDLE_VALUE) {
+    std::cerr << "error: WinLVM driver control device unavailable (error " << GetLastError() << ")\n";
+    return 5;
+  }
+  WINLVM_CONTROL_REQUEST req{1, sizeof(WINLVM_CONTROL_REQUEST)};
+  WINLVM_INVENTORY inv{};
+  DWORD ret = 0;
+  if (!DeviceIoControl(h, IOCTL_WINLVM_INVENTORY, &req, sizeof(req), &inv, sizeof(inv), &ret, nullptr)) {
+    std::cerr << "error: failed to query inventory from driver (error " << GetLastError() << ")\n";
+    CloseHandle(h);
+    return 5;
+  }
+  std::cout << "WinLVM Inventory:\n"
+            << "  Version: " << inv.version << "\n"
+            << "  Active records: " << inv.record_count << "\n";
+  CloseHandle(h);
+  return 0;
+}
+#endif
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3 || std::string(argv[1]) != "--image") {
+  if (argc >= 3 && std::string(argv[1]) == "--image") {
+    if (argc != 4) return usage();
+    const std::string path = argv[2];
+    const std::string command = argv[3];
+    if (command != "pvs" && command != "vgs" && command != "lvs" && command != "dump") return usage();
+
+    Image image;
+    std::string error;
+    if (!load_image(path, image, error)) {
+      std::cerr << "error: " << error << "\n";
+      return 1;
+    }
+    if (command == "pvs") return print_pvs(image);
+    if (command == "vgs") return print_vgs(image);
+    if (command == "lvs") return print_lvs(image);
+    return print_dump(image);
+  }
+
+  if (argc < 2) return usage();
+  const std::string command = argv[1];
+
+  if (command == "version") {
+#ifdef _WIN32
+    return online_version();
+#else
+    std::cout << "WinLVM CLI version 1.0 (Windows LVM2 Subsystem)\n";
+    return 0;
+#endif
+  }
+
+#ifdef _WIN32
+  if (command == "pvs" || command == "vgs" || command == "lvs") return online_inventory();
+  if (command == "vgscan" || command == "pvscan" || command == "refresh") return online_vgscan();
+#else
+  if (command == "pvs" || command == "vgs" || command == "lvs" || command == "dump") {
     std::cerr << "error: --image is required; online device mode is unsupported\n";
     return 2;
   }
-  if (argc != 4) return usage();
-  const std::string path = argv[2];
-  const std::string command = argv[3];
-  if (command != "pvs" && command != "vgs" && command != "lvs" && command != "dump") return usage();
+#endif
 
-  Image image;
-  std::string error;
-  if (!load_image(path, image, error)) {
-    std::cerr << "error: " << error << "\n";
-    return 1;
-  }
-  if (command == "pvs") return print_pvs(image);
-  if (command == "vgs") return print_vgs(image);
-  if (command == "lvs") return print_lvs(image);
-  return print_dump(image);
+  return usage();
 }

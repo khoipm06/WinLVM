@@ -1,0 +1,76 @@
+#ifndef WINLVM_IOCTL_H
+#define WINLVM_IOCTL_H
+
+#if defined(_WIN32) && !defined(_KERNEL_MODE)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#elif defined(_KERNEL_MODE)
+/* ntddk.h / wdm.h */
+#else
+#include <stddef.h>
+#include <stdint.h>
+
+#ifndef CTL_CODE
+#define CTL_CODE(DeviceType, Function, Method, Access) \
+    (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+#endif
+#ifndef FILE_DEVICE_UNKNOWN
+#define FILE_DEVICE_UNKNOWN 0x00000022
+#endif
+#ifndef METHOD_BUFFERED
+#define METHOD_BUFFERED 0
+#endif
+#ifndef FILE_READ_DATA
+#define FILE_READ_DATA 0x0001
+#endif
+#ifndef FILE_WRITE_DATA
+#define FILE_WRITE_DATA 0x0002
+#endif
+
+typedef uint32_t ULONG;
+typedef uint64_t ULONGLONG;
+typedef char     CHAR;
+typedef wchar_t  WCHAR;
+#endif
+
+#define WINLVM_CONTROL_DEVICE_NAME L"\\Device\\WinLvmControl"
+#define WINLVM_CONTROL_DOS_NAME    L"\\DosDevices\\WinLvmControl"
+#define WINLVM_USER_DEVICE_NAME    L"\\\\.\\WinLvmControl"
+
+#define IOCTL_WINLVM_INVENTORY      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_REFRESH        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_QUIESCE_VG     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_RESUME_VG      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_ACTIVATE_LV    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_DEACTIVATE_LV  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_UPDATE_LV      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_WINLVM_GET_LOG        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_DATA)
+
+#pragma pack(push, 8)
+
+typedef struct _WINLVM_CONTROL_REQUEST {
+    ULONG version;
+    ULONG size;
+} WINLVM_CONTROL_REQUEST, *PWINLVM_CONTROL_REQUEST;
+
+typedef struct _WINLVM_INVENTORY {
+    ULONG version;
+    ULONG size;
+    ULONG record_count;
+    ULONG reserved;
+} WINLVM_INVENTORY, *PWINLVM_INVENTORY;
+
+typedef struct _WINLVM_UPDATE_LV_REQUEST {
+    WINLVM_CONTROL_REQUEST header;
+    CHAR lv_uuid[32];
+    ULONGLONG byte_size;
+    ULONG logical_sector;
+    ULONG physical_sector;
+} WINLVM_UPDATE_LV_REQUEST, *PWINLVM_UPDATE_LV_REQUEST;
+
+#pragma pack(pop)
+
+#endif /* WINLVM_IOCTL_H */
