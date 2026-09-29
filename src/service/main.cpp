@@ -9,7 +9,7 @@
 
 #include "protocol.h"
 #ifdef _WIN32
-#include "../driver/winlvm.h"
+#include "../winlvm_ioctl.h"
 #endif
 
 #ifdef _WIN32
@@ -49,6 +49,7 @@ void serve_client(HANDLE pipe) {
   }
   write_exact(pipe, &result, sizeof result);
 }
+}  // namespace
 #endif
 
 #ifdef _WIN32
