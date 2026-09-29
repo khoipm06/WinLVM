@@ -1,2 +1,0 @@
-  VG     VG UUID                                Ext     #Ext Seq System ID #PV #LV
-  vgluks y5q6BL-Kglf-NeSU-k6m9-RZKo-dNiS-GrsvN1 4194304   27   2             1   1

@@ -1,7 +1,6 @@
 /*
  * winlvm_types.h — shared freestanding types for the winlvm C layer.
- * Single definition of winlvm_byte_source so lvmfmt and luksfmt compose
- * (LUKS view feeding the LVM parser) without duplicate-typedef conflicts.
+ * Freestanding definition of winlvm_byte_source for disk and file I/O.
  */
 #ifndef WINLVM_TYPES_H
 #define WINLVM_TYPES_H
