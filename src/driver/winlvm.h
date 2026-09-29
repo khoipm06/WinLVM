@@ -256,8 +256,12 @@ typedef struct {
 /* Globals (winlvm.c). */
 extern WINLVM_BUS_EXT *g_bus_ext;      /* set by AddDevice, cleared on REMOVE */
 extern PVOID            g_disk_notify_cookie;
+extern PVOID            g_volume_notify_cookie;
 extern PDEVICE_OBJECT   g_control_device;
 extern BOOLEAN          g_control_link_created;
+
+NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject);
+VOID WinLvmUnregisterDiskNotify(VOID);
 
 /* Dispatchers. */
 DRIVER_INITIALIZE DriverEntry;

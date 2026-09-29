@@ -103,21 +103,50 @@ static void WinLvmQuerySectorSize(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_fil
 
 static NTSTATUS WinLvmQueueProbeForInterface(const UNICODE_STRING *ifname);
 
-static NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
-    if (g_disk_notify_cookie) return STATUS_SUCCESS;
-    NTSTATUS status = IoRegisterPlugPlayNotification(
-        EventCategoryDeviceInterfaceChange,
-        PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
-        (PVOID)&GUID_DEVINTERFACE_DISK,
-        DriverObject,
-        WinLvmPnpDiskNotify,
-        NULL,
-        &g_disk_notify_cookie);
-    if (!NT_SUCCESS(status))
-        WL_TRACE_1("register: notification registration failed 0x%x",
-                   (unsigned)status);
-    else
-        WL_TRACE("register: notification registered");
+VOID WinLvmUnregisterDiskNotify(VOID) {
+    if (g_disk_notify_cookie) {
+        IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
+        g_disk_notify_cookie = NULL;
+    }
+    if (g_volume_notify_cookie) {
+        IoUnregisterPlugPlayNotification(g_volume_notify_cookie);
+        g_volume_notify_cookie = NULL;
+    }
+}
+
+NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
+    NTSTATUS status = STATUS_SUCCESS;
+    if (!g_disk_notify_cookie) {
+        status = IoRegisterPlugPlayNotification(
+            EventCategoryDeviceInterfaceChange,
+            PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+            (PVOID)&GUID_DEVINTERFACE_DISK,
+            DriverObject,
+            WinLvmPnpDiskNotify,
+            NULL,
+            &g_disk_notify_cookie);
+        if (!NT_SUCCESS(status))
+            WL_TRACE_1("register: disk notification registration failed 0x%x",
+                       (unsigned)status);
+        else
+            WL_TRACE("register: disk notification registered");
+    }
+    if (!g_volume_notify_cookie) {
+        NTSTATUS vstatus = IoRegisterPlugPlayNotification(
+            EventCategoryDeviceInterfaceChange,
+            PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+            (PVOID)&GUID_DEVINTERFACE_VOLUME,
+            DriverObject,
+            WinLvmPnpDiskNotify,
+            NULL,
+            &g_volume_notify_cookie);
+        if (!NT_SUCCESS(vstatus))
+            WL_TRACE_1("register: volume notification registration failed 0x%x",
+                       (unsigned)vstatus);
+        else
+            WL_TRACE("register: volume notification registered");
+        if (NT_SUCCESS(status)) status = vstatus;
+    }
     return status;
 }
 
@@ -141,10 +170,7 @@ static VOID WinLvmRegisterWorker(PVOID context) {
      * then would leave a cookie pointing at a dead bus and block the next
      * devnode cycle from re-registering. */
     if (g_bus_ext) {
-        if (g_disk_notify_cookie) {
-            IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
-            g_disk_notify_cookie = NULL;
-        }
+        WinLvmUnregisterDiskNotify();
         NTSTATUS status = WinLvmRegisterDiskNotify(work->driver);
         if (!NT_SUCCESS(status))
             WL_TRACE_1("register worker: notification registration failed 0x%x",
@@ -211,7 +237,20 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID notificationStruct, PVOID context) {
     PDEVICE_INTERFACE_CHANGE_NOTIFICATION data =
         (PDEVICE_INTERFACE_CHANGE_NOTIFICATION)notificationStruct;
     UNREFERENCED_PARAMETER(context);
-    if (!data || !data->SymbolicLinkName) return STATUS_SUCCESS;
+    if (!data || !data->SymbolicLinkName || !data->SymbolicLinkName->Buffer) return STATUS_SUCCESS;
+
+    /* Filter out interfaces we must never probe:
+     * - Our own WinLvm child volume PDOs (prevents self-probing/recursion)
+     * - CD-ROM / DVD drives
+     * - VSS Volume Snapshots
+     */
+    if (wcsstr(data->SymbolicLinkName->Buffer, L"WinLvm") != NULL ||
+        wcsstr(data->SymbolicLinkName->Buffer, L"winlvm") != NULL ||
+        wcsstr(data->SymbolicLinkName->Buffer, L"CdRom") != NULL ||
+        wcsstr(data->SymbolicLinkName->Buffer, L"cdrom") != NULL ||
+        wcsstr(data->SymbolicLinkName->Buffer, L"VolumeSnapshot") != NULL) {
+        return STATUS_SUCCESS;
+    }
 
     /* Backing-disk surprise removal: the probe only listens to ARRIVALS,
      * so a removed PV left a live VG record pointing at a dead PDO — IRPs
@@ -308,19 +347,30 @@ wl_update_result WinLvmUpdateLvSeam(void *ctx, const char *lv_uuid) {
 void WinLvmProbeWorker(PVOID context) {
     WINLVM_PROBE_WORK *work = (WINLVM_PROBE_WORK *)context;
     WINLVM_BUS_EXT *bus = g_bus_ext;
-    WL_TRACE("probe worker start");
-
+    WL_TRACE_1("probe worker: ifname %wZ", &work->ifname);
     NTSTATUS pointer_status = IoGetDeviceObjectPointer(&work->ifname,
-                                                       FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+                                                       FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
                                                        &work->target_file,
                                                        &work->target_disk);
+    if (pointer_status == STATUS_ACCESS_DENIED || pointer_status == STATUS_MEDIA_WRITE_PROTECTED) {
+        pointer_status = IoGetDeviceObjectPointer(&work->ifname,
+                                                   FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+                                                   &work->target_file,
+                                                   &work->target_disk);
+    }
     if (!NT_SUCCESS(pointer_status)) {
+        WL_TRACE_1("probe worker: IoGetDeviceObjectPointer failed 0x%08x", (unsigned)pointer_status);
         ExFreePoolWithTag(work->ifname.Buffer, WINLVM_WIN_TAG);
         ExFreePoolWithTag(work, WINLVM_WIN_TAG);
         return;
     }
 
     if (bus) {
+        /* Defense-in-depth: never probe devices created by our own driver. */
+        if (work->target_disk->DriverObject == bus->fdo->DriverObject) {
+            WL_TRACE("probe: skipping our own driver device");
+            goto out;
+        }
         WINLVM_DISK_SOURCE dsrc;
         dsrc.disk_pdo = work->target_disk;
         dsrc.file = work->target_file;

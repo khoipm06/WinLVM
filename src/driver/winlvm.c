@@ -39,6 +39,7 @@ void WinLvmLog(const char *fmt, ...) {
  * arrival callback may fire before AddDevice, so it must be null-checked. */
 WINLVM_BUS_EXT *g_bus_ext = NULL;
 PVOID           g_disk_notify_cookie = NULL;
+PVOID           g_volume_notify_cookie = NULL;
 PDEVICE_OBJECT  g_control_device = NULL;
 BOOLEAN         g_control_link_created = FALSE;
 
@@ -104,10 +105,7 @@ void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
         IoDeleteDevice(g_control_device);
         g_control_device = NULL;
     }
-    if (g_disk_notify_cookie) {
-        IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
-        g_disk_notify_cookie = NULL;
-    }
+    WinLvmUnregisterDiskNotify();
     /* Child PDOs and VG records are torn down by IRP_MN_REMOVE_DEVICE /
      * IRP_MN_SURPRISE_REMOVAL on the bus FDO; DriverUnload runs only after
      * the last device stack is gone. */
@@ -320,6 +318,7 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             if (to_copy > 0 && Irp->AssociatedIrp.SystemBuffer) {
                 RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, g_kernel_log, to_copy);
             }
+            g_kernel_log_pos = 0;
             status = STATUS_SUCCESS;
             information = to_copy;
         }
@@ -369,22 +368,12 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                      * callback fires for all currently-present disks. */
                     if (g_bus_ext) {
                         WinLvmBusResetInactiveRecords(g_bus_ext);
-                        if (g_disk_notify_cookie) {
-                            IoUnregisterPlugPlayNotification(g_disk_notify_cookie);
-                            g_disk_notify_cookie = NULL;
-                        }
-                        NTSTATUS reg_status = IoRegisterPlugPlayNotification(
-                            EventCategoryDeviceInterfaceChange,
-                            PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
-                            (PVOID)&GUID_DEVINTERFACE_DISK,
-                            g_bus_ext->fdo->DriverObject,
-                            WinLvmPnpDiskNotify,
-                            NULL,
-                            &g_disk_notify_cookie);
+                        WinLvmUnregisterDiskNotify();
+                        NTSTATUS reg_status = WinLvmRegisterDiskNotify(g_bus_ext->fdo->DriverObject);
                         if (NT_SUCCESS(reg_status)) {
-                            WL_TRACE("refresh: disk notify re-registered");
+                            WL_TRACE("refresh: disk/volume notify re-registered");
                         } else {
-                            WL_TRACE_1("refresh: disk notify re-registration failed 0x%x",
+                            WL_TRACE_1("refresh: notify re-registration failed 0x%x",
                                        (unsigned)reg_status);
                         }
                     }

@@ -12,7 +12,6 @@
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext) {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
-    WL_TRACE_1("mount ioctl: 0x%08x", (unsigned)code);
 
     if (code == IOCTL_MOUNTDEV_QUERY_DEVICE_NAME) {
         /* MSDN contract (mountmgr/ni-mountmgr-ioctl_mountdev_query_device_name):
@@ -129,6 +128,34 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
         code == IOCTL_DISK_CHECK_VERIFY) {
         /* No removable media; the media is present whenever the PDO exists. */
         Irp->IoStatus.Information = 0;
+        return STATUS_SUCCESS;
+    }
+
+    if (code == IOCTL_DISK_IS_WRITABLE) {
+        const lvmcore_volume_group *view = ext->record ? ext->record->view : NULL;
+        if (view && view->system_id[0] != '\0') {
+            return STATUS_MEDIA_WRITE_PROTECTED;
+        }
+        Irp->IoStatus.Information = 0;
+        return STATUS_SUCCESS;
+    }
+
+    if (code == IOCTL_DISK_GET_PARTITION_INFO) {
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(PARTITION_INFORMATION)) {
+            Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        PPARTITION_INFORMATION p = (PPARTITION_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
+        RtlZeroMemory(p, sizeof(*p));
+        p->StartingOffset.QuadPart = 0;
+        p->PartitionLength.QuadPart = (LONGLONG)ext->byte_size;
+        p->HiddenSectors = 0;
+        p->PartitionNumber = 1;
+        p->PartitionType = 0x07; /* PARTITION_IFS */
+        p->BootIndicator = FALSE;
+        p->RecognizedPartition = TRUE;
+        p->RewritePartition = FALSE;
+        Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION);
         return STATUS_SUCCESS;
     }
 

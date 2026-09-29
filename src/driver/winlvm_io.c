@@ -58,6 +58,8 @@ size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) 
         if (avail > len) avail = len;
         RtlCopyMemory(buf, bounce + skip, avail);
         got = avail;
+    } else if (!NT_SUCCESS(status)) {
+        WL_TRACE_2("disk_source_read: off=%llu failed 0x%08x", start, (unsigned)status);
     }
     ExFreePoolWithTag(bounce, WINLVM_WIN_TAG);
     return got;
@@ -175,8 +177,13 @@ static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
                 transferred = Irp->IoStatus.Information;
             }
         } else {
-            /* Aligned write piece: MDL maps directly from parent buffer slice. */
+            /* Aligned write piece: MDL maps directly from parent buffer slice.
+             * Storage class drivers completing IRP_MJ_WRITE with STATUS_SUCCESS
+             * often return Information = 0 since disk write transfers are all-or-nothing. */
             transferred = Irp->IoStatus.Information;
+            if (transferred == 0) {
+                transferred = pc->len;
+            }
         }
 
         if (transferred < pc->len) {
