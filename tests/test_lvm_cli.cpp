@@ -52,3 +52,17 @@ TEST(lvm_cli_online_mode_fails_closed) {
   CHECK(status != 0);
   CHECK(output.find("--image is required") != std::string::npos);
 }
+
+TEST(lvm_cli_version_outputs_banner) {
+  int status = 0;
+  const std::string output = run(fs::path(WINLVM_LVM_EXE), "version", status);
+  CHECK_EQ(status, 0);
+  CHECK(output.find("WinLVM CLI version") != std::string::npos);
+}
+
+TEST(lvm_cli_vgscan_without_win32_fails_closed) {
+  int status = 0;
+  const std::string output = run(fs::path(WINLVM_LVM_EXE), "vgscan", status);
+  CHECK(status != 0);
+  CHECK(output.find("usage:") != std::string::npos);
+}
