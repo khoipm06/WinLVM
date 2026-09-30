@@ -667,6 +667,70 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     return FALSE;
 }
 
+NTSTATUS WinLvmBusActivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid) {
+    if (!bus || !lv_uuid) return STATUS_INVALID_PARAMETER;
+    KIRQL old;
+    KeAcquireSpinLock(&bus->lock, &old);
+    for (size_t i = 0; i < WL_VG_MAX; i++) {
+        wl_vg_record *r = &bus->vg_records[i];
+        const lvmcore_volume_group *view = r->view;
+        if (!view || r->pv_count == 0) continue;
+        for (size_t k = 0; k < view->lv_count; k++) {
+            if (RtlCompareMemory(view->lvs[k].id, lv_uuid, WL_VG_UUID_LEN) == WL_VG_UUID_LEN) {
+                if (wl_vg_lv_activated(r, k)) {
+                    KeReleaseSpinLock(&bus->lock, old);
+                    return STATUS_SUCCESS;
+                }
+                wl_vg_lv_set_activated(r, k, 1);
+                KeReleaseSpinLock(&bus->lock, old);
+                if (WinLvmProbeWorkerCreateLvPdo(bus, r, k)) {
+                    IoInvalidateDeviceRelations(bus->pdo, BusRelations);
+                    return STATUS_SUCCESS;
+                } else {
+                    KeAcquireSpinLock(&bus->lock, &old);
+                    wl_vg_lv_set_activated(r, k, 0);
+                    KeReleaseSpinLock(&bus->lock, old);
+                    return STATUS_UNSUCCESSFUL;
+                }
+            }
+        }
+    }
+    KeReleaseSpinLock(&bus->lock, old);
+    return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
+NTSTATUS WinLvmBusDeactivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid) {
+    if (!bus || !lv_uuid) return STATUS_INVALID_PARAMETER;
+    KIRQL old;
+    KeAcquireSpinLock(&bus->lock, &old);
+    WINLVM_LV_EXT *target = NULL;
+    for (size_t i = 0; i < bus->child_count; i++) {
+        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
+        const lvmcore_volume_group *view = lv->record ? lv->record->view : NULL;
+        if (view && lv->lv_index < view->lv_count &&
+            RtlCompareMemory(view->lvs[lv->lv_index].id, lv_uuid, WL_VG_UUID_LEN) == WL_VG_UUID_LEN) {
+            target = lv;
+            break;
+        }
+    }
+    if (!target) {
+        KeReleaseSpinLock(&bus->lock, old);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (target->record) {
+        wl_vg_lv_set_activated(target->record, target->lv_index, 0);
+    }
+    KeReleaseSpinLock(&bus->lock, old);
+
+    WinLvmIoGateBeginQuiesce(&target->io_gate);
+    if (target->ifname.Buffer) {
+        IoSetDeviceInterfaceState(&target->ifname, FALSE);
+    }
+    WinLvmIoGateResume(&target->io_gate, target->pdo);
+    IoInvalidateDeviceRelations(bus->pdo, BusRelations);
+    return STATUS_SUCCESS;
+}
+
 /* --------------------------------------------------------------- */
 /* Bus FDO PnP dispatch.                                            */
 /* --------------------------------------------------------------- */
@@ -797,7 +861,8 @@ static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     for (size_t i = 0; i < bus->child_count; i++) {
         WINLVM_LV_EXT *lext =
             (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
-        if (lext->record && wl_vg_lv_all_gone(lext->record, lext->lv_index))
+        if (lext->record && (wl_vg_lv_all_gone(lext->record, lext->lv_index) ||
+                             !wl_vg_lv_activated(lext->record, lext->lv_index)))
             continue;
         bus->children[n] = bus->children[i];
         if (n != i) bus->children[i] = NULL;

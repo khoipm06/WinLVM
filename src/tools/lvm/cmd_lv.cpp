@@ -3,6 +3,53 @@
 #include <iostream>
 #include <iomanip>
 #include <random>
+#include <cstring>
+#include <algorithm>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "../../winlvm_ioctl.h"
+
+namespace {
+void notify_driver_update_lv(const std::string& lv_uuid, std::uint64_t new_size_bytes) {
+    HANDLE h = CreateFileW(WINLVM_USER_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        WINLVM_UPDATE_LV_REQUEST req{};
+        req.header.version = 1;
+        req.header.size = sizeof(req);
+        size_t n = lv_uuid.size();
+        if (n >= sizeof(req.lv_uuid)) n = sizeof(req.lv_uuid) - 1;
+        std::memcpy(req.lv_uuid, lv_uuid.data(), n);
+        req.byte_size = new_size_bytes;
+        req.logical_sector = 512;
+        req.physical_sector = 512;
+        DWORD bytesRet = 0;
+        DeviceIoControl(h, IOCTL_WINLVM_UPDATE_LV, &req, sizeof(req), nullptr, 0, &bytesRet, nullptr);
+        CloseHandle(h);
+    }
+}
+
+bool notify_driver_activate_lv(const std::string& lv_uuid, bool activate) {
+    HANDLE h = CreateFileW(WINLVM_USER_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        WINLVM_UPDATE_LV_REQUEST req{};
+        req.header.version = 1;
+        req.header.size = sizeof(req);
+        size_t n = lv_uuid.size();
+        if (n >= sizeof(req.lv_uuid)) n = sizeof(req.lv_uuid) - 1;
+        std::memcpy(req.lv_uuid, lv_uuid.data(), n);
+        DWORD bytesRet = 0;
+        DWORD code = activate ? IOCTL_WINLVM_ACTIVATE_LV : IOCTL_WINLVM_DEACTIVATE_LV;
+        BOOL ok = DeviceIoControl(h, code, &req, sizeof(req), nullptr, 0, &bytesRet, nullptr);
+        CloseHandle(h);
+        return ok != FALSE;
+    }
+    return false;
+}
+} // namespace
+#endif
 
 namespace lvmfmt {
 
@@ -307,6 +354,22 @@ int cmd_lvchange(const std::vector<std::string>& args) {
         return 1;
     }
 
+    std::string lv_target = pos[0];
+    auto act_val = get_opt_value(args, "-a", "--activate");
+    if (!act_val) {
+        for (const auto& a : args) {
+            if (a == "-ay") { act_val = "y"; break; }
+            if (a == "-an") { act_val = "n"; break; }
+        }
+    }
+
+#ifdef _WIN32
+    if (act_val) {
+        bool activate = (*act_val == "y" || *act_val == "ey" || *act_val == "sy");
+        notify_driver_activate_lv(lv_target, activate);
+    }
+#endif
+
     std::cout << "  Logical volume \"" << pos[0] << "\" changed.\n";
     return 0;
 }
@@ -369,6 +432,15 @@ int cmd_lvextend(const std::vector<std::string>& args) {
         return 1;
     }
 
+#ifdef _WIN32
+    for (const auto& lv_item : loaded->vg.lvs) {
+        if (lv_item.name == lv_name) {
+            notify_driver_update_lv(lv_item.id, lv_item.extent_count() * ext_bytes);
+            break;
+        }
+    }
+#endif
+
     std::cout << "  Logical volume " << loaded->vg.name << "/" << lv_name << " successfully resized\n";
     return 0;
 }
@@ -430,6 +502,15 @@ int cmd_lvreduce(const std::vector<std::string>& args) {
         std::cerr << "error: failed to commit metadata: " << err << "\n";
         return 1;
     }
+
+#ifdef _WIN32
+    for (const auto& lv_item : loaded->vg.lvs) {
+        if (lv_item.name == lv_name) {
+            notify_driver_update_lv(lv_item.id, lv_item.extent_count() * ext_bytes);
+            break;
+        }
+    }
+#endif
 
     std::cout << "  Logical volume " << loaded->vg.name << "/" << lv_name << " successfully resized\n";
     return 0;

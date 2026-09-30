@@ -296,6 +296,8 @@ void WinLvmWmiInit(PDEVICE_OBJECT DeviceObject);
 DRIVER_DISPATCH WinLvmBusPnp;
 DRIVER_DISPATCH WinLvmChildPnp;
 void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus);
+NTSTATUS WinLvmBusActivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid);
+NTSTATUS WinLvmBusDeactivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid);
 
 /* winlvm_io.c */
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len);

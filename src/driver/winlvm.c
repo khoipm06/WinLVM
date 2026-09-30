@@ -304,8 +304,15 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 } else {
                     status = WinLvmIoGateBeginQuiesce(&target->io_gate);
                     if (status == STATUS_SUCCESS) {
-                        status = STATUS_NOT_SUPPORTED;
+                        target->byte_size = request->byte_size;
+                        if (request->logical_sector >= 512)
+                            target->logical_sector = request->logical_sector;
+                        if (request->physical_sector >= target->logical_sector)
+                            target->physical_sector = request->physical_sector;
+                        WL_TRACE_2("update lv: uuid %s new size %llu",
+                                   request->lv_uuid, request->byte_size);
                         WinLvmIoGateResume(&target->io_gate, target->pdo);
+                        status = STATUS_SUCCESS;
                     }
                 }
             }
@@ -378,6 +385,30 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                         }
                     }
                     status = STATUS_SUCCESS;
+                } else if (code == IOCTL_WINLVM_ACTIVATE_LV) {
+                    if (input_length >= sizeof(WINLVM_CONTROL_REQUEST) + WL_VG_UUID_LEN) {
+                        const WINLVM_UPDATE_LV_REQUEST *req =
+                            (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
+                        if (g_bus_ext) {
+                            status = WinLvmBusActivateLvByUuid(g_bus_ext, req->lv_uuid);
+                        } else {
+                            status = STATUS_DEVICE_NOT_READY;
+                        }
+                    } else {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                    }
+                } else if (code == IOCTL_WINLVM_DEACTIVATE_LV) {
+                    if (input_length >= sizeof(WINLVM_CONTROL_REQUEST) + WL_VG_UUID_LEN) {
+                        const WINLVM_UPDATE_LV_REQUEST *req =
+                            (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
+                        if (g_bus_ext) {
+                            status = WinLvmBusDeactivateLvByUuid(g_bus_ext, req->lv_uuid);
+                        } else {
+                            status = STATUS_DEVICE_NOT_READY;
+                        }
+                    } else {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                    }
                 } else {
                     status = STATUS_NOT_IMPLEMENTED;
                 }

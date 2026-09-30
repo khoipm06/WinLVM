@@ -118,7 +118,8 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
         }
 
-        BOOLEAN physically_removed = (lvext->record == NULL || lvext->record->dead);
+        BOOLEAN physically_removed = (lvext->record == NULL || lvext->record->dead ||
+                                      !wl_vg_lv_activated(lvext->record, lvext->lv_index));
         if (!physically_removed) {
             Irp->IoStatus.Status = STATUS_SUCCESS;
             IoCompleteRequest(Irp, IO_NO_INCREMENT);
