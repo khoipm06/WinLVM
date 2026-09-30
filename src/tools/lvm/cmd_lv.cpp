@@ -174,12 +174,21 @@ int cmd_lvcreate(const std::vector<std::string>& args) {
             return 1;
         }
 
+        std::uint32_t stripe_size_sectors = 128; // 64 KiB default stripe size
+        if (auto str_stripe_size = get_opt_value(args, "-I", "--stripesize")) {
+            std::string err_sz;
+            auto sz = parse_size_bytes(*str_stripe_size, err_sz);
+            if (sz && *sz >= 512) {
+                stripe_size_sectors = static_cast<std::uint32_t>(*sz / 512ULL);
+            }
+        }
+
         Segment seg;
         seg.start_extent = 0;
         seg.extent_count = extents_needed;
         seg.type = "striped";
         seg.stripe_count = stripes;
-        seg.stripe_size_sectors = 128; // 64 KiB default stripe size
+        seg.stripe_size_sectors = stripe_size_sectors;
         for (std::uint32_t s = 0; s < stripes; s++) {
             seg.stripes.push_back({stripe_allocs[s][0].pv_key, stripe_allocs[s][0].start_pe});
         }

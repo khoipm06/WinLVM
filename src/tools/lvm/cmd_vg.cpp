@@ -363,7 +363,7 @@ int cmd_vgrename(const std::vector<std::string>& args) {
 int cmd_vgcfgbackup(const std::vector<std::string>& args) {
     if (check_help_requested(args, "vgcfgbackup")) return 0;
 
-    auto pos = get_positional_args(args);
+    auto pos = get_positional_args(args, true);
     auto backup_file = get_opt_value(args, "-f", "--file");
     if (!backup_file) {
         backup_file = "vg_backup.vg";
@@ -399,7 +399,7 @@ int cmd_vgcfgrestore(const std::vector<std::string>& args) {
         return 1;
     }
 
-    auto pos = get_positional_args(args);
+    auto pos = get_positional_args(args, true);
     if (pos.empty()) {
         std::cerr << "error: vgcfgrestore requires target PV paths\n";
         return 1;

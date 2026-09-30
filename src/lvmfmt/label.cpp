@@ -103,7 +103,13 @@ std::optional<PvLabel> read_pv_label(ByteSource& source, std::string& error) {
     const std::uint64_t pvh_off = off + data_offset;
     const std::size_t pvh_len =
         static_cast<std::size_t>(std::min<std::uint64_t>(kLabelSize, source.size() - pvh_off));
-    if (!source.read_vec(pvh_off, pvh_len, pvh) || pvh.size() < 40) {
+    if (pvh_off + pvh_len <= scan) {
+      pvh.assign(head.data() + pvh_off, head.data() + pvh_off + pvh_len);
+    } else if (!source.read_vec(pvh_off, pvh_len, pvh)) {
+      error = "failed to read physical volume header";
+      return std::nullopt;
+    }
+    if (pvh.size() < 40) {
       error = "failed to read physical volume header";
       return std::nullopt;
     }

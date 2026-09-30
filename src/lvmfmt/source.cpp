@@ -107,29 +107,71 @@ class Win32DeviceSource final : public ByteSource {
 
   bool read(std::uint64_t offset, void* buffer, std::size_t length) override {
     if (length == 0) return true;
+    constexpr std::uint64_t kSector = 512;
+    std::uint64_t start_aligned = (offset / kSector) * kSector;
+    std::uint64_t end_aligned = ((offset + length + kSector - 1) / kSector) * kSector;
+    std::size_t aligned_len = static_cast<std::size_t>(end_aligned - start_aligned);
+
     LARGE_INTEGER li;
-    li.QuadPart = static_cast<LONGLONG>(offset);
+    li.QuadPart = static_cast<LONGLONG>(start_aligned);
     if (!SetFilePointerEx(handle_, li, nullptr, FILE_BEGIN)) return false;
 
+    if (offset == start_aligned && length == aligned_len) {
+      DWORD bytes_read = 0;
+      if (!ReadFile(handle_, buffer, static_cast<DWORD>(length), &bytes_read, nullptr)) {
+        return false;
+      }
+      return bytes_read == length;
+    }
+
+    std::vector<std::uint8_t> bounce(aligned_len);
     DWORD bytes_read = 0;
-    if (!ReadFile(handle_, buffer, static_cast<DWORD>(length), &bytes_read, nullptr)) {
+    if (!ReadFile(handle_, bounce.data(), static_cast<DWORD>(aligned_len), &bytes_read, nullptr)) {
       return false;
     }
-    return bytes_read == length;
+    if (bytes_read < (offset - start_aligned) + length) return false;
+    std::memcpy(buffer, bounce.data() + (offset - start_aligned), length);
+    return true;
   }
 
   bool write(std::uint64_t offset, const void* buffer, std::size_t length) override {
     if (length == 0) return true;
     if (!writable_) return false;
+    constexpr std::uint64_t kSector = 512;
+    std::uint64_t start_aligned = (offset / kSector) * kSector;
+    std::uint64_t end_aligned = ((offset + length + kSector - 1) / kSector) * kSector;
+    std::size_t aligned_len = static_cast<std::size_t>(end_aligned - start_aligned);
+
+    if (offset == start_aligned && length == aligned_len) {
+      LARGE_INTEGER li;
+      li.QuadPart = static_cast<LONGLONG>(offset);
+      if (!SetFilePointerEx(handle_, li, nullptr, FILE_BEGIN)) return false;
+
+      DWORD bytes_written = 0;
+      if (!WriteFile(handle_, buffer, static_cast<DWORD>(length), &bytes_written, nullptr)) {
+        return false;
+      }
+      return bytes_written == length;
+    }
+
+    std::vector<std::uint8_t> bounce(aligned_len, 0);
     LARGE_INTEGER li;
-    li.QuadPart = static_cast<LONGLONG>(offset);
+    li.QuadPart = static_cast<LONGLONG>(start_aligned);
+    if (!SetFilePointerEx(handle_, li, nullptr, FILE_BEGIN)) return false;
+
+    DWORD bytes_read = 0;
+    ReadFile(handle_, bounce.data(), static_cast<DWORD>(aligned_len), &bytes_read, nullptr);
+
+    std::memcpy(bounce.data() + (offset - start_aligned), buffer, length);
+
+    li.QuadPart = static_cast<LONGLONG>(start_aligned);
     if (!SetFilePointerEx(handle_, li, nullptr, FILE_BEGIN)) return false;
 
     DWORD bytes_written = 0;
-    if (!WriteFile(handle_, buffer, static_cast<DWORD>(length), &bytes_written, nullptr)) {
+    if (!WriteFile(handle_, bounce.data(), static_cast<DWORD>(aligned_len), &bytes_written, nullptr)) {
       return false;
     }
-    return bytes_written == length;
+    return bytes_written == aligned_len;
   }
 
   std::uint64_t size() const override { return size_; }
@@ -223,7 +265,7 @@ std::unique_ptr<ByteSource> open_storage_source(const std::string& path, bool re
   if (path.rfind("\\\\.\\", 0) == 0 || path.rfind("\\\\?\\", 0) == 0) {
     DWORD access = GENERIC_READ;
     if (read_write) access |= GENERIC_WRITE;
-    HANDLE h = CreateFileA(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE h = CreateFileA(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
       error = "failed to open device " + path + " (error " + std::to_string(GetLastError()) + ")";

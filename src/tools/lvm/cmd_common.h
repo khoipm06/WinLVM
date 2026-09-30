@@ -66,18 +66,20 @@ inline std::optional<std::string> get_opt_value(const std::vector<std::string>& 
     return std::nullopt;
 }
 
-inline std::vector<std::string> get_positional_args(const std::vector<std::string>& args) {
+inline std::vector<std::string> get_positional_args(const std::vector<std::string>& args, bool f_takes_value = false) {
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); i++) {
         if (args[i].rfind("-", 0) == 0) {
             // Check if it's an option that takes an argument
             if (args[i] == "-L" || args[i] == "-l" || args[i] == "-n" ||
                 args[i] == "-s" || args[i] == "-u" ||
-                (args[i] == "-f" && i + 1 < args.size() && args[i+1][0] != '-') ||
+                (f_takes_value && args[i] == "-f" && i + 1 < args.size() && args[i+1][0] != '-') ||
+                args[i] == "--file" ||
                 args[i] == "--uuid" || args[i] == "--setphysicalvolumesize" ||
                 args[i] == "--metadatasize" || args[i] == "--dataalignment" ||
                 args[i] == "--separator" || args[i] == "-o" || args[i] == "--options" ||
-                args[i] == "-i" || args[i] == "--stripes") {
+                args[i] == "-i" || args[i] == "--stripes" ||
+                args[i] == "-I" || args[i] == "--stripesize") {
                 i++; // skip value
             }
             continue;
