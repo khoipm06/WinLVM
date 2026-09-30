@@ -336,12 +336,28 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
                                             wl_vg_record *record,
                                             size_t lv_index);
 
-/* W3 UPDATE_LV seam, absent: keeps the OLD view serving (fail closed —
- * never free/fake under live children). Returns unavailable, so a
- * higher-seqno late arrival leaves the record stale with the old view. */
+/* W3 UPDATE_LV seam: quiesces the child I/O gate and allows geometry updates */
 wl_update_result WinLvmUpdateLvSeam(void *ctx, const char *lv_uuid) {
-    (void)ctx; (void)lv_uuid;
-    return WL_UPDATE_UNAVAILABLE;
+    WINLVM_BUS_EXT *bus = (WINLVM_BUS_EXT *)ctx;
+    if (!bus) bus = g_bus_ext;
+    if (!bus || !lv_uuid) return WL_UPDATE_UNAVAILABLE;
+
+    WINLVM_LV_EXT *target = NULL;
+    for (size_t i = 0; i < bus->child_count; i++) {
+        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
+        const lvmcore_volume_group *view = lv->record ? lv->record->view : NULL;
+        if (view && lv->lv_index < view->lv_count &&
+            RtlCompareMemory(view->lvs[lv->lv_index].id, lv_uuid, WL_VG_UUID_LEN) == WL_VG_UUID_LEN) {
+            target = lv;
+            break;
+        }
+    }
+    if (!target) return WL_UPDATE_OK;
+
+    NTSTATUS q_status = WinLvmIoGateBeginQuiesce(&target->io_gate);
+    if (!NT_SUCCESS(q_status)) return WL_UPDATE_UNAVAILABLE;
+    WinLvmIoGateResume(&target->io_gate, target->pdo);
+    return WL_UPDATE_OK;
 }
 
 void WinLvmProbeWorker(PVOID context) {
@@ -411,6 +427,8 @@ void WinLvmProbeWorker(PVOID context) {
             WL_TRACE_1("probe: lvmcore read_vg failed: %s", verr.message);
             goto out_block;
         }
+        WL_TRACE_3("probe parsed vg: name %s seqno %I64u lvs %u",
+                   vg_out->name, vg_out->seqno, (unsigned)vg_out->lv_count);
 
         /* Per-PV backing tag: interface link + disk PDO/file (referenced)
          * + native sector sizes (StorageAccessAlignmentProperty query —
@@ -442,8 +460,10 @@ void WinLvmProbeWorker(PVOID context) {
                                  vg_out->id) >= 0;
         wl_arrival_result res = wl_vg_arrival(
             bus->vg_records, WL_VG_MAX, &slot, vg_out,
-            label.pv_uuid, tag, WinLvmUpdateLvSeam, NULL,
+            label.pv_uuid, tag, WinLvmUpdateLvSeam, bus,
             newly, WL_VG_MAX_LVS, &newly_count);
+        WL_TRACE_3("probe arrival res %d slot %u newly %u",
+                   (int)res, (unsigned)slot, (unsigned)newly_count);
         /* View arena kept by the record only when it was stored: brand-new
          * record (created now) or a refs==0 reconcile swap. */
         int view_kept = (res == WL_ARR_RECONCILED) ||
@@ -470,12 +490,23 @@ void WinLvmProbeWorker(PVOID context) {
         if (res == WL_ARR_REJECTED || res == WL_ARR_DUPLICATE) {
             WinLvmFreePvTag(tag);
             tag = NULL;
-        } else if (res == WL_ARR_STALE_SEQNO) {
+        } else if (res == WL_ARR_STALE_SEQNO || res == WL_ARR_RECONCILED) {
             wl_vg_record *r = &bus->vg_records[slot];
             int kept = 0;
             for (size_t p = 0; p < r->pv_count; p++)
                 if (r->pv_tag[p] == tag) { kept = 1; break; }
             if (!kept) { WinLvmFreePvTag(tag); tag = NULL; }
+        }
+
+        if (res == WL_ARR_RECONCILED) {
+            wl_vg_record *r = &bus->vg_records[slot];
+            const lvmcore_volume_group *v = r->view;
+            for (size_t i = 0; i < bus->child_count; i++) {
+                WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
+                if (lext->record == r && v && lext->lv_index < v->lv_count) {
+                    lext->byte_size = wl_lv_byte_size(v, lext->lv_index);
+                }
+            }
         }
 
         /* Freshly-activatable LVs become child PDOs (single-PV backing
@@ -570,6 +601,7 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
         }
     }
     if (!table_ok || slot_count == 0) {
+        WL_TRACE_2("create lv pdo: table_ok %d slot_count %u FAILED", (int)table_ok, (unsigned)slot_count);
         return FALSE; /* missing backing / empty LV: no PDO */
     }
     if (min_logical == 0) min_logical = 512;
@@ -579,6 +611,7 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
      * with no volume rather than a lie of a device. */
     uint64_t byte_size = wl_lv_byte_size(view, lv_index);
     if (byte_size == 0) {
+        WL_TRACE("create lv pdo: byte_size 0 FAILED");
         return FALSE;
     }
 
@@ -655,6 +688,7 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
         wl_vg_ref(record); /* child-PDO refcount: reconciles refuse to swap
                             * a view under live children (refs == 0 gate) */
         KeReleaseSpinLock(&bus->lock, old);
+        WL_TRACE_2("create lv pdo: SUCCESS child %wZ total %u", &devName, (unsigned)bus->child_count);
         return TRUE;
     }
     /* over cap: undo rather than corrupt the array */

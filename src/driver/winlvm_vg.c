@@ -334,13 +334,13 @@ wl_arrival_result wl_vg_arrival(wl_vg_record *recs, size_t count,
     r = &recs[slot];
 
     /* ---------------- duplicate-arrival dedupe ---------------- */
-    /* Same PV UUID already PRESENT: no-op. This also covers a CLONED disk
-     * (different backing, same PV UUID): we cannot serve one PV from two
-     * backings — fail closed by ignoring the second. The glue logs the tag
-     * mismatch. Repeated arrivals must not re-create live children (v22). */
+    /* Same PV UUID already PRESENT with same/lower seqno: no-op.
+     * Higher-seqno arrivals must not be dropped as duplicates: they carry
+     * updated VG metadata that must go through reconciliation below. */
     {
         int pv_slot = wl_rec_pv_slot(r, pv_uuid);
-        if (pv_slot >= 0 && r->pv_state[pv_slot] == WL_PV_PRESENT)
+        if (pv_slot >= 0 && r->pv_state[pv_slot] == WL_PV_PRESENT &&
+            view->seqno <= r->seqno)
             return WL_ARR_DUPLICATE;
     }
 

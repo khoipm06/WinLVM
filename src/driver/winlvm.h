@@ -68,6 +68,7 @@ void WinLvmLog(const char *fmt, ...);
 #define WL_TRACE(msg) WinLvmLog("winlvm: " msg "\n")
 #define WL_TRACE_1(msg, a) WinLvmLog("winlvm: " msg "\n", a)
 #define WL_TRACE_2(msg, a, b) WinLvmLog("winlvm: " msg "\n", a, b)
+#define WL_TRACE_3(msg, a, b, c) WinLvmLog("winlvm: " msg "\n", a, b, c)
 
 /* Device ID and Hardware IDs reported by child LV PDOs.
  * WDM contract: DeviceID MUST have the form <enumerator>\<device-id> with a

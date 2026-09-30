@@ -59,7 +59,7 @@ size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) 
         RtlCopyMemory(buf, bounce + skip, avail);
         got = avail;
     } else if (!NT_SUCCESS(status)) {
-        WL_TRACE_2("disk_source_read: off=%llu failed 0x%08x", start, (unsigned)status);
+        WL_TRACE_2("disk_source_read: off=%I64u failed 0x%08x", start, (unsigned)status);
     }
     ExFreePoolWithTag(bounce, WINLVM_WIN_TAG);
     return got;

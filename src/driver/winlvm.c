@@ -309,7 +309,7 @@ NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                             target->logical_sector = request->logical_sector;
                         if (request->physical_sector >= target->logical_sector)
                             target->physical_sector = request->physical_sector;
-                        WL_TRACE_2("update lv: uuid %s new size %llu",
+                        WL_TRACE_2("update lv: uuid %s new size %I64u",
                                    request->lv_uuid, request->byte_size);
                         WinLvmIoGateResume(&target->io_gate, target->pdo);
                         status = STATUS_SUCCESS;

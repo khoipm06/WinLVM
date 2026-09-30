@@ -551,6 +551,30 @@ static void test_map_refusal(void) {
     CHECK("refusal-sticky", wl_map_next(&it, &pv, &b, &len) == -1);
 }
 
+static void test_reconcile_with_live_child_and_new_lv(void) {
+    wl_vg_registry_init(recs, WL_VG_MAX);
+    static lvmcore_physical_volume pv_r1[2], pv_r2[2];
+    static lvmcore_stripe st_r1[4][2], st_r2[4][2];
+    static lvmcore_segment sg_r1[4], sg_r2[4];
+    static lvmcore_logical_volume lv_r1[4], lv_r2[4];
+    static lvmcore_volume_group vgr1, vgr2;
+    vg_build(10, 1, &vgr1, pv_r1, st_r1, sg_r1, lv_r1);
+    vg_build(11, 2, &vgr2, pv_r2, st_r2, sg_r2, lv_r2);
+
+    size_t slot;
+    ARR(&vgr1, UUID_PV0, &tag0, NULL, NULL);
+    ARR(&vgr1, UUID_PV1, &tag1, NULL, NULL);
+    CHECK("rec-live-init-state", recs[slot].state == WL_VG_COMPLETE);
+    wl_vg_lv_set_activated(&recs[slot], 0, 1);
+    wl_vg_ref(&recs[slot]);
+
+    wl_arrival_result r = ARR(&vgr2, UUID_PV0, &tag0, seam_ok, NULL);
+    CHECK("rec-live-result", r == WL_ARR_RECONCILED);
+    CHECK("rec-live-newly-count", newly_count == 1);
+    CHECK("rec-live-newly-idx", newly_count > 0 && newly[0] == 3);
+    wl_vg_unref(&recs[slot]);
+}
+
 int main(void) {
     test_registry_and_arrival();
     test_activation_gating();
@@ -561,6 +585,7 @@ int main(void) {
     test_map_linear();
     test_map_striped();
     test_map_refusal();
+    test_reconcile_with_live_child_and_new_lv();
 
     printf("test_winlvm_vg: %d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;
