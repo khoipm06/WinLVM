@@ -17,8 +17,9 @@ size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len) 
      * STATUS_INVALID_PARAMETER and the probe silently gave up. Read an
      * aligned window and copy the requested part out. */
     if (len == 0 || off + len < off) return 0;
-    uint64_t start = off & ~511ULL;
-    uint64_t end = (off + len + 511ULL) & ~511ULL;
+    size_t sec = (src && src->sector_size >= 512) ? src->sector_size : 512;
+    uint64_t start = (off / sec) * sec;
+    uint64_t end = ((off + len + sec - 1) / sec) * sec;
     size_t window = (size_t)(end - start);
     size_t skip = (size_t)(off - start);
 

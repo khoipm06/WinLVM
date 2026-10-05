@@ -111,19 +111,39 @@ NTSTATUS WinLvmIoGateBeginQuiesce(WL_IO_GATE *gate) {
         return STATUS_INVALID_DEVICE_STATE;
     }
     gate->state = WL_IO_QUIESCING;
+    if (gate->active == 0) {
+        gate->state = WL_IO_QUIESCED;
+        KeReleaseSpinLock(&gate->lock, irql);
+        return STATUS_SUCCESS;
+    }
     KeReleaseSpinLock(&gate->lock, irql);
-    if (gate->active != 0) return STATUS_PENDING;
-    KeAcquireSpinLock(&gate->lock, &irql);
-    gate->state = WL_IO_QUIESCED;
-    KeReleaseSpinLock(&gate->lock, irql);
-    return STATUS_SUCCESS;
+
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -50000000LL; /* 5 seconds relative */
+        NTSTATUS wait_status = KeWaitForSingleObject(&gate->drained, Executive, KernelMode, FALSE, &timeout);
+        KeAcquireSpinLock(&gate->lock, &irql);
+        if (gate->state == WL_IO_QUIESCING && gate->active == 0) {
+            gate->state = WL_IO_QUIESCED;
+            KeReleaseSpinLock(&gate->lock, irql);
+            return STATUS_SUCCESS;
+        }
+        /* Draining timed out or aborted — reset to RUNNING */
+        gate->state = WL_IO_RUNNING;
+        KeReleaseSpinLock(&gate->lock, irql);
+        return (wait_status == STATUS_TIMEOUT) ? STATUS_TIMEOUT : STATUS_UNSUCCESSFUL;
+    }
+
+    return STATUS_PENDING;
 }
 
 void WinLvmIoGateResume(WL_IO_GATE *gate, PDEVICE_OBJECT DeviceObject) {
     PIRP irp;
     KIRQL irql;
     KeAcquireSpinLock(&gate->lock, &irql);
-    if (gate->state == WL_IO_QUIESCED) gate->state = WL_IO_RUNNING;
+    if (gate->state == WL_IO_QUIESCED || gate->state == WL_IO_QUIESCING) {
+        gate->state = WL_IO_RUNNING;
+    }
     KeReleaseSpinLock(&gate->lock, irql);
     while ((irp = IoCsqRemoveNextIrp(&gate->csq, NULL)) != NULL) {
         if (gate->dispatch) gate->dispatch(DeviceObject, irp);

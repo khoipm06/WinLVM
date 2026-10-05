@@ -252,6 +252,7 @@ typedef struct {
     PDEVICE_OBJECT  disk_pdo;
     PFILE_OBJECT    file;
     KEVENT          done;
+    ULONG           sector_size;
 } WINLVM_DISK_SOURCE;
 
 /* Globals (winlvm.c). */

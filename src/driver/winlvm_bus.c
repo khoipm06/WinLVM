@@ -151,22 +151,26 @@ NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
 }
 
 typedef struct {
+    KTIMER          timer;
+    KDPC            dpc;
     WORK_QUEUE_ITEM item;
     PDRIVER_OBJECT  driver;
 } WINLVM_REGISTER_WORK;
 
+static KDEFERRED_ROUTINE WinLvmRegisterDpcRoutine;
+static VOID WinLvmRegisterDpcRoutine(PKDPC Dpc, PVOID DeferredContext,
+                                     PVOID SystemArgument1, PVOID SystemArgument2) {
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+    WINLVM_REGISTER_WORK *work = (WINLVM_REGISTER_WORK *)DeferredContext;
+    ExQueueWorkItem(&work->item, DelayedWorkQueue);
+}
+
 static VOID WinLvmRegisterWorker(PVOID context) {
     WINLVM_REGISTER_WORK *work = (WINLVM_REGISTER_WORK *)context;
     WL_TRACE("register worker entry");
-    /* F10 fix: PnP START transaction holds devnode lock across post-start.
-     * DelayedWorkQueue can execute immediately on another core before PnP
-     * unwinds, so synchronous disk enumeration must wait until this delay
-     * lets the START transaction close completely. */
-    LARGE_INTEGER delay;
-    delay.QuadPart = -20000000LL;  /* 2 seconds relative (100ns units) */
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
-    WL_TRACE("register worker delay done");
-    /* Bus may have been removed while this worker sat queued: registering
+    /* Bus may have been removed while this timer/worker sat queued: registering
      * then would leave a cookie pointing at a dead bus and block the next
      * devnode cycle from re-registering. */
     if (g_bus_ext) {
@@ -387,9 +391,14 @@ void WinLvmProbeWorker(PVOID context) {
             WL_TRACE("probe: skipping our own driver device");
             goto out;
         }
+        ULONG logical_sec = 512, physical_sec = 512;
+        WinLvmQuerySectorSize(work->target_disk, work->target_file,
+                              &logical_sec, &physical_sec);
+
         WINLVM_DISK_SOURCE dsrc;
         dsrc.disk_pdo = work->target_disk;
         dsrc.file = work->target_file;
+        dsrc.sector_size = logical_sec;
         KeInitializeEvent(&dsrc.done, NotificationEvent, FALSE);
 
         /* Adapter: the lvmcore byte source has the same read-callback
@@ -445,8 +454,8 @@ void WinLvmProbeWorker(PVOID context) {
         work->ifname.Buffer = NULL; /* ownership moved into the tag */
         ObReferenceObject(work->target_disk);
         ObReferenceObject(work->target_file);
-        WinLvmQuerySectorSize(work->target_disk, work->target_file,
-                              &tag->logical_sector, &tag->physical_sector);
+        tag->logical_sector = logical_sec;
+        tag->physical_sector = physical_sec;
 
         /* Registry transitions run under the bus lock (the state machine
          * mutates only shared record slots). PDO creation happens after
@@ -560,7 +569,7 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     size_t slots[WL_VG_MAX_PVS];
     size_t slot_count = 0;
     ULONG max_stack = 0;
-    ULONG min_logical = 0, max_physical = 0;
+    ULONG max_logical = 0, max_physical = 0;
     BOOLEAN table_ok = TRUE;
     for (size_t s = 0; s < lv0->segment_count && table_ok; s++) {
         const lvmcore_segment *seg = &lv0->segments[s];
@@ -593,8 +602,8 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
                 slots[slot_count++] = slot;
                 if ((ULONG)tag->backing_pdo->StackSize > max_stack)
                     max_stack = (ULONG)tag->backing_pdo->StackSize;
-                if (min_logical == 0 || tag->logical_sector < min_logical)
-                    min_logical = tag->logical_sector;
+                if (tag->logical_sector > max_logical)
+                    max_logical = tag->logical_sector;
                 if (tag->physical_sector > max_physical)
                     max_physical = tag->physical_sector;
             }
@@ -604,8 +613,8 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
         WL_TRACE_2("create lv pdo: table_ok %d slot_count %u FAILED", (int)table_ok, (unsigned)slot_count);
         return FALSE; /* missing backing / empty LV: no PDO */
     }
-    if (min_logical == 0) min_logical = 512;
-    if (max_physical == 0) max_physical = min_logical;
+    if (max_logical == 0) max_logical = 512;
+    if (max_physical < max_logical) max_physical = max_logical;
 
     /* Overflow-safe total size; 0 = overflow or absent — fail closed
      * with no volume rather than a lie of a device. */
@@ -662,7 +671,7 @@ static BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
         ObReferenceObject(tag->backing_pdo);
         ObReferenceObject(tag->backing_file);
     }
-    ext->logical_sector = min_logical;
+    ext->logical_sector = max_logical;
     ext->physical_sector = max_physical;
     ext->byte_size = byte_size;
 
@@ -826,9 +835,13 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             WINLVM_REGISTER_WORK *work = ExAllocatePoolZero(NonPagedPool,
                 sizeof(WINLVM_REGISTER_WORK), WINLVM_WIN_TAG);
             if (work) {
-                ExInitializeWorkItem(&work->item, WinLvmRegisterWorker, work);
                 work->driver = DeviceObject->DriverObject;
-                ExQueueWorkItem(&work->item, DelayedWorkQueue);
+                KeInitializeTimer(&work->timer);
+                KeInitializeDpc(&work->dpc, WinLvmRegisterDpcRoutine, work);
+                ExInitializeWorkItem(&work->item, WinLvmRegisterWorker, work);
+                LARGE_INTEGER delay;
+                delay.QuadPart = -20000000LL; /* 2 seconds relative (100ns units) */
+                KeSetTimer(&work->timer, delay, &work->dpc);
             }
         }
         Irp->IoStatus.Status = st;
@@ -836,6 +849,7 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return st;
     }
     case IRP_MN_REMOVE_DEVICE: {
+        WinLvmUnregisterDiskNotify();
         for (size_t i = 0; i < ext->child_count; i++) {
             IoWMIRegistrationControl(ext->children[i], WMIREG_ACTION_DEREGISTER);
             WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)ext->children[i]->DeviceExtension;

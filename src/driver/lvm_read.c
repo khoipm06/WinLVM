@@ -798,6 +798,26 @@ static int parse_vg(const char *text, size_t text_len, winlvm_volume_group *vg,
 /* Public entry: winlvm_read_vg.                                       */
 /* ------------------------------------------------------------------ */
 
+static uint64_t peek_vg_seqno(const char *text, size_t text_len) {
+    parser ps;
+    p_init(&ps, text, text_len);
+    while (!p_eof(&ps)) {
+        p_skip(&ps);
+        if (p_eof(&ps)) break;
+        char ident[64];
+        if (!p_ident(&ps, ident, sizeof(ident))) { ps.pos++; continue; }
+        if (wl_streq(ident, "seqno")) {
+            p_skip(&ps);
+            if (ps.pos < ps.len && ps.p[ps.pos] == '=') {
+                ps.pos++;
+                uint64_t v = 0;
+                if (p_int(&ps, &v)) return v;
+            }
+        }
+    }
+    return 0;
+}
+
 int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
                    winlvm_lvm_err *err) {
     if (!err) return 0;
@@ -836,23 +856,24 @@ int winlvm_read_vg(winlvm_byte_source *src, winlvm_volume_group *vg,
     wl_zero(&local_err, sizeof(local_err));
     int got_text = 0;
     size_t text_len = 0;
+    uint64_t best_seqno = 0;
     int result = 0;
     for (size_t i = 0; i < WINLVM_MAX_MD_AREAS && label.metadata_areas[i].size != 0; i++) {
         winlvm_mda_header mda;
         if (!read_mda_header(src, &label.metadata_areas[i], &mda, &local_err)) continue;
         if (read_metadata_text(src, &label.metadata_areas[i], &mda, text, &text_len, &local_err)) {
-            got_text = 1;
-            break;
+            uint64_t cand_seqno = peek_vg_seqno(text, text_len);
+            if (!got_text || cand_seqno > best_seqno) {
+                wl_zero(vg, sizeof(*vg));
+                if (parse_vg(text, text_len, vg, &label, 0, 0)) {
+                    best_seqno = cand_seqno;
+                    got_text = 1;
+                    result = 1;
+                }
+            }
         }
     }
-    if (got_text) {
-        /* Step 4: parse. */
-        if (parse_vg(text, text_len, vg, &label, 0, 0)) {
-            result = 1;
-        } else {
-            wl_set_err(err, "no volume group section in metadata");
-        }
-    } else {
+    if (!result) {
         wl_set_err(err, local_err.failed ? local_err.message : "no readable metadata area");
     }
 #ifdef _KERNEL_MODE
