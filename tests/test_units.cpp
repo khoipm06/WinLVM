@@ -1,5 +1,6 @@
 #include <string>
 
+#include "lvmfmt/allocator.h"
 #include "lvmfmt/bytes.h"
 #include "lvmfmt/config.h"
 #include "lvmfmt/crc32.h"
@@ -220,4 +221,49 @@ TEST(vg_with_zero_extent_size_is_refused) {
   text.replace(pos, 18, "extent_size = 0   ");
   std::string error;
   CHECK(!parse_vg_metadata(text, error).has_value());
+}
+
+TEST(reduce_lv_enforces_striped_divisibility) {
+  VolumeGroup vg;
+  vg.name = "testvg";
+  vg.id = "vg-test-id";
+  vg.extent_size_sectors = 8192;
+  vg.seqno = 1;
+
+  PhysicalVolume pv0;
+  pv0.key = "pv0";
+  pv0.id = "pv0-uuid";
+  pv0.pe_count = 10;
+  vg.pvs.push_back(pv0);
+
+  PhysicalVolume pv1;
+  pv1.key = "pv1";
+  pv1.id = "pv1-uuid";
+  pv1.pe_count = 10;
+  vg.pvs.push_back(pv1);
+
+  LogicalVolume lv;
+  lv.name = "stripe_lv";
+  lv.id = "lv-stripe-id";
+
+  Segment seg;
+  seg.start_extent = 0;
+  seg.extent_count = 4;
+  seg.type = "striped";
+  seg.stripe_count = 2;
+  seg.stripe_size_sectors = 128;
+  seg.stripes.push_back({"pv0", 0});
+  seg.stripes.push_back({"pv1", 0});
+  lv.segments.push_back(seg);
+  vg.lvs.push_back(lv);
+
+  std::string err;
+  // Reducing by 1 leaves 3 extents, which is not divisible by stripe_count (2)
+  CHECK(!reduce_lv(vg, "stripe_lv", 1, err));
+  CHECK(err.find("cannot reduce striped segment to non-multiple of stripe count") != std::string::npos);
+
+  // Reducing by 2 leaves 2 extents (divisible by 2) -> must succeed
+  CHECK(reduce_lv(vg, "stripe_lv", 2, err));
+  CHECK_EQ(vg.lvs[0].extent_count(), std::uint64_t{2});
+  CHECK_EQ(vg.lvs[0].segments[0].extent_count, std::uint64_t{2});
 }

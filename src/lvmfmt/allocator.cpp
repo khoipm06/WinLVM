@@ -291,6 +291,11 @@ bool reduce_lv(VolumeGroup& vg,
             kept_segments.push_back(std::move(seg));
         } else if (accumulated < target_extents) {
             std::uint64_t keep = target_extents - accumulated;
+            if (seg.stripe_count > 1 && (keep % seg.stripe_count) != 0) {
+                error = "cannot reduce striped segment to non-multiple of stripe count (" +
+                        std::to_string(seg.stripe_count) + ")";
+                return false;
+            }
             seg.extent_count = keep;
             accumulated += keep;
             kept_segments.push_back(std::move(seg));

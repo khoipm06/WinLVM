@@ -4,6 +4,7 @@
 
 #include "lvmfmt/bytes.h"
 #include "lvmfmt/crc32.h"
+#include "lvmfmt/metadata.h"
 
 namespace lvmfmt {
 namespace {
@@ -230,6 +231,10 @@ std::optional<std::string> read_vg_metadata(ByteSource& source, const PvLabel& l
     return std::nullopt;
   }
   std::string last_error;
+  std::optional<std::string> best_text;
+  std::uint64_t best_seqno = 0;
+  bool found_any = false;
+
   for (const auto& area : label.metadata_areas) {
     std::string local;
     auto mda = read_mda_header(source, area, local);
@@ -242,8 +247,20 @@ std::optional<std::string> read_vg_metadata(ByteSource& source, const PvLabel& l
       last_error = local;
       continue;
     }
-    return text;
+    std::string parse_err;
+    auto vg = parse_vg_metadata(*text, parse_err);
+    if (vg) {
+      if (!found_any || vg->seqno > best_seqno) {
+        best_seqno = vg->seqno;
+        best_text = std::move(text);
+        found_any = true;
+      }
+    } else if (!found_any) {
+      best_text = std::move(text);
+      found_any = true;
+    }
   }
+  if (found_any) return best_text;
   error = last_error.empty() ? "no readable metadata area" : last_error;
   return std::nullopt;
 }

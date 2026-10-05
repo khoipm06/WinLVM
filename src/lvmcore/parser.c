@@ -1145,6 +1145,64 @@ lvmcore_status lvmcore_parse_vg_text(const char *text,
 /* 5. High-level single PV and multi-PV entry points                   */
 /* ------------------------------------------------------------------ */
 
+static bool lvmcore_find_best_mda(lvmcore_byte_source *src,
+                                  const lvmcore_pv_label *label,
+                                  uint32_t flags,
+                                  lvmcore_arena *arena,
+                                  char **text_out,
+                                  size_t *text_len_out,
+                                  bool *is_precommitted_out,
+                                  lvmcore_err *err) {
+    char *best_text = NULL;
+    size_t best_text_len = 0;
+    bool best_is_precommitted = false;
+    uint64_t best_seqno = 0;
+    bool got_text = false;
+    wl_zero(err, sizeof(*err));
+
+    for (size_t i = 0; i < label->metadata_area_count; i++) {
+        lvmcore_mda_header mda;
+        if (lvmcore_read_mda_header(src, &label->metadata_areas[i], arena, &mda, err) != LVMCORE_OK) {
+            continue;
+        }
+        char *cand_text = NULL;
+        size_t cand_text_len = 0;
+        bool cand_is_precommitted = false;
+        if (lvmcore_read_metadata_text(src, &label->metadata_areas[i], &mda, flags, arena,
+                                       &cand_text, &cand_text_len, &cand_is_precommitted, err) == LVMCORE_OK) {
+            size_t checkpoint = arena->offset;
+            lvmcore_volume_group *cand_vg = (lvmcore_volume_group *)lvmcore_arena_alloc_zero(arena, sizeof(lvmcore_volume_group), 8);
+            if (cand_vg && lvmcore_parse_vg_text(cand_text, cand_text_len, arena, cand_vg, err) == LVMCORE_OK) {
+                if (!got_text || cand_vg->seqno > best_seqno) {
+                    best_seqno = cand_vg->seqno;
+                    best_text = cand_text;
+                    best_text_len = cand_text_len;
+                    best_is_precommitted = cand_is_precommitted;
+                    got_text = true;
+                }
+            } else if (!got_text) {
+                best_text = cand_text;
+                best_text_len = cand_text_len;
+                best_is_precommitted = cand_is_precommitted;
+                got_text = true;
+            }
+            arena->offset = checkpoint;
+        }
+    }
+
+    if (!got_text) {
+        if (!err->failed) {
+            wl_set_err(err, LVMCORE_ERR_NO_VALID_MDA, "no readable metadata area found");
+        }
+        return false;
+    }
+
+    *text_out = best_text;
+    *text_len_out = best_text_len;
+    *is_precommitted_out = best_is_precommitted;
+    return true;
+}
+
 lvmcore_status lvmcore_read_vg(lvmcore_byte_source *src,
                                uint32_t flags,
                                lvmcore_arena *arena,
@@ -1166,30 +1224,12 @@ lvmcore_status lvmcore_read_vg(lvmcore_byte_source *src,
         return LVMCORE_ERR_NO_VALID_MDA;
     }
 
-    /* Step 2 & 3: Iterate through metadata areas, take the first valid one */
+    /* Step 2 & 3: Iterate through metadata areas, select highest seqno */
     char *text = NULL;
     size_t text_len = 0;
     bool is_precommitted = false;
-    bool got_text = false;
-    lvmcore_err local_err;
-    wl_zero(&local_err, sizeof(local_err));
-
-    for (size_t i = 0; i < label.metadata_area_count; i++) {
-        lvmcore_mda_header mda;
-        if (lvmcore_read_mda_header(src, &label.metadata_areas[i], arena, &mda, &local_err) != LVMCORE_OK) {
-            continue;
-        }
-        if (lvmcore_read_metadata_text(src, &label.metadata_areas[i], &mda, flags, arena,
-                                       &text, &text_len, &is_precommitted, &local_err) == LVMCORE_OK) {
-            got_text = true;
-            break;
-        }
-    }
-
-    if (!got_text) {
-        wl_set_err(err, local_err.failed ? local_err.status : LVMCORE_ERR_NO_VALID_MDA,
-                   local_err.failed ? local_err.message : "no readable metadata area found");
-        return local_err.failed ? local_err.status : LVMCORE_ERR_NO_VALID_MDA;
+    if (!lvmcore_find_best_mda(src, &label, flags, arena, &text, &text_len, &is_precommitted, err)) {
+        return err->failed ? err->status : LVMCORE_ERR_NO_VALID_MDA;
     }
 
     /* Step 4: Parse metadata text */

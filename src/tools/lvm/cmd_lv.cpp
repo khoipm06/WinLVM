@@ -183,16 +183,42 @@ int cmd_lvcreate(const std::vector<std::string>& args) {
             }
         }
 
-        Segment seg;
-        seg.start_extent = 0;
-        seg.extent_count = extents_needed;
-        seg.type = "striped";
-        seg.stripe_count = stripes;
-        seg.stripe_size_sectors = stripe_size_sectors;
-        for (std::uint32_t s = 0; s < stripes; s++) {
-            seg.stripes.push_back({stripe_allocs[s][0].pv_key, stripe_allocs[s][0].start_pe});
+        std::vector<std::size_t> chunk_idx(stripes, 0);
+        std::vector<std::uint64_t> chunk_off(stripes, 0);
+        std::uint64_t cur_le = 0;
+
+        while (cur_le < extents_needed) {
+            std::uint64_t run_len = UINT64_MAX;
+            for (std::uint32_t s = 0; s < stripes; s++) {
+                if (chunk_idx[s] >= stripe_allocs[s].size()) {
+                    run_len = 0;
+                    break;
+                }
+                std::uint64_t avail = stripe_allocs[s][chunk_idx[s]].count - chunk_off[s];
+                if (avail < run_len) run_len = avail;
+            }
+            if (run_len == 0 || run_len == UINT64_MAX) {
+                std::cerr << "error: internal allocation mismatch during striped segment creation\n";
+                return 1;
+            }
+            Segment seg;
+            seg.start_extent = cur_le;
+            seg.extent_count = run_len * stripes;
+            seg.type = "striped";
+            seg.stripe_count = stripes;
+            seg.stripe_size_sectors = stripe_size_sectors;
+            for (std::uint32_t s = 0; s < stripes; s++) {
+                std::uint64_t pe = stripe_allocs[s][chunk_idx[s]].start_pe + chunk_off[s];
+                seg.stripes.push_back({stripe_allocs[s][chunk_idx[s]].pv_key, pe});
+                chunk_off[s] += run_len;
+                if (chunk_off[s] == stripe_allocs[s][chunk_idx[s]].count) {
+                    chunk_idx[s]++;
+                    chunk_off[s] = 0;
+                }
+            }
+            cur_le += seg.extent_count;
+            lv.segments.push_back(std::move(seg));
         }
-        lv.segments.push_back(std::move(seg));
     }
 
     loaded->vg.lvs.push_back(std::move(lv));
