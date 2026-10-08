@@ -1,9 +1,6 @@
 [submodule "third_party/lvm2"]
 	path = third_party/lvm2
 	url = https://gitlab.com/lvmteam/lvm2.git
-[submodule "third_party/cryptsetup"]
-	path = third_party/cryptsetup
-	url = https://gitlab.com/cryptsetup/cryptsetup.git
 [submodule "third_party/winbtrfs"]
 	path = third_party/winbtrfs
 	url = https://github.com/maharmstone/btrfs.git
