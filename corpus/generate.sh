@@ -345,20 +345,37 @@ churn_metadata() {
 # Oracle capture. Must run while the VG is ACTIVE so dmsetup can be read.
 # ---------------------------------------------------------------------------
 capture() {
-  local name="$1" vg="$2"
+  local name="$1" vg="$2" luksmap="${3:-}"
   local d="$EXP_DIR/$name"; mkdir -p "$d"
 
+  # Scope device-mapper captures strictly to this case's VG (and optional LUKS
+  # mapping) so unrelated host DM devices never enter the oracle files.
+  # Invoke dmsetup table/deps without positional args so single-device outputs
+  # retain the "<name>: " prefix, then filter lines to this case.
+  local dm_line_regex="^${vg}-"
+  local dm_name_regex="^${vg}-"
+  if [[ -n "$luksmap" ]]; then
+    dm_line_regex="^(${vg}-|${luksmap}:)"
+    dm_name_regex="^(${vg}-|${luksmap}$)"
+  fi
+
   # The single most important artifact: the kernel's own sector-level mapping.
-  dmsetup table > "$d/dmsetup-table-all.txt"
+  dmsetup table | grep -E "$dm_line_regex" > "$d/dmsetup-table-all.txt" || true
   dmsetup table | grep "^${vg}-" > "$d/dmsetup-table.txt" || true
-  dmsetup deps  > "$d/dmsetup-deps.txt"  || true
-  dmsetup info  > "$d/dmsetup-info.txt"  || true
+  dmsetup deps  | grep -E "$dm_line_regex" > "$d/dmsetup-deps.txt"  || true
+  local dm_devs=()
+  mapfile -t dm_devs < <(dmsetup info --noheadings -o name 2>/dev/null | grep -E "$dm_name_regex" | sort || true)
+  if (( ${#dm_devs[@]} > 0 )); then
+    dmsetup info "${dm_devs[@]}" > "$d/dmsetup-info.txt" || true
+  else
+    : > "$d/dmsetup-info.txt"
+  fi
 
   lvs --units b --nosuffix -o \
     vg_name,lv_name,lv_uuid,lv_size,seg_start_pe,seg_size_pe,segtype,stripes,stripe_size,seg_pe_ranges,devices \
     "$vg" > "$d/lvs.txt"
 
-  pvs --units b --nosuffix -o \
+  pvs --units b --nosuffix -S "vg_name=${vg}" -o \
     pv_name,pv_uuid,vg_name,pv_size,pe_start,pv_pe_count,pv_pe_alloc_count,pv_mda_count \
     > "$d/pvs.txt"
 
@@ -591,7 +608,7 @@ case_luks2_default() {
   vgcreate vgluks /dev/mapper/wl_luks1 >/dev/null
   lvcreate -y -L "$LUKS_LV" -n lvcrypt vgluks >/dev/null
   write_example_data /dev/vgluks/lvcrypt lvcrypt vgluks luks2-default
-  capture luks2-default vgluks
+  capture luks2-default vgluks wl_luks1
   capture_fs_oracles luks2-default vgluks lvcrypt
   dump_luks "$L" "$EXP_DIR/luks2-default"
   deactivate_vg vgluks wl_luks1
@@ -614,7 +631,7 @@ case_luks2_pbkdf2() {
   vgcreate vgboot /dev/mapper/wl_luks2 >/dev/null
   lvcreate -y -L "$LUKS_LV" -n lvboot vgboot >/dev/null
   write_example_data /dev/vgboot/lvboot lvboot vgboot luks2-pbkdf2
-  capture luks2-pbkdf2 vgboot
+  capture luks2-pbkdf2 vgboot wl_luks2
   capture_fs_oracles luks2-pbkdf2 vgboot lvboot
   dump_luks "$L" "$EXP_DIR/luks2-pbkdf2"
   deactivate_vg vgboot wl_luks2
@@ -637,7 +654,7 @@ run_case luks2-pbkdf2         case_luks2_pbkdf2
 # ===========================================================================
 {
   echo "generated:  $(date -Is)"
-  echo "host:       $(uname -a)"
+  echo "host:       $(uname -s) $(uname -r) $(uname -v) $(uname -m) $(uname -o)"
   echo "lvm:        $(lvm version 2>&1 | tr '\n' ' ')"
   echo "cryptsetup: $(cryptsetup --version 2>&1)"
   echo "passed:     ${PASSED[*]:-none}"
@@ -752,7 +769,7 @@ for case_name in sorted(os.listdir(exp_dir)):
             if not f.endswith('.img.zst'):
                 continue
             base = f.replace('.img.zst', '')
-            if base == case_name or base.startswith(case_name + '-'):
+            if base == case_name or re.fullmatch(re.escape(case_name) + r'-[a-z]', base):
                 case_info["images"].append(f)
 
     # Extract VG info from metadata text

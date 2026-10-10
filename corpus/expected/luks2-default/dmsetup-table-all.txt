@@ -1,0 +1,2 @@
+vgluks-lvcrypt: 0 32768 linear 252:0 2048
+wl_luks1: 0 229376 crypt aes-xts-plain64 :64:logon:cryptsetup:7710ceac-3d8e-4ee1-a6ed-e4a0d2e890c2-d0 0 8:160 32768

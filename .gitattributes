@@ -1,0 +1,2 @@
+# Verbatim Linux tool outputs (lvs, dmsetup, cryptsetup) include trailing column padding.
+corpus/expected/** -whitespace

@@ -1,2 +1,2 @@
   VG    VG UUID                                Ext     #Ext Seq System ID #PV #LV
-  vgodd 3l5D8x-QDv4-Nr6Z-2vib-Kcpl-ehuf-uQgsR2 2097152   63 122             1   1
+  vgodd T1YKFL-DdEP-NgNC-C4Ab-XcLJ-rqJR-tU4twG 2097152   63 122             1   1

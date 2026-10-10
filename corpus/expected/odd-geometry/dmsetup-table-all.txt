@@ -1,6 +1,1 @@
-hostvg-Root: 0 67108864 linear 252:0 100665344
-hostvg-Root: 67108864 33554432 linear 252:0 218073088
-hostvg-VarData: 0 100663296 linear 252:0 2048
-hostvg-VarData: 100663296 50298880 linear 252:0 167774208
-luks-2d467aed-2601-4440-afc8-a61ca2b710dc: 0 251631616 crypt aes-xts-plain64 :64:logon:cryptsetup:2d467aed-2601-4440-afc8-a61ca2b710dc-d0 0 259:4 32768 1 allow_discards
-vgodd-lvodd: 0 32768 linear 7:7 2048
+vgodd-lvodd: 0 32768 linear 8:96 2048

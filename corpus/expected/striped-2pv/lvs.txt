@@ -1,2 +1,2 @@
   VG       LV    LV UUID                                LSize    Start SSize Type    #Str Stripe PE Ranges                     Devices                    
-  vgstripe lvstr CGNnYq-EN3F-lXdw-mj0E-iBCV-qqyN-4br0mA 33554432     0     8 striped    2  65536 /dev/loop4:0-3 /dev/loop5:0-3 /dev/loop4(0),/dev/loop5(0)
+  vgstripe lvstr 2fUalT-xnVk-nW4s-LDKP-aTVG-y5Tn-A8PVO9 33554432     0     8 striped    2  65536 /dev/loop4:0-3 /dev/loop5:0-3 /dev/loop4(0),/dev/loop5(0)

@@ -1,11 +1,9 @@
 # Ground-truth corpus
 
-Real LVM2/LUKS2 disk images created by Linux, with oracle files captured from
-LVM itself. This is Stage 0 in [`../docs/ROADMAP.md`](../docs/ROADMAP.md).
-
-**Nothing in `src/` has ever been validated against real Linux-created data.**
-Until this corpus exists and the tests run against it, every correctness claim
-this project makes is faith-based. Build it before writing new code.
+Real LVM2 and LVM-in-LUKS2 disk images created by Linux, paired with oracle
+files captured from Linux LVM2, `dmsetup`, `cryptsetup`, and ext4. All 9 test
+cases (12 compressed `.img.zst` images under `images/`, per-case oracles under
+`expected/`, and `corpus-manifest.json`) are committed in this directory.
 
 ## Generating
 
@@ -26,7 +24,7 @@ The script therefore splits its output:
 
 |                                | Location                                                                                  | Size                               |
 | ------------------------------ | ----------------------------------------------------------------------------------------- | ---------------------------------- |
-| Raw `.img` while building      | `$WORK` — auto-detected as `~/disk/winlvm-corpus-work` if `~/disk` exists, else `./.work` | ~700 MB, deleted after compression |
+| Raw `.img` while building      | `$WORK` — auto-detected as `~/disk/winlvm-corpus-work` if `~/disk` exists, else `./disk/work` | ~700 MB, deleted after compression |
 | Final `.img.zst` + `expected/` | `$OUT` — this directory by default                                                        | ~70 MB, kept                       |
 
 Override explicitly if needed:
@@ -60,25 +58,6 @@ lives under this directory's `images/`. It deliberately never calls
 `dmsetup remove_all` or similar, so running it on a machine with real LVM
 volumes will not touch them. Use a VM anyway.
 
-### If you generated a corpus before 2026-07-27, regenerate it
-
-An earlier version of `generate.sh` called `vgremove` from its teardown, and
-teardown ran once more immediately before compression. Every volume group was
-therefore **deleted from the images just before they were saved**. The oracle
-files were captured while the VGs were still active, so they are correct and
-look perfect — but the shipped images had their metadata areas zeroed, and
-`raw_locn[0]` reads as all zeros with a valid CRC over it.
-
-Fixed by splitting teardown in two: `purge_previous()` (destructive, startup
-only) and `release_devices()` (non-destructive, everything else). A
-post-teardown verification pass now re-attaches every image and confirms `pvs`
-still reports a volume group, so this class of bug fails the run instead of
-shipping.
-
-The lesson generalises: **verify the artifact, not the process that produced
-it.** Every check ran while the VGs were alive, which is precisely the state
-that does not ship.
-
 ### Telling whether it worked
 
 The script prints a per-case result and a summary, and **exits non-zero if any
@@ -109,7 +88,10 @@ Verification in the script:
 - `capture` asserts each oracle file exists and is non-empty;
 - both LUKS cases are closed and then **re-opened from scratch**, with the ext4
   filesystem mounted and `hello.txt` checked, proving the container is
-  genuinely readable rather than merely writable once in-process.
+  genuinely readable rather than merely writable once in-process;
+- after teardown releases all VGs and loop devices, every plain image is
+  re-attached read-only and checked with `pvs` to confirm metadata survived
+  teardown prior to compression.
 
 ### A note on LVM warnings
 
@@ -127,16 +109,16 @@ overriding `LVM_SYSTEM_DIR`.
 | `linear-1pv`          | baseline single-PV linear LV                        | — (if this fails, nothing else matters)                             |
 | `linear-1pv-multiseg` | one LV, several **discontiguous** segments          | treats an LV as one `start + length` range                          |
 | `linear-2pv`          | LV spanning two PVs                                 | can't resolve PV UUIDs, or mishandles the cross-device seam         |
-| `striped-2pv`         | round-robin striping, 64 KiB stripes                | assumes linear; the prototype's stripe code has never run           |
+| `striped-2pv`         | round-robin striping, 64 KiB stripes                | assumes linear or miscalculates stripe chunk offsets                |
 | `sector4k`            | 4Kn PV                                              | hardcodes 512-byte sectors                                          |
 | `odd-geometry`        | 2 MiB extents, shifted `pe_start`, **two MDAs**     | assumes 4 MiB extents, 1 MiB `pe_start`, or one metadata area       |
 | `mixed-vg`            | thin/raid1/snapshot beside a plain linear LV        | fails the whole VG instead of rejecting only the unsupported LVs    |
-| `luks2-default`       | LUKS2 stock defaults (argon2id, aes-xts-plain64)    | the realistic data-volume case                                      |
-| `luks2-pbkdf2`        | PBKDF2, the **boot-candidate** config (decision D4) | argon2id at 1 GiB is infeasible pre-boot and in a boot-start driver |
+| `luks2-default`       | LUKS2 stock defaults (argon2id, aes-xts-plain64)    | opaque-container rejection and LVM-in-LUKS stacking                 |
+| `luks2-pbkdf2`        | LUKS2 with PBKDF2 (low-memory KDF)                  | opaque-container rejection and LVM-in-LUKS stacking                 |
 
-Every image also has its metadata area deliberately churned so the MDA ring
-buffer **wraps** and `seqno` climbs well past 1. Wrap-around handling is a
-classic silent-corruption path and the prototype has never seen a wrapped MDA.
+Every churned image (`linear-1pv-multiseg`, `odd-geometry`) has its metadata
+area repeatedly updated so the MDA ring buffer **wraps** and `seqno` climbs
+well past 1, exercising circular MDA wrap-around handling.
 
 ## Filesystem data (verification anchor)
 
@@ -204,9 +186,9 @@ byte-for-byte against `expected/<case>/fs-<lv>/files/hello.txt`.
 
 A single machine-readable file at the corpus root, generated automatically at
 the end of each run. Contains every case, its images, VG metadata summary, and
-the checksums of all filesystem files. This is the **entry point for agents
-and automated tools** — read this file to discover what the corpus contains
-and what to verify.
+the checksums of all filesystem files. This is the entry point for automated
+test harnesses and tooling to discover what the corpus contains and what to
+verify.
 
 ```json
 {
@@ -231,18 +213,16 @@ and what to verify.
 }
 ```
 
-## About the committed master keys
+## About the committed LUKS2 test credentials
 
 `MASTER-KEY-INSECURE-TEST-ONLY.txt` contains the LUKS2 volume key in plaintext,
-and `passphrase.txt` the passphrase. This is deliberate and safe: these are
-throwaway containers whose passphrase is published in `generate.sh`.
+and `passphrase.txt` the passphrase. These are throwaway test containers whose
+passphrase is published in `generate.sh`. WinLVM implements no cryptography
+itself; the LUKS2 containers verify that WinLVM rejects raw encrypted LUKS2
+headers as non-PVs and maps the enclosed LVM2 volume groups once unlocked by a
+separate decryption layer (such as Linux `cryptsetup` or WinLUKS).
 
-It is also genuinely useful — it lets you **unit-test the XTS sector-crypto
-layer independently of the keyslot/KDF layer**. Without it, a decryption failure
-is ambiguous between "my Argon2 is wrong", "my AF-merge is wrong", and "my XTS
-tweak is wrong". With it you can isolate all three.
-
-Never do this for a real container.
+Never commit keys or passphrases for a real container.
 
 ## Size — what to expect, and why LUKS is different
 

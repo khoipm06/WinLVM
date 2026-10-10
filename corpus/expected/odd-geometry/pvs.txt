@@ -1,10 +1,2 @@
-  PV                                                    PV UUID                                VG       PSize        1st PE  PE    Alloc #PMda
-  /dev/loop0                                            6m0kE1-fm6x-OlV6-sDHg-xLe5-fAxG-mtK0Ow vgbase      130023424 1048576    31     4     1
-  /dev/loop1                                            nrzO4P-48Wl-f5Zo-zmvL-nU3q-REgT-Aklal7 vgseg       130023424 1048576    31    14     1
-  /dev/loop2                                            eqCKjX-0yfK-cSLp-zQwu-e7nw-5gjw-6qKn7n vgspan      130023424 1048576    31    31     1
-  /dev/loop3                                            sifgFv-0qGV-seOV-hIem-6yjV-Df8u-PRsWTF vgspan      130023424 1048576    31     9     1
-  /dev/loop4                                            jEIgTm-YU6S-3rY2-D6d8-iBwn-iHA3-4XYNpM vgstripe    130023424 1048576    31     4     1
-  /dev/loop5                                            F9Mqwq-q7ok-zp3D-krP5-EY1m-8XYl-tBQeJN vgstripe    130023424 1048576    31     4     1
-  /dev/loop6                                            wdVO0N-vUwA-aNzL-CZcd-Ie58-srkl-UwGSXS vg4k        130023424 1048576    31     4     1
-  /dev/loop7                                            G7YN0k-bSzX-b0Oe-DB9I-oQjT-Aah9-o682lj vgodd       132120576 1048576    63     8     2
-  /dev/mapper/luks-2d467aed-2601-4440-afc8-a61ca2b710dc c9Jymg-nQrK-M3Ki-KNCi-u6Ay-lwiW-RxgS6h hostvg 128832241664 1048576 30716 30716     1
+  PV         PV UUID                                VG    PSize     1st PE  PE  Alloc #PMda
+  /dev/sdg   15J52p-eraE-XApS-eC9V-4T5q-GYNQ-O21tg6 vgodd 132120576 1048576  63     8     2

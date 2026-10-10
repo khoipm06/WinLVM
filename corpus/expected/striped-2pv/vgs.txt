@@ -1,2 +1,2 @@
   VG       VG UUID                                Ext     #Ext Seq System ID #PV #LV
-  vgstripe CKaIyc-NqrX-9FCV-7j0A-1dUV-A2h0-l2tyLE 4194304   62   2             2   1
+  vgstripe Eo1o6A-F47v-lHKW-0brP-LS6n-WDyD-mFrfb8 4194304   62   2             2   1

@@ -1,170 +1,140 @@
-Name:              hostvg-Root
+Name:              vgmix-lvplain
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
-Open count:        1
+Open count:        0
 Event number:      0
 Major, minor:      252, 1
-Number of targets: 2
-UUID: LVM-ShrmdYWfsgc3FZTHpV31dXTIKlcQdzjReJYGLUNQcwoFnPp0WsZptuTMiszF00LD
+Number of targets: 1
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NfxNe8oU8ZSEuc3tPYT7A2oxHhuFLzvyT
 
-Name:              hostvg-VarData
+Name:              vgmix-lvplain-real
 State:             ACTIVE
-Read Ahead:        256
-Tables present:    LIVE
-Open count:        1
-Event number:      0
-Major, minor:      252, 2
-Number of targets: 2
-UUID: LVM-ShrmdYWfsgc3FZTHpV31dXTIKlcQdzjRdj7ag6gKTwxxbY3Gmi1WhurNFNzgcE66
-
-Name:              luks-2d467aed-2601-4440-afc8-a61ca2b710dc
-State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        2
 Event number:      0
 Major, minor:      252, 0
 Number of targets: 1
-UUID: CRYPT-LUKS2-2d467aed26014440afc8a61ca2b710dc-luks-2d467aed-2601-4440-afc8-a61ca2b710dc
-
-Name:              vgmix-lvplain
-State:             ACTIVE
-Read Ahead:        256
-Tables present:    LIVE
-Open count:        0
-Event number:      0
-Major, minor:      252, 3
-Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5KUGBQfejGlY2RUR9m7jiXGYfQFSxSHkZ
-
-Name:              vgmix-lvplain-real
-State:             ACTIVE
-Read Ahead:        256
-Tables present:    LIVE
-Open count:        2
-Event number:      0
-Major, minor:      252, 14
-Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5KUGBQfejGlY2RUR9m7jiXGYfQFSxSHkZ-real
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NfxNe8oU8ZSEuc3tPYT7A2oxHhuFLzvyT-real
 
 Name:              vgmix-lvraid
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        0
-Event number:      2
+Event number:      1
 Major, minor:      252, 13
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5DJ4WxxUjkAJgXlanzd3CUDobtdCGtPnc
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NqALUqANC2B96m7bq6dKybf2mgC72Tlh4
 
 Name:              vgmix-lvraid_rimage_0
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
 Major, minor:      252, 10
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5URrv24n18VCcpzEFZ5G4rREAiTNm4d7r-real
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NF8xoCEbIvTAP37hbnKTSnwGPLRteWUdH-real
 
 Name:              vgmix-lvraid_rimage_1
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
 Major, minor:      252, 12
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5KgVdaY7pqt2aKDoDmwBfboe32U5lEfct-real
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2N97lVDdI0Yh3T3qzGGG1dBXz1whqhaEHt-real
 
 Name:              vgmix-lvraid_rmeta_0
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
 Major, minor:      252, 9
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5emtaT3kHsRyQo7tPbwEyqpkjLD5fevug-real
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NBUpJnh90Ik211N0JV6PdJ70z7crdQr6H-real
 
 Name:              vgmix-lvraid_rmeta_1
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
 Major, minor:      252, 11
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5uv1TlzQsevK7aQjACvP0K1Vslj3Wgbg3-real
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NYDaUgPEyc7aDKt295vNi0XCq4f21zfdy-real
 
 Name:              vgmix-lvsnap
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        0
 Event number:      0
-Major, minor:      252, 16
+Major, minor:      252, 3
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5GZmM2eFF1Klxs0ajtKE6prU6S17GRK9w
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NFHflUcVtcoetjets6tPiXztPZJMlPLju
 
 Name:              vgmix-lvsnap-cow
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
-Major, minor:      252, 15
+Major, minor:      252, 2
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5GZmM2eFF1Klxs0ajtKE6prU6S17GRK9w-cow
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NFHflUcVtcoetjets6tPiXztPZJMlPLju-cow
 
 Name:              vgmix-lvthin
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        0
 Event number:      0
 Major, minor:      252, 8
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5vVvDbLv1CTyrfDsSdjRhaBG1Nf4hyogn
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NujVG04eb1Wesd04Wm1W5s1Jpc8XZHKSL
 
 Name:              vgmix-tpool
 State:             ACTIVE (READ-ONLY)
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        0
 Event number:      0
 Major, minor:      252, 7
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5EB0jRXXARHohDFkwyg92gbqzwVZj6y1I-pool
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2ND8Gb3mf5KfDxPQf0318S2FYLcIchH8M3-pool
 
 Name:              vgmix-tpool-tpool
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        2
 Event number:      0
 Major, minor:      252, 6
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5EB0jRXXARHohDFkwyg92gbqzwVZj6y1I-tpool
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2ND8Gb3mf5KfDxPQf0318S2FYLcIchH8M3-tpool
 
 Name:              vgmix-tpool_tdata
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
 Major, minor:      252, 5
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5fJzOvkxA9zt2YcG5HrufqeMEQASASXHz-tdata
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2N2fMO1mQslQyTww1zcJuz8vVvD4TBJuRj-tdata
 
 Name:              vgmix-tpool_tmeta
 State:             ACTIVE
-Read Ahead:        256
+Read Ahead:        16384
 Tables present:    LIVE
 Open count:        1
 Event number:      0
 Major, minor:      252, 4
 Number of targets: 1
-UUID: LVM-lB8BMxYFs5QjPCKHwa9eYA52R0WAatC5ZJTvuRP233NTH6Kocem5Gs3HO8NRZ1Tf-tmeta
+UUID: LVM-hZyVvjcb0UdsZEwm1QSfYCx3FnXlZW2NcVyBQRMNQDNn3dhhyOGcefD7TVvS8nkI-tmeta
 

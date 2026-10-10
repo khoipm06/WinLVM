@@ -1,3 +1,3 @@
   VG     LV     LV UUID                                LSize     Start SSize Type   #Str Stripe PE Ranges       Devices      
-  vgspan lvspan lcEQZy-GW91-MQBL-vNFw-xIec-GwRd-5S4V7g 167772160     0    31 linear    1      0 /dev/loop2:0-30 /dev/loop2(0)
-  vgspan lvspan lcEQZy-GW91-MQBL-vNFw-xIec-GwRd-5S4V7g 167772160    31     9 linear    1      0 /dev/loop3:0-8  /dev/loop3(0)
+  vgspan lvspan ARVpac-epEs-ouJ9-8Lo4-fH7T-3Ohp-esmyAU 167772160     0    31 linear    1      0 /dev/loop2:0-30 /dev/loop2(0)
+  vgspan lvspan ARVpac-epEs-ouJ9-8Lo4-fH7T-3Ohp-esmyAU 167772160    31     9 linear    1      0 /dev/loop3:0-8  /dev/loop3(0)

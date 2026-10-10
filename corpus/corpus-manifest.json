@@ -3,7 +3,6 @@
     "linear-1pv": {
       "description": "Baseline single-PV linear LV",
       "images": [
-        "linear-1pv-multiseg.img.zst",
         "linear-1pv.img.zst"
       ],
       "lvs": {

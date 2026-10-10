@@ -1,0 +1,20 @@
+Name:              vgboot-lvboot
+State:             ACTIVE
+Read Ahead:        16384
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 1
+Number of targets: 1
+UUID: LVM-d2NNmgQRrQP1uiPD0XTtob5TkKKTTecJP4H1oasGY2ESdRnjn5RRJXL5iHpRIDku
+
+Name:              wl_luks2
+State:             ACTIVE (READ-ONLY)
+Read Ahead:        16384
+Tables present:    LIVE
+Open count:        1
+Event number:      0
+Major, minor:      252, 0
+Number of targets: 1
+UUID: CRYPT-LUKS2-7cbaa54e98cb45478fb7a2a20bbb6aa2-wl_luks2
+

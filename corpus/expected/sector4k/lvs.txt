@@ -1,2 +1,2 @@
   VG   LV   LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges      Devices      
-  vg4k lv4k 64gnLt-lAHJ-Qf7Z-VsNU-2Cvo-PAEJ-29G2t9 16777216     0     4 linear    1      0 /dev/loop6:0-3 /dev/loop6(0)
+  vg4k lv4k copiVQ-PWXk-40mp-nL6A-pFR3-KWKb-fNTyEO 16777216     0     4 linear    1      0 /dev/loop6:0-3 /dev/loop6(0)
