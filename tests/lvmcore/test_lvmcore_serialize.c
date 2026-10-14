@@ -50,8 +50,17 @@ static size_t file_read(void *impl, uint64_t offset, void *buf, size_t len) {
 }
 
 typedef struct {
-    uint8_t buf[1024];
+    uint8_t buf[4096];
 } mock_state_t;
+
+static uint32_t get_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t get_le64(const uint8_t *p) {
+    return (uint64_t)get_le32(p) | ((uint64_t)get_le32(p + 4) << 32);
+}
 
 static size_t mock_read(void *impl, uint64_t offset, void *buf, size_t len) {
     mock_state_t *s = (mock_state_t *)impl;
@@ -213,6 +222,7 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
 
         snprintf(title, sizeof(title), "round-trip VG pv_count for %s", kCorpusImages[i]);
         CHECK(title, vg_disk.pv_count == vg_round.pv_count);
+        CHECK("round-trip VG read_only matches", vg_disk.read_only == vg_round.read_only);
 
         for (size_t p = 0; p < vg_disk.pv_count; p++) {
             const lvmcore_physical_volume *p1 = &vg_disk.pvs[p];
@@ -224,6 +234,7 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
             CHECK("PV pe_start matches", p1->pe_start == p2->pe_start);
             CHECK("PV pe_count matches", p1->pe_count == p2->pe_count);
             CHECK("PV dev_size matches", p1->dev_size_sectors == p2->dev_size_sectors);
+            CHECK("PV missing matches", p1->missing == p2->missing);
         }
 
         snprintf(title, sizeof(title), "round-trip VG lv_count for %s", kCorpusImages[i]);
@@ -237,6 +248,9 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
             if (!lv2) continue;
 
             CHECK("LV id matches", strcmp(lv1->id, lv2->id) == 0);
+            CHECK("LV visible matches", lv1->visible == lv2->visible);
+            CHECK("LV read_only matches", lv1->read_only == lv2->read_only);
+            CHECK("LV mappable matches", lv1->mappable == lv2->mappable);
             CHECK("LV segment_count matches", lv1->segment_count == lv2->segment_count);
             for (size_t s = 0; s < lv1->segment_count; s++) {
                 const lvmcore_segment *s1 = &lv1->segments[s];
@@ -252,6 +266,124 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
             }
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 2b: READ-Only VG/LV, MISSING PV, and Escaping Round-Trip      */
+/* ------------------------------------------------------------------ */
+
+static void test_status_flags_roundtrip(void) {
+    lvmcore_arena a1, a2;
+    lvmcore_arena_init(&a1, arena_buf1, sizeof(arena_buf1));
+    lvmcore_arena_init(&a2, arena_buf2, sizeof(arena_buf2));
+
+    lvmcore_volume_group vg;
+    memset(&vg, 0, sizeof(vg));
+    snprintf(vg.name, sizeof(vg.name), "vgro");
+    snprintf(vg.id, sizeof(vg.id), "11111122223333444455556666777799");
+    snprintf(vg.system_id, sizeof(vg.system_id), "foreign-host");
+    vg.seqno = 7;
+    vg.extent_size_sectors = 8192;
+    vg.read_only = 1;
+    vg.pv_count = 2;
+    vg.pvs = (lvmcore_physical_volume *)lvmcore_arena_alloc_zero(&a1, 2 * sizeof(lvmcore_physical_volume), 8);
+
+    snprintf(vg.pvs[0].key, sizeof(vg.pvs[0].key), "pv0");
+    snprintf(vg.pvs[0].id, sizeof(vg.pvs[0].id), "aaaaaabbbbccccddddeeeeffff000011");
+    snprintf(vg.pvs[0].device, sizeof(vg.pvs[0].device), "\\\\.\\PhysicalDrive1");
+    vg.pvs[0].dev_size_sectors = 262144;
+    vg.pvs[0].pe_start = 2048;
+    vg.pvs[0].pe_count = 31;
+    vg.pvs[0].missing = 0;
+
+    snprintf(vg.pvs[1].key, sizeof(vg.pvs[1].key), "pv1");
+    snprintf(vg.pvs[1].id, sizeof(vg.pvs[1].id), "bbbbbbccccddddeeeeffffaaaa111122");
+    vg.pvs[1].dev_size_sectors = 262144;
+    vg.pvs[1].pe_start = 2048;
+    vg.pvs[1].pe_count = 31;
+    vg.pvs[1].missing = 1;
+
+    vg.lv_count = 3;
+    vg.lvs = (lvmcore_logical_volume *)lvmcore_arena_alloc_zero(&a1, 3 * sizeof(lvmcore_logical_volume), 8);
+
+    /* lv_ro: visible, read-only, on healthy pv0 */
+    snprintf(vg.lvs[0].name, sizeof(vg.lvs[0].name), "lv_ro");
+    snprintf(vg.lvs[0].id, sizeof(vg.lvs[0].id), "ccccccddddeeeeffffaaaabbbb222201");
+    vg.lvs[0].visible = 1;
+    vg.lvs[0].read_only = 1;
+    vg.lvs[0].segment_count = 1;
+    vg.lvs[0].segments = (lvmcore_segment *)lvmcore_arena_alloc_zero(&a1, sizeof(lvmcore_segment), 8);
+    vg.lvs[0].segments[0].start_extent = 0;
+    vg.lvs[0].segments[0].extent_count = 4;
+    vg.lvs[0].segments[0].type = LVMCORE_SEG_STRIPED;
+    snprintf(vg.lvs[0].segments[0].seg_type_name, sizeof(vg.lvs[0].segments[0].seg_type_name), "striped");
+    vg.lvs[0].segments[0].stripe_count = 1;
+    vg.lvs[0].segments[0].stripe_count_used = 1;
+    vg.lvs[0].segments[0].stripes = (lvmcore_stripe *)lvmcore_arena_alloc_zero(&a1, sizeof(lvmcore_stripe), 8);
+    snprintf(vg.lvs[0].segments[0].stripes[0].pv_key, sizeof(vg.lvs[0].segments[0].stripes[0].pv_key), "pv0");
+
+    /* lv_hidden_ro: hidden, read-only, on healthy pv0 */
+    snprintf(vg.lvs[1].name, sizeof(vg.lvs[1].name), "lv_hidden_ro");
+    snprintf(vg.lvs[1].id, sizeof(vg.lvs[1].id), "ccccccddddeeeeffffaaaabbbb222202");
+    vg.lvs[1].visible = 0;
+    vg.lvs[1].read_only = 1;
+    vg.lvs[1].segment_count = 1;
+    vg.lvs[1].segments = (lvmcore_segment *)lvmcore_arena_alloc_zero(&a1, sizeof(lvmcore_segment), 8);
+    vg.lvs[1].segments[0].start_extent = 0;
+    vg.lvs[1].segments[0].extent_count = 4;
+    vg.lvs[1].segments[0].type = LVMCORE_SEG_STRIPED;
+    snprintf(vg.lvs[1].segments[0].seg_type_name, sizeof(vg.lvs[1].segments[0].seg_type_name), "striped");
+    vg.lvs[1].segments[0].stripe_count = 1;
+    vg.lvs[1].segments[0].stripe_count_used = 1;
+    vg.lvs[1].segments[0].stripes = (lvmcore_stripe *)lvmcore_arena_alloc_zero(&a1, sizeof(lvmcore_stripe), 8);
+    snprintf(vg.lvs[1].segments[0].stripes[0].pv_key, sizeof(vg.lvs[1].segments[0].stripes[0].pv_key), "pv0");
+    vg.lvs[1].segments[0].stripes[0].start_extent = 4;
+
+    /* lv_missing: visible, writable, on missing pv1 */
+    snprintf(vg.lvs[2].name, sizeof(vg.lvs[2].name), "lv_missing");
+    snprintf(vg.lvs[2].id, sizeof(vg.lvs[2].id), "ccccccddddeeeeffffaaaabbbb222203");
+    vg.lvs[2].visible = 1;
+    vg.lvs[2].read_only = 0;
+    vg.lvs[2].segment_count = 1;
+    vg.lvs[2].segments = (lvmcore_segment *)lvmcore_arena_alloc_zero(&a1, sizeof(lvmcore_segment), 8);
+    vg.lvs[2].segments[0].start_extent = 0;
+    vg.lvs[2].segments[0].extent_count = 4;
+    vg.lvs[2].segments[0].type = LVMCORE_SEG_STRIPED;
+    snprintf(vg.lvs[2].segments[0].seg_type_name, sizeof(vg.lvs[2].segments[0].seg_type_name), "striped");
+    vg.lvs[2].segments[0].stripe_count = 1;
+    vg.lvs[2].segments[0].stripe_count_used = 1;
+    vg.lvs[2].segments[0].stripes = (lvmcore_stripe *)lvmcore_arena_alloc_zero(&a1, sizeof(lvmcore_stripe), 8);
+    snprintf(vg.lvs[2].segments[0].stripes[0].pv_key, sizeof(vg.lvs[2].segments[0].stripes[0].pv_key), "pv1");
+
+    size_t out_len = 0;
+    lvmcore_status st = lvmcore_serialize_vg(&vg, text_buf, sizeof(text_buf), &out_len);
+    CHECK("status flags VG serialize OK", st == LVMCORE_OK && out_len > 0);
+    CHECK("serialized VG emits READ-only status",
+          strstr(text_buf, "\tstatus = [\"RESIZEABLE\", \"READ\"]\n") != NULL);
+    CHECK("serialized PV emits MISSING status",
+          strstr(text_buf, "status = [\"ALLOCATABLE\", \"MISSING\"]") != NULL);
+    CHECK("serialized Win32 device escapes backslashes",
+          strstr(text_buf, "device = \"\\\\\\\\.\\\\PhysicalDrive1\"") != NULL);
+
+    lvmcore_volume_group parsed;
+    lvmcore_err err;
+    st = lvmcore_parse_vg_text(text_buf, out_len - 1, &a2, &parsed, &err);
+    CHECK("status flags VG re-parse OK", st == LVMCORE_OK);
+    CHECK("round-trip VG read_only == 1", parsed.read_only == 1);
+    CHECK("round-trip VG system_id preserved", strcmp(parsed.system_id, "foreign-host") == 0);
+    CHECK("round-trip pv0 device unescaped", strcmp(parsed.pvs[0].device, "\\\\.\\PhysicalDrive1") == 0);
+    CHECK("round-trip pv0 missing == 0, pv1 missing == 1",
+          parsed.pv_count == 2 && parsed.pvs[0].missing == 0 && parsed.pvs[1].missing == 1);
+
+    const lvmcore_logical_volume *p_ro = lvmcore_vg_find_lv(&parsed, "lv_ro");
+    const lvmcore_logical_volume *p_hro = lvmcore_vg_find_lv(&parsed, "lv_hidden_ro");
+    const lvmcore_logical_volume *p_miss = lvmcore_vg_find_lv(&parsed, "lv_missing");
+    CHECK("round-trip lv_ro visible=1 read_only=1 mappable=1",
+          p_ro && p_ro->visible == 1 && p_ro->read_only == 1 && p_ro->mappable == 1);
+    CHECK("round-trip lv_hidden_ro visible=0 read_only=1 mappable=0",
+          p_hro && p_hro->visible == 0 && p_hro->read_only == 1 && p_hro->mappable == 0);
+    CHECK("round-trip lv_missing read_only=0 mappable=0 (PV missing)",
+          p_miss && p_miss->visible == 1 && p_miss->read_only == 0 && p_miss->mappable == 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -304,6 +436,13 @@ static void test_ring_placement(void) {
     st = lvmcore_mda_next_offset(&mdah, small_mda, 1000, 512, &offset);
     CHECK("ring after wrapped commit == 1024", st == LVMCORE_OK && offset == 1024);
 
+    /* 6b. Wrapped commit with wrap > 512 bytes:
+     * offset = 9000, size = 2000 -> wrap = 1000, old_last = 1511 -> next = 1536. */
+    mdah.raw_locns[0].offset = 9000;
+    mdah.raw_locns[0].size = 2000;
+    st = lvmcore_mda_next_offset(&mdah, small_mda, 1000, 512, &offset);
+    CHECK("ring after >512B wrapped commit == 1536", st == LVMCORE_OK && offset == 1536);
+
     /* 7. Oversized payload -> overflow */
     st = lvmcore_mda_next_offset(NULL, mda_size, mda_size, 512, &offset);
     CHECK("ring oversized payload rejects OVERFLOW", st == LVMCORE_ERR_OVERFLOW);
@@ -320,47 +459,60 @@ static void test_two_slot_commit_and_sector(void) {
     mdah.size = sizeof(mock_state_t);
     mdah.version = 1;
 
-    const char sample_payload[] = "sample_vg { seqno = 1 }\n";
-    uint32_t payload_crc = lvmcore_crc32(sample_payload, sizeof(sample_payload));
-    uint64_t payload_size = (uint64_t)sizeof(sample_payload);
+    const char payload_v1[] = "sample_vg { seqno = 1 }\n";
+    uint32_t crc_v1 = lvmcore_crc32(payload_v1, sizeof(payload_v1));
+    uint64_t size_v1 = (uint64_t)sizeof(payload_v1);
 
-    /* Step 1: Precommit */
+    const char payload_v2[] = "sample_vg { seqno = 2 }\n";
+    uint32_t crc_v2 = lvmcore_crc32(payload_v2, sizeof(payload_v2));
+    uint64_t size_v2 = (uint64_t)sizeof(payload_v2);
+
+    /* Establish committed Slot 0 = v1 at offset 512. */
+    lvmcore_mda_header cur_mdah;
+    lvmcore_status st = lvmcore_mda_prepare_commit(&mdah, 512, size_v1, crc_v1, &cur_mdah);
+    CHECK("initial commit v1 OK", st == LVMCORE_OK);
+
+    /* Step 1: Precommit v2 in Slot 1 at offset 1024 while Slot 0 holds v1. */
     lvmcore_mda_header pre_mdah;
-    lvmcore_status st = lvmcore_mda_prepare_precommit(&mdah, 512, payload_size, payload_crc, &pre_mdah);
+    st = lvmcore_mda_prepare_precommit(&cur_mdah, 1024, size_v2, crc_v2, &pre_mdah);
     CHECK("mda_prepare_precommit OK", st == LVMCORE_OK);
-    CHECK("precommit slot 0 remains untouched (offset 0)", pre_mdah.raw_locns[0].offset == 0);
-    CHECK("precommit slot 1 has new offset 512", pre_mdah.raw_locns[1].offset == 512);
-    CHECK("precommit slot 1 has new size", pre_mdah.raw_locns[1].size == payload_size);
-    CHECK("precommit slot 1 has new checksum", pre_mdah.raw_locns[1].checksum == payload_crc);
+    CHECK("precommit slot 0 preserved (offset 512)", pre_mdah.raw_locns[0].offset == 512);
+    CHECK("precommit slot 1 has new offset 1024", pre_mdah.raw_locns[1].offset == 1024);
+    CHECK("precommit slot 1 has new size", pre_mdah.raw_locns[1].size == size_v2);
+    CHECK("precommit slot 1 has new checksum", pre_mdah.raw_locns[1].checksum == crc_v2);
 
-    /* Step 2: Binary serialize precommit header to 512-byte sector */
+    /* Step 2: Binary serialize precommit header and assert exact 24B raw_locn layout. */
     uint8_t sector[512];
     st = lvmcore_mda_header_write(&pre_mdah, sector, sizeof(sector));
     CHECK("mda_header_write precommit OK", st == LVMCORE_OK);
 
-    /* Verify CRC at sector 0..3 */
-    uint32_t stored_crc = (uint32_t)sector[0] | ((uint32_t)sector[1] << 8) |
-                          ((uint32_t)sector[2] << 16) | ((uint32_t)sector[3] << 24);
+    uint32_t stored_crc = get_le32(sector);
     uint32_t calc_crc = lvmcore_crc32(sector + 4, sizeof(sector) - 4);
     CHECK("mda_header_write CRC matches computed", stored_crc == calc_crc);
 
-    /* Step 3: Commit */
-    lvmcore_mda_header commit_mdah;
-    st = lvmcore_mda_prepare_commit(&pre_mdah, 512, payload_size, payload_crc, &commit_mdah);
-    CHECK("mda_prepare_commit OK", st == LVMCORE_OK);
-    CHECK("commit slot 0 has new offset 512", commit_mdah.raw_locns[0].offset == 512);
-    CHECK("commit slot 0 has new size", commit_mdah.raw_locns[0].size == payload_size);
-    CHECK("commit slot 0 has new checksum", commit_mdah.raw_locns[0].checksum == payload_crc);
-    CHECK("commit slot 1 is cleared (offset 0)", commit_mdah.raw_locns[1].offset == 0);
-    CHECK("commit slot 1 is cleared (size 0)", commit_mdah.raw_locns[1].size == 0);
+    /* Slot 0 at bytes 40..63; Slot 1 at bytes 64..87; bytes 88..135 zero. */
+    CHECK("raw sector slot 0 at 40..63",
+          get_le64(sector + 40) == 512 &&
+          get_le64(sector + 48) == size_v1 &&
+          get_le32(sector + 56) == crc_v1 &&
+          get_le32(sector + 60) == 0);
+    CHECK("raw sector slot 1 at 64..87",
+          get_le64(sector + 64) == 1024 &&
+          get_le64(sector + 72) == size_v2 &&
+          get_le32(sector + 80) == crc_v2 &&
+          get_le32(sector + 84) == 0);
+    int tail_zero = 1;
+    for (size_t b = 88; b < 136; b++) {
+        if (sector[b] != 0) { tail_zero = 0; break; }
+    }
+    CHECK("raw sector bytes 88..135 are zero (no stale slot-2 write)", tail_zero == 1);
 
-    /* Step 4: Write committed sector and verify parse using lvmcore_read_mda_header */
-    st = lvmcore_mda_header_write(&commit_mdah, sector, sizeof(sector));
-    CHECK("mda_header_write commit OK", st == LVMCORE_OK);
-
+    /* Populate mock ring buffer with precommit header + v1 at 512 + v2 at 1024. */
     static mock_state_t mock_state;
     memset(&mock_state, 0, sizeof(mock_state));
     memcpy(mock_state.buf, sector, sizeof(sector));
+    memcpy(mock_state.buf + 512, payload_v1, sizeof(payload_v1));
+    memcpy(mock_state.buf + 1024, payload_v2, sizeof(payload_v2));
 
     lvmcore_byte_source mock_src;
     memset(&mock_src, 0, sizeof(mock_src));
@@ -370,15 +522,86 @@ static void test_two_slot_commit_and_sector(void) {
 
     lvmcore_arena a;
     lvmcore_arena_init(&a, arena_buf1, sizeof(arena_buf1));
-    lvmcore_disk_area area = { .offset = 0, .size = commit_mdah.size };
-    lvmcore_mda_header read_back;
+    lvmcore_disk_area area = { .offset = 0, .size = pre_mdah.size };
+    lvmcore_mda_header read_pre;
     lvmcore_err err;
+    st = lvmcore_read_mda_header(&mock_src, &area, &a, &read_pre, &err);
+    CHECK("read_back precommit header OK", st == LVMCORE_OK);
+    CHECK("read_back precommit slot 0 matches v1",
+          read_pre.raw_locns[0].offset == 512 &&
+          read_pre.raw_locns[0].size == size_v1 &&
+          read_pre.raw_locns[0].checksum == crc_v1);
+    CHECK("read_back precommit slot 1 matches v2",
+          read_pre.raw_locns[1].offset == 1024 &&
+          read_pre.raw_locns[1].size == size_v2 &&
+          read_pre.raw_locns[1].checksum == crc_v2 &&
+          read_pre.raw_locns[1].flags == 0);
+
+    char *txt = NULL;
+    size_t txt_len = 0;
+    bool is_pre = false;
+    st = lvmcore_read_metadata_text(&mock_src, &area, &read_pre, LVMCORE_READ_FLAG_DEFAULT,
+                                    &a, &txt, &txt_len, &is_pre, &err);
+    CHECK("DEFAULT read returns committed v1",
+          st == LVMCORE_OK && !is_pre && strcmp(txt, payload_v1) == 0);
+
+    st = lvmcore_read_metadata_text(&mock_src, &area, &read_pre, LVMCORE_READ_FLAG_PRECOMMITTED,
+                                    &a, &txt, &txt_len, &is_pre, &err);
+    CHECK("PRECOMMITTED read returns slot 1 v2",
+          st == LVMCORE_OK && is_pre && strcmp(txt, payload_v2) == 0);
+
+    /* Verify non-zero slot 1 flags serialize at byte 84..87 and parse back. */
+    lvmcore_mda_header flag_mdah = pre_mdah;
+    flag_mdah.raw_locns[1].flags = LVMCORE_RAW_LOCN_IGNORED;
+    st = lvmcore_mda_header_write(&flag_mdah, sector, sizeof(sector));
+    CHECK("slot 1 flags written at offset 84..87 (not 88)",
+          st == LVMCORE_OK &&
+          get_le32(sector + 84) == LVMCORE_RAW_LOCN_IGNORED &&
+          get_le32(sector + 88) == 0);
+    memcpy(mock_state.buf, sector, sizeof(sector));
+    lvmcore_arena_reset(&a);
+    st = lvmcore_read_mda_header(&mock_src, &area, &a, &read_pre, &err);
+    CHECK("slot 1 flags parsed back from offset 84..87",
+          st == LVMCORE_OK && read_pre.raw_locns[1].flags == LVMCORE_RAW_LOCN_IGNORED);
+    /* With slot 1 marked ignored, PRECOMMITTED falls back to slot 0 v1. */
+    st = lvmcore_read_metadata_text(&mock_src, &area, &read_pre, LVMCORE_READ_FLAG_PRECOMMITTED,
+                                    &a, &txt, &txt_len, &is_pre, &err);
+    CHECK("PRECOMMITTED ignores slot 1 when RAW_LOCN_IGNORED is set",
+          st == LVMCORE_OK && !is_pre && strcmp(txt, payload_v1) == 0);
+
+    /* Step 3: Commit v2 to Slot 0 and clear Slot 1. */
+    lvmcore_mda_header commit_mdah;
+    st = lvmcore_mda_prepare_commit(&pre_mdah, 1024, size_v2, crc_v2, &commit_mdah);
+    CHECK("mda_prepare_commit OK", st == LVMCORE_OK);
+    CHECK("commit slot 0 has new offset 1024", commit_mdah.raw_locns[0].offset == 1024);
+    CHECK("commit slot 0 has new size", commit_mdah.raw_locns[0].size == size_v2);
+    CHECK("commit slot 0 has new checksum", commit_mdah.raw_locns[0].checksum == crc_v2);
+    CHECK("commit slot 1 is cleared (offset 0)", commit_mdah.raw_locns[1].offset == 0);
+    CHECK("commit slot 1 is cleared (size 0)", commit_mdah.raw_locns[1].size == 0);
+
+    /* Step 4: Write committed sector and verify round-trip read of v2. */
+    st = lvmcore_mda_header_write(&commit_mdah, sector, sizeof(sector));
+    CHECK("mda_header_write commit OK", st == LVMCORE_OK);
+    int slot1_zero = 1;
+    for (size_t b = 64; b < 88; b++) {
+        if (sector[b] != 0) { slot1_zero = 0; break; }
+    }
+    CHECK("committed sector zeroes slot 1 bytes 64..87", slot1_zero == 1);
+
+    memcpy(mock_state.buf, sector, sizeof(sector));
+    lvmcore_arena_reset(&a);
+    lvmcore_mda_header read_back;
     st = lvmcore_read_mda_header(&mock_src, &area, &a, &read_back, &err);
     CHECK("read_back written committed header OK", st == LVMCORE_OK);
-    CHECK("read_back slot 0 offset matches 512", read_back.raw_locns[0].offset == 512);
-    CHECK("read_back slot 0 size matches payload_size", read_back.raw_locns[0].size == payload_size);
-    CHECK("read_back slot 0 checksum matches payload_crc", read_back.raw_locns[0].checksum == payload_crc);
+    CHECK("read_back slot 0 offset matches 1024", read_back.raw_locns[0].offset == 1024);
+    CHECK("read_back slot 0 size matches size_v2", read_back.raw_locns[0].size == size_v2);
+    CHECK("read_back slot 0 checksum matches crc_v2", read_back.raw_locns[0].checksum == crc_v2);
     CHECK("read_back slot 1 offset is 0", read_back.raw_locns[1].offset == 0);
+
+    st = lvmcore_read_metadata_text(&mock_src, &area, &read_back, LVMCORE_READ_FLAG_DEFAULT,
+                                    &a, &txt, &txt_len, &is_pre, &err);
+    CHECK("DEFAULT read after commit returns v2",
+          st == LVMCORE_OK && !is_pre && strcmp(txt, payload_v2) == 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -390,6 +613,7 @@ int main(int argc, char **argv) {
 
     printf("=== test_lvmcore_serialize ===\n");
     test_synthetic_vg_roundtrip();
+    test_status_flags_roundtrip();
     test_ring_placement();
     test_two_slot_commit_and_sector();
     test_corpus_roundtrip(corpus_images_dir);

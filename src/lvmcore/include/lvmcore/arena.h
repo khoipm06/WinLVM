@@ -8,9 +8,7 @@
 #ifndef LVMCORE_ARENA_H
 #define LVMCORE_ARENA_H
 
-#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
+#include "lvmcore/types.h"
 
 #ifdef __cplusplus
 extern "C" {

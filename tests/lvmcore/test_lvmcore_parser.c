@@ -114,9 +114,23 @@ static int parse_table_line(const char *line, oracle_target *t, char *name_out, 
     }
     if (strcmp(t->type, "striped") == 0) {
         unsigned long sc = 0, ch = 0;
-        if (sscanf(p, "%*u %*u %*s %lu %lu", &sc, &ch) == 2) {
+        int consumed = 0;
+        if (sscanf(p, "%*u %*u %*s %lu %lu%n", &sc, &ch, &consumed) == 2) {
             t->stripe_count = sc;
             t->chunk = ch;
+            const char *q = p + consumed;
+            unsigned int idx = 0;
+            while (idx < 8u) {
+                unsigned maj = 0, min = 0;
+                unsigned long ts = 0;
+                int step = 0;
+                if (sscanf(q, " %u:%u %lu%n", &maj, &min, &ts, &step) != 3) break;
+                t->dev[idx] = (unsigned long)maj * 10000ul + (unsigned long)min;
+                t->target_start[idx] = ts;
+                idx++;
+                q += step;
+            }
+            t->dev_count = idx;
         }
         return 1;
     }
@@ -182,8 +196,14 @@ int main(int argc, char **argv) {
         char img_path[1024];
         snprintf(img_path, sizeof(img_path), "%s/%s", images_dir, c->image_name);
 
+        int is_luks = (strncmp(c->case_name, "luks2-", 6) == 0);
         FILE *f = fopen(img_path, "rb");
         if (!f) {
+            if (is_luks) {
+                printf("[ SKIP ] %s: LUKS container image not present (%s)\n",
+                       c->case_name, img_path);
+                continue;
+            }
             fprintf(stderr, "[%s] could not open image %s\n", c->case_name, img_path);
             fails++;
             continue;
@@ -198,20 +218,31 @@ int main(int argc, char **argv) {
         lvmcore_arena arena;
         lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
 
+        if (is_luks) {
+            /* Encrypted LUKS2 containers carry no plaintext LABELONE header. */
+            lvmcore_pv_label lbl;
+            lvmcore_err lerr = {0};
+            lvmcore_status lst = lvmcore_read_pv_label(&src, &arena, &lbl, &lerr);
+            char name[128];
+            snprintf(name, sizeof(name), "%s: lvmcore_read_pv_label rejects LUKS with NO_LABEL",
+                     c->case_name);
+            CHECK(name, lst == LVMCORE_ERR_NO_LABEL);
+
+            lvmcore_arena_reset(&arena);
+            lvmcore_volume_group lvg;
+            lvmcore_err verr = {0};
+            lvmcore_status vst = lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &lvg, &verr);
+            snprintf(name, sizeof(name), "%s: lvmcore_read_vg rejects LUKS with NO_LABEL",
+                     c->case_name);
+            CHECK(name, vst == LVMCORE_ERR_NO_LABEL);
+            fclose(f);
+            continue;
+        }
+
         lvmcore_volume_group vg;
         lvmcore_err err = {0};
         lvmcore_status st = lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vg, &err);
         if (st != LVMCORE_OK) {
-            /* luks2-* images are whole-disk LUKS containers: the PV lives
-             * behind the crypt layer, so a bare parse must FAIL here. */
-            if (strncmp(c->case_name, "luks2-", 6) == 0) {
-                char name[128];
-                snprintf(name, sizeof(name), "%s: bare parse refused (LUKS container)",
-                         c->case_name);
-                CHECK(name, 1);
-                fclose(f);
-                continue;
-            }
             fprintf(stderr, "[%s] parser failed (status=%s): %s\n",
                     c->case_name, lvmcore_status_string(st), err.message);
             fails++;
@@ -219,10 +250,11 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        printf("[%s] VG=%s seqno=%lu extents=%lu PVs=%lu LVs=%lu\n",
+        printf("[%s] VG=%s seqno=%lu extents=%lu PVs=%lu LVs=%lu ro=%d\n",
                c->case_name, vg.name, (unsigned long)vg.seqno,
                (unsigned long)vg.extent_size_sectors,
-               (unsigned long)vg.pv_count, (unsigned long)vg.lv_count);
+               (unsigned long)vg.pv_count, (unsigned long)vg.lv_count,
+               vg.read_only);
 
         /* VG name must appear in the vgs oracle. */
         {
@@ -236,8 +268,9 @@ int main(int argc, char **argv) {
 
         for (size_t j = 0; j < vg.lv_count; j++) {
             lvmcore_logical_volume *lv = &vg.lvs[j];
-            printf("  LV=%s visible=%d mappable=%d segs=%lu",
-                   lv->name, lv->visible, lv->mappable, (unsigned long)lv->segment_count);
+            printf("  LV=%s visible=%d ro=%d mappable=%d segs=%lu",
+                   lv->name, lv->visible, lv->read_only, lv->mappable,
+                   (unsigned long)lv->segment_count);
             if (!lv->mappable) printf(" REFUSED:%s", lv->unsupported_reason);
             printf("\n");
         }
@@ -257,6 +290,20 @@ int main(int argc, char **argv) {
         }
 
         int case_bad = 0;
+        if (vg.read_only != 0) {
+            printf("[ FAIL ] %s: expected writable VG (read_only==0), got %d\n",
+                   c->case_name, vg.read_only);
+            fails++; case_bad = 1;
+        }
+        for (size_t p = 0; p < vg.pv_count; p++) {
+            if (vg.pvs[p].missing != 0 || vg.pvs[p].pe_start == 0) {
+                printf("[ FAIL ] %s: PV %s unexpected missing=%d pe_start=%lu\n",
+                       c->case_name, vg.pvs[p].key, vg.pvs[p].missing,
+                       (unsigned long)vg.pvs[p].pe_start);
+                fails++; case_bad = 1;
+            }
+        }
+
         for (size_t j = 0; j < vg.lv_count; j++) {
             lvmcore_logical_volume *lv = &vg.lvs[j];
             char dm_name[160];
@@ -302,72 +349,97 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            /* Linear (stripe_count==1) segments are compared exactly. */
-            size_t oi = 0;
-            for (size_t s = 0; s < lv->segment_count; s++) {
-                lvmcore_segment *seg = &lv->segments[s];
-                if (seg->stripe_count != 1) continue;  /* striped: below */
-
-                if (oi >= ol->count) {
-                    printf("[ FAIL ] %s/%s: more linear segments than oracle lines\n",
-                           c->case_name, lv->name);
-                    fails++; case_bad = 1; break;
-                }
-                oracle_target *ot = &ol->t[oi];
-
-                int pv_idx = find_pv(&vg, seg->stripes[0].pv_key);
-                if (pv_idx < 0) {
-                    printf("[ FAIL ] %s/%s: stripe key %s unknown\n",
-                           c->case_name, lv->name, seg->stripes[0].pv_key);
-                    fails++; case_bad = 1; break;
-                }
-                lvmcore_physical_volume *pv = &vg.pvs[pv_idx];
-
-                uint64_t expect_start =
-                    pv->pe_start + seg->stripes[0].start_extent * vg.extent_size_sectors;
-                uint64_t expect_len   = seg->extent_count * vg.extent_size_sectors;
-                uint64_t expect_lv_start = seg->start_extent * vg.extent_size_sectors;
-
-                if (strcmp(ot->type, "linear") != 0) {
-                    printf("[ FAIL ] %s/%s seg%lu: oracle type is %s, we mapped linear\n",
-                           c->case_name, lv->name, (unsigned long)s, ot->type);
-                    fails++; case_bad = 1; break;
-                }
-                if (ot->start != expect_lv_start || ot->length != expect_len ||
-                    ot->target_start[0] != expect_start) {
-                    printf("[ FAIL ] %s/%s seg%lu:\n"
-                           "        linux: %lu %lu linear ... %lu\n"
-                           "        ours:  %lu %lu linear ... %lu\n",
-                           c->case_name, lv->name, (unsigned long)s,
-                           ot->start, ot->length, ot->target_start[0],
-                           (unsigned long)expect_lv_start, (unsigned long)expect_len,
-                           (unsigned long)expect_start);
-                    fails++; case_bad = 1; break;
-                }
-                oi++;
+            if (lv->read_only != 0) {
+                printf("[ FAIL ] %s/%s: expected writable LV (read_only==0), got %d\n",
+                       c->case_name, lv->name, lv->read_only);
+                fails++; case_bad = 1;
             }
 
-            /* Striped LV: count must agree with the oracle line. */
+            if (lv->segment_count != ol->count) {
+                printf("[ FAIL ] %s/%s: segment count %lu != oracle line count %lu\n",
+                       c->case_name, lv->name,
+                       (unsigned long)lv->segment_count, (unsigned long)ol->count);
+                fails++; case_bad = 1;
+                continue;
+            }
+
+            /* Compare every linear and striped segment in exact order against dmsetup-table. */
             for (size_t s = 0; s < lv->segment_count; s++) {
                 lvmcore_segment *seg = &lv->segments[s];
-                if (seg->stripe_count <= 1) continue;
-                int found = 0;
-                for (size_t k = 0; k < ol->count; k++) {
-                    if (strcmp(ol->t[k].type, "striped") == 0 &&
-                        ol->t[k].stripe_count == seg->stripe_count) {
-                        found = 1;
-                        if (seg->stripes[0].start_extent != 0) {
-                            printf("[ FAIL ] %s/%s: stripe start_extent %lu != 0\n",
-                                   c->case_name, lv->name,
-                                   (unsigned long)seg->stripes[0].start_extent);
-                            fails++; case_bad = 1;
+                oracle_target *ot = &ol->t[s];
+                uint64_t expect_lv_start = seg->start_extent * vg.extent_size_sectors;
+                uint64_t expect_len = seg->extent_count * vg.extent_size_sectors;
+
+                if (ot->start != expect_lv_start || ot->length != expect_len) {
+                    printf("[ FAIL ] %s/%s seg%lu range mismatch: linux=[%lu,+%lu) ours=[%lu,+%lu)\n",
+                           c->case_name, lv->name, (unsigned long)s,
+                           ot->start, ot->length,
+                           (unsigned long)expect_lv_start, (unsigned long)expect_len);
+                    fails++; case_bad = 1; break;
+                }
+
+                if (seg->stripe_count == 1) {
+                    int pv_idx = find_pv(&vg, seg->stripes[0].pv_key);
+                    if (pv_idx < 0) {
+                        printf("[ FAIL ] %s/%s: stripe key %s unknown\n",
+                               c->case_name, lv->name, seg->stripes[0].pv_key);
+                        fails++; case_bad = 1; break;
+                    }
+                    lvmcore_physical_volume *pv = &vg.pvs[pv_idx];
+                    uint64_t expect_start =
+                        pv->pe_start + seg->stripes[0].start_extent * vg.extent_size_sectors;
+
+                    if (strcmp(ot->type, "linear") != 0 || ot->dev_count != 1u ||
+                        ot->target_start[0] != expect_start) {
+                        printf("[ FAIL ] %s/%s seg%lu:\n"
+                               "        linux: %lu %lu %s ... %lu\n"
+                               "        ours:  %lu %lu linear ... %lu (pe_start=%lu)\n",
+                               c->case_name, lv->name, (unsigned long)s,
+                               ot->start, ot->length, ot->type, ot->target_start[0],
+                               (unsigned long)expect_lv_start, (unsigned long)expect_len,
+                               (unsigned long)expect_start, (unsigned long)pv->pe_start);
+                        fails++; case_bad = 1; break;
+                    }
+                } else {
+                    if (strcmp(ot->type, "striped") != 0) {
+                        printf("[ FAIL ] %s/%s seg%lu: oracle type is %s, expected striped\n",
+                               c->case_name, lv->name, (unsigned long)s, ot->type);
+                        fails++; case_bad = 1; break;
+                    }
+                    if (ot->stripe_count != seg->stripe_count ||
+                        ot->chunk != seg->stripe_size_sectors ||
+                        (uint64_t)ot->dev_count != seg->stripe_count ||
+                        (uint64_t)seg->stripe_count_used != seg->stripe_count) {
+                        printf("[ FAIL ] %s/%s seg%lu striped header mismatch:\n"
+                               "        linux: stripes=%lu chunk=%lu devs=%u\n"
+                               "        ours:  stripes=%lu chunk=%lu used=%lu\n",
+                               c->case_name, lv->name, (unsigned long)s,
+                               ot->stripe_count, ot->chunk, ot->dev_count,
+                               (unsigned long)seg->stripe_count,
+                               (unsigned long)seg->stripe_size_sectors,
+                               (unsigned long)seg->stripe_count_used);
+                        fails++; case_bad = 1; break;
+                    }
+                    for (size_t st_i = 0; st_i < seg->stripe_count_used; st_i++) {
+                        int pv_idx = find_pv(&vg, seg->stripes[st_i].pv_key);
+                        if (pv_idx < 0) {
+                            printf("[ FAIL ] %s/%s seg%lu stripe%lu: key %s unknown\n",
+                                   c->case_name, lv->name, (unsigned long)s, (unsigned long)st_i,
+                                   seg->stripes[st_i].pv_key);
+                            fails++; case_bad = 1; break;
+                        }
+                        lvmcore_physical_volume *pv = &vg.pvs[pv_idx];
+                        uint64_t expect_start =
+                            pv->pe_start + seg->stripes[st_i].start_extent * vg.extent_size_sectors;
+                        if (ot->target_start[st_i] != expect_start) {
+                            printf("[ FAIL ] %s/%s seg%lu stripe%lu start mismatch: linux=%lu ours=%lu (pe_start=%lu)\n",
+                                   c->case_name, lv->name, (unsigned long)s, (unsigned long)st_i,
+                                   ot->target_start[st_i], (unsigned long)expect_start,
+                                   (unsigned long)pv->pe_start);
+                            fails++; case_bad = 1; break;
                         }
                     }
-                }
-                if (!found) {
-                    printf("[ FAIL ] %s/%s: striped seg with %lu stripes has no oracle line\n",
-                           c->case_name, lv->name, (unsigned long)seg->stripe_count);
-                    fails++; case_bad = 1;
+                    if (case_bad) break;
                 }
             }
         }

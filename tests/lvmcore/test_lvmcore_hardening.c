@@ -14,6 +14,11 @@
  *
  * Usage: test_lvmcore_hardening (no arguments — all synthetic in-memory).
  */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,16 +124,19 @@ static void build_mda(const char *text) {
 }
 
 static void stripes_vg(char *out, size_t cap, int n_stripes, const char *seg_type) {
+    int ext_cnt = (n_stripes > 4) ? n_stripes : 4;
     size_t w = 0;
     w += (size_t)snprintf(out + w, cap - w,
         "vgx {\n"
         "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
         "seqno = 1\n"
+        "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
         "extent_size = 8192\n"
         "physical_volumes {\n"
         "  pv0 {\n"
         "    id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP\"\n"
         "    device = \"/dev/loop0\"\n"
+        "    status = [\"ALLOCATABLE\"]\n"
         "    pe_start = 2048\n"
         "    pe_count = 100\n"
         "  }\n"
@@ -140,12 +148,12 @@ static void stripes_vg(char *out, size_t cap, int n_stripes, const char *seg_typ
         "    segment_count = 1\n"
         "    segment1 {\n"
         "      start_extent = 0\n"
-        "      extent_count = 4\n"
+        "      extent_count = %d\n"
         "      type = \"%s\"\n"
         "      stripe_count = %d\n"
         "      stripe_size = 128\n"
         "      stripes = [",
-        seg_type, n_stripes);
+        ext_cnt, seg_type, n_stripes);
     for (int i = 0; i < n_stripes; i++)
         w += (size_t)snprintf(out + w, cap - w, "\"pv0\", %d, ", i);
     w += (size_t)snprintf(out + w, cap - w, "]\n    }\n  }\n }\n}\n");
@@ -514,6 +522,492 @@ int main(void) {
         CHECK("MDA ring wrap-around metadata parses correctly",
               st == LVMCORE_OK && vg.lv_count == 1);
         CHECK("wrapped VG name matches", strcmp(vg.name, "vgx") == 0);
+    }
+
+    /* ---- 14. PV label data_off bounds at end of 8 KiB scan buffer ---- */
+    {
+        /* Heap-allocate exact 8 KiB so ASan catches any read past byte 8191. */
+        unsigned char *scan_img = (unsigned char *)calloc(1, LVMCORE_LABEL_SCAN_BYTES);
+        CHECK("heap scan image allocated", scan_img != NULL);
+        if (scan_img) {
+            uint32_t bad_offs[] = { 500u, 473u, 472u, 31u };
+            for (size_t bi = 0; bi < sizeof(bad_offs) / sizeof(bad_offs[0]); bi++) {
+                memset(scan_img, 0, LVMCORE_LABEL_SCAN_BYTES);
+                unsigned char *p = scan_img + 7680u; /* last 512B sector of 8 KiB */
+                memcpy(p, "LABELONE", 8);
+                put_le64(p + 8, 15);
+                put_le32(p + 20, bad_offs[bi]);
+                memcpy(p + 24, "LVM2 001", 8);
+                put_le32(p + 16, lvmcore_crc32(p + 20, 512 - 20));
+
+                lvmcore_byte_source src; mem_src ms;
+                mem_source(scan_img, LVMCORE_LABEL_SCAN_BYTES, &src, &ms);
+                lvmcore_arena arena;
+                lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+                lvmcore_pv_label lbl;
+                lvmcore_err err = {0};
+
+                lvmcore_status st = lvmcore_read_pv_label(&src, &arena, &lbl, &err);
+                char msg[96];
+                snprintf(msg, sizeof(msg),
+                         "data_off=%u at off=7680 rejected without OOB read",
+                         bad_offs[bi]);
+                CHECK(msg, st == LVMCORE_ERR_CORRUPT_LABEL && err.failed);
+            }
+
+#ifndef _WIN32
+            /* Hardware PROT_NONE guard page immediately after the 8 KiB head buffer. */
+            long ps = sysconf(_SC_PAGESIZE);
+            if (ps > 0) {
+                size_t page_sz = (size_t)ps;
+                size_t data_pages =
+                    ((LVMCORE_LABEL_SCAN_BYTES + page_sz - 1u) / page_sz) * page_sz;
+                uint8_t *region = (uint8_t *)mmap(
+                    NULL, data_pages + page_sz, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (region != MAP_FAILED) {
+                    int prot_ok = (mprotect(region + data_pages, page_sz, PROT_NONE) == 0);
+                    CHECK("PROT_NONE guard page mapped after 8 KiB scan arena", prot_ok);
+                    if (prot_ok) {
+                        uint8_t *guarded_arena = region + (data_pages - LVMCORE_LABEL_SCAN_BYTES);
+                        uint32_t oob_offs[] = { 500u, 473u };
+                        for (size_t bi = 0; bi < sizeof(oob_offs) / sizeof(oob_offs[0]); bi++) {
+                            memset(scan_img, 0, LVMCORE_LABEL_SCAN_BYTES);
+                            unsigned char *p = scan_img + 7680u;
+                            memcpy(p, "LABELONE", 8);
+                            put_le64(p + 8, 15);
+                            put_le32(p + 20, oob_offs[bi]);
+                            memcpy(p + 24, "LVM2 001", 8);
+                            put_le32(p + 16, lvmcore_crc32(p + 20, 512 - 20));
+
+                            lvmcore_byte_source src; mem_src ms;
+                            mem_source(scan_img, LVMCORE_LABEL_SCAN_BYTES, &src, &ms);
+                            lvmcore_arena g_arena;
+                            lvmcore_arena_init(&g_arena, guarded_arena, LVMCORE_LABEL_SCAN_BYTES);
+                            lvmcore_pv_label lbl;
+                            lvmcore_err err = {0};
+
+                            lvmcore_status st = lvmcore_read_pv_label(&src, &g_arena, &lbl, &err);
+                            char msg[96];
+                            snprintf(msg, sizeof(msg),
+                                     "guard-page data_off=%u at off=7680 rejected without fault",
+                                     oob_offs[bi]);
+                            CHECK(msg, st == LVMCORE_ERR_CORRUPT_LABEL && err.failed);
+                        }
+                    }
+                    munmap(region, data_pages + page_sz);
+                }
+            }
+#endif
+            free(scan_img);
+        }
+    }
+
+    /* ---- 15. Slot 0 LVMCORE_RAW_LOCN_IGNORED skipped in multi-MDA PV - */
+    {
+        const uint64_t mda0_off = 4096u;
+        const uint64_t mda0_sz  = 65536u;
+        const uint64_t mda1_off = 69632u;
+        const uint64_t mda1_sz  = 65536u;
+
+        memset(img, 0, sizeof(img));
+        unsigned char *p = img + LABEL_OFF;
+        memcpy(p, "LABELONE", 8);
+        put_le64(p + 8, 1);
+        put_le32(p + 20, 32);
+        memcpy(p + 24, "LVM2 001", 8);
+        unsigned char *pvh = p + 32;
+        memcpy(pvh, "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP", 32);
+        put_le64(pvh + 32, IMG_SIZE);
+        unsigned char *d = pvh + 40;
+        put_le64(d, 0x1000000); put_le64(d + 8, 0x7f00000);
+        put_le64(d + 16, 0); put_le64(d + 24, 0);
+        unsigned char *m = d + 32;
+        put_le64(m,      mda0_off); put_le64(m + 8,  mda0_sz);
+        put_le64(m + 16, mda1_off); put_le64(m + 24, mda1_sz);
+        put_le64(m + 32, 0);        put_le64(m + 40, 0);
+        put_le32(p + 16, lvmcore_crc32(p + 20, 512 - 20));
+
+        /* MDA 0: higher seqno=99 but Slot 0 has LVMCORE_RAW_LOCN_IGNORED. */
+        const char *meta_ignored =
+            "vgx {\n"
+            "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            "seqno = 99\n"
+            "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
+            "extent_size = 8192\n"
+            "physical_volumes {\n"
+            "  pv0 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+            "}\n"
+            "}\n";
+        size_t len0 = strlen(meta_ignored) + 1;
+        memcpy(img + mda0_off + 512, meta_ignored, len0);
+        unsigned char *h0 = img + mda0_off;
+        memcpy(h0 + 4, " LVM2 x[5A%r0N*>", 16);
+        put_le32(h0 + 20, 1);
+        put_le64(h0 + 24, mda0_off);
+        put_le64(h0 + 32, mda0_sz);
+        put_le64(h0 + 40, 512);
+        put_le64(h0 + 48, len0);
+        put_le32(h0 + 56, lvmcore_crc32(img + mda0_off + 512, len0));
+        put_le32(h0 + 60, LVMCORE_RAW_LOCN_IGNORED);
+        put_le32(h0, lvmcore_crc32(h0 + 4, 512 - 4));
+
+        /* MDA 1: active with seqno=5. */
+        const char *meta_active =
+            "vgx {\n"
+            "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            "seqno = 5\n"
+            "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
+            "extent_size = 8192\n"
+            "physical_volumes {\n"
+            "  pv0 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+            "}\n"
+            "}\n";
+        size_t len1 = strlen(meta_active) + 1;
+        memcpy(img + mda1_off + 512, meta_active, len1);
+        unsigned char *h1 = img + mda1_off;
+        memcpy(h1 + 4, " LVM2 x[5A%r0N*>", 16);
+        put_le32(h1 + 20, 1);
+        put_le64(h1 + 24, mda1_off);
+        put_le64(h1 + 32, mda1_sz);
+        put_le64(h1 + 40, 512);
+        put_le64(h1 + 48, len1);
+        put_le32(h1 + 56, lvmcore_crc32(img + mda1_off + 512, len1));
+        put_le32(h1 + 60, 0);
+        put_le32(h1, lvmcore_crc32(h1 + 4, 512 - 4));
+
+        lvmcore_byte_source src; mem_src ms;
+        mem_source(img, IMG_SIZE, &src, &ms);
+        lvmcore_arena arena;
+        lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+        lvmcore_volume_group vg;
+        lvmcore_err err = {0};
+
+        lvmcore_status st = lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vg, &err);
+        CHECK("multi-MDA skips ignored MDA 0 (seqno 99) and selects active MDA 1 (seqno 5)",
+              st == LVMCORE_OK && vg.seqno == 5);
+
+        /* Direct read_metadata_text on ignored MDA 0 returns NO_VALID_MDA. */
+        lvmcore_arena_reset(&arena);
+        lvmcore_disk_area area0 = { mda0_off, mda0_sz };
+        lvmcore_mda_header mdah0;
+        char *txt0 = NULL;
+        size_t txt0_len = 0;
+        CHECK("read_mda_header on ignored MDA 0 succeeds with IGNORED flag",
+              lvmcore_read_mda_header(&src, &area0, &arena, &mdah0, &err) == LVMCORE_OK &&
+              (mdah0.raw_locns[0].flags & LVMCORE_RAW_LOCN_IGNORED) != 0);
+        CHECK("read_metadata_text on ignored MDA 0 returns NO_VALID_MDA",
+              lvmcore_read_metadata_text(&src, &area0, &mdah0, LVMCORE_READ_FLAG_DEFAULT,
+                                         &arena, &txt0, &txt0_len, NULL, &err) == LVMCORE_ERR_NO_VALID_MDA);
+
+        /* Mark MDA 1 ignored as well -> whole PV has no valid MDA. */
+        put_le32(h1 + 60, LVMCORE_RAW_LOCN_IGNORED);
+        put_le32(h1, lvmcore_crc32(h1 + 4, 512 - 4));
+        lvmcore_arena_reset(&arena);
+        st = lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vg, &err);
+        CHECK("all-ignored MDAs fail with LVMCORE_ERR_NO_VALID_MDA",
+              st == LVMCORE_ERR_NO_VALID_MDA);
+    }
+
+    /* ---- 16. Multi-MDA seqno==0 selection & non-VG section isolation - */
+    {
+        const uint64_t mda0_off = 4096u;
+        const uint64_t mda0_sz  = 65536u;
+        const uint64_t mda1_off = 69632u;
+        const uint64_t mda1_sz  = 65536u;
+
+        memset(img, 0, sizeof(img));
+        unsigned char *p = img + LABEL_OFF;
+        memcpy(p, "LABELONE", 8);
+        put_le64(p + 8, 1);
+        put_le32(p + 20, 32);
+        memcpy(p + 24, "LVM2 001", 8);
+        unsigned char *pvh = p + 32;
+        memcpy(pvh, "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP", 32);
+        put_le64(pvh + 32, IMG_SIZE);
+        unsigned char *d = pvh + 40;
+        put_le64(d, 0x1000000); put_le64(d + 8, 0x7f00000);
+        put_le64(d + 16, 0); put_le64(d + 24, 0);
+        unsigned char *m = d + 32;
+        put_le64(m,      mda0_off); put_le64(m + 8,  mda0_sz);
+        put_le64(m + 16, mda1_off); put_le64(m + 24, mda1_sz);
+        put_le64(m + 32, 0);        put_le64(m + 40, 0);
+        put_le32(p + 16, lvmcore_crc32(p + 20, 512 - 20));
+
+        /* MDA 0: valid CRC text without a VG section. */
+        const char *meta_novg = "dummy { system_id = \"stale\" }\n";
+        size_t len0 = strlen(meta_novg) + 1;
+        memcpy(img + mda0_off + 512, meta_novg, len0);
+        unsigned char *h0 = img + mda0_off;
+        memcpy(h0 + 4, " LVM2 x[5A%r0N*>", 16);
+        put_le32(h0 + 20, 1);
+        put_le64(h0 + 24, mda0_off);
+        put_le64(h0 + 32, mda0_sz);
+        put_le64(h0 + 40, 512);
+        put_le64(h0 + 48, len0);
+        put_le32(h0 + 56, lvmcore_crc32(img + mda0_off + 512, len0));
+        put_le32(h0, lvmcore_crc32(h0 + 4, 512 - 4));
+
+        /* MDA 1: valid VG with seqno = 0 preceded by a non-VG section. */
+        const char *meta_seq0 =
+            "preamble { system_id = \"leaked\" }\n"
+            "vgzero {\n"
+            "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            "seqno = 0\n"
+            "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
+            "extent_size = 8192\n"
+            "physical_volumes {\n"
+            "  pv0 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+            "}\n"
+            "}\n";
+        size_t len1 = strlen(meta_seq0) + 1;
+        memcpy(img + mda1_off + 512, meta_seq0, len1);
+        unsigned char *h1 = img + mda1_off;
+        memcpy(h1 + 4, " LVM2 x[5A%r0N*>", 16);
+        put_le32(h1 + 20, 1);
+        put_le64(h1 + 24, mda1_off);
+        put_le64(h1 + 32, mda1_sz);
+        put_le64(h1 + 40, 512);
+        put_le64(h1 + 48, len1);
+        put_le32(h1 + 56, lvmcore_crc32(img + mda1_off + 512, len1));
+        put_le32(h1, lvmcore_crc32(h1 + 4, 512 - 4));
+
+        lvmcore_byte_source src; mem_src ms;
+        mem_source(img, IMG_SIZE, &src, &ms);
+        lvmcore_arena arena;
+        lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+        lvmcore_volume_group vg;
+        lvmcore_err err = {0};
+
+        lvmcore_status st = lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vg, &err);
+        CHECK("multi-MDA selects valid seqno==0 MDA over invalid MDA 0",
+              st == LVMCORE_OK && strcmp(vg.name, "vgzero") == 0 && vg.seqno == 0);
+        CHECK("non-VG preamble does not bleed system_id into VG",
+              vg.system_id[0] == '\0');
+    }
+
+    /* ---- 17. Segment contiguity, overlap, gap & declared count ------- */
+    {
+        struct {
+            const char *name;
+            const char *lv_body;
+        } bad_segs[] = {
+            {
+                "segment starting at nonzero extent rejected",
+                "segment_count = 1\n"
+                "segment1 { start_extent = 1 extent_count = 2 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 0] }\n"
+            },
+            {
+                "gapped segments rejected",
+                "segment_count = 2\n"
+                "segment1 { start_extent = 0 extent_count = 2 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 0] }\n"
+                "segment2 { start_extent = 3 extent_count = 2 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 2] }\n"
+            },
+            {
+                "overlapping segments rejected",
+                "segment_count = 2\n"
+                "segment1 { start_extent = 0 extent_count = 3 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 0] }\n"
+                "segment2 { start_extent = 2 extent_count = 2 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 4] }\n"
+            },
+            {
+                "declared_segment_count mismatch rejected",
+                "segment_count = 2\n"
+                "segment1 { start_extent = 0 extent_count = 2 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 0] }\n"
+            },
+            {
+                "zero extent_count segment rejected",
+                "segment_count = 1\n"
+                "segment1 { start_extent = 0 extent_count = 0 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 0] }\n"
+            },
+        };
+
+        for (size_t i = 0; i < sizeof(bad_segs) / sizeof(bad_segs[0]); i++) {
+            snprintf(meta, sizeof(meta),
+                "vgx {\n"
+                "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+                "seqno = 1\n"
+                "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
+                "extent_size = 8192\n"
+                "physical_volumes {\n"
+                "  pv0 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+                "}\n"
+                "logical_volumes {\n"
+                "  lv0 {\n"
+                "    id = \"lllllllllllllllllllllllllllllll0\"\n"
+                "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+                "    %s"
+                "  }\n"
+                "}\n"
+                "}\n",
+                bad_segs[i].lv_body);
+            lvmcore_arena arena;
+            lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+            lvmcore_volume_group vg;
+            lvmcore_err err = {0};
+            lvmcore_status st = lvmcore_parse_vg_text(meta, strlen(meta), &arena, &vg, &err);
+            CHECK(bad_segs[i].name,
+                  st == LVMCORE_OK && vg.lv_count == 1 &&
+                  vg.lvs[0].mappable == 0 && vg.lvs[0].unsupported_reason[0] != '\0');
+        }
+    }
+
+    /* ---- 18. Empty stripes = [], bad stripe geometry & PV bounds ----- */
+    {
+        struct {
+            const char *name;
+            const char *seg_body;
+        } bad_stripes[] = {
+            {
+                "empty stripes = [] with stripe_count = 1 rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = []"
+            },
+            {
+                "empty stripes = [] with stripe_count = 0 rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 0 stripes = []"
+            },
+            {
+                "omitted stripes array (NULL) rejected without deref",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1"
+            },
+            {
+                "striped segment with stripe_size = 0 rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 2 stripe_size = 0 stripes = [\"pv0\", 0, \"pv0\", 2]"
+            },
+            {
+                "striped segment with non-power-of-two stripe_size rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 2 stripe_size = 96 stripes = [\"pv0\", 0, \"pv0\", 2]"
+            },
+            {
+                "striped segment with extent_count not divisible by stripe_count rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 3 stripe_size = 128 stripes = [\"pv0\", 0, \"pv0\", 2, \"pv0\", 4]"
+            },
+            {
+                "stripe referencing unknown PV rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv9\", 0]"
+            },
+            {
+                "stripe extending past pv->pe_count rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 98]"
+            },
+            {
+                "stripe start_extent overflow rejected",
+                "start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 9223372036854775807]"
+            },
+        };
+
+        for (size_t i = 0; i < sizeof(bad_stripes) / sizeof(bad_stripes[0]); i++) {
+            snprintf(meta, sizeof(meta),
+                "vgx {\n"
+                "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+                "seqno = 1\n"
+                "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
+                "extent_size = 8192\n"
+                "physical_volumes {\n"
+                "  pv0 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+                "}\n"
+                "logical_volumes {\n"
+                "  lv0 {\n"
+                "    id = \"lllllllllllllllllllllllllllllll0\"\n"
+                "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+                "    segment_count = 1\n"
+                "    segment1 { %s }\n"
+                "  }\n"
+                "}\n"
+                "}\n",
+                bad_stripes[i].seg_body);
+            lvmcore_arena arena;
+            lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+            lvmcore_volume_group vg;
+            lvmcore_err err = {0};
+            lvmcore_status st = lvmcore_parse_vg_text(meta, strlen(meta), &arena, &vg, &err);
+            CHECK(bad_stripes[i].name,
+                  st == LVMCORE_OK && vg.lv_count == 1 &&
+                  vg.lvs[0].mappable == 0 && vg.lvs[0].unsupported_reason[0] != '\0');
+        }
+    }
+
+    /* ---- 19. READ-only VG/LV and MISSING PV status flags ------------- */
+    {
+        const char *ro_meta =
+            "vgro {\n"
+            "id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            "seqno = 3\n"
+            "status = [\"RESIZEABLE\", \"READ\"]\n"
+            "extent_size = 8192\n"
+            "physical_volumes {\n"
+            "  pv0 {\n"
+            "    id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP0\"\n"
+            "    status = [\"ALLOCATABLE\"]\n"
+            "    flags = []\n"
+            "    pe_start = 2048\n"
+            "    pe_count = 100\n"
+            "  }\n"
+            "  pv1 {\n"
+            "    id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP1\"\n"
+            "    status = [\"ALLOCATABLE\", \"MISSING\"]\n"
+            "    flags = []\n"
+            "    pe_start = 2048\n"
+            "    pe_count = 100\n"
+            "  }\n"
+            "  pv2 {\n"
+            "    id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP2\"\n"
+            "    status = [\"ALLOCATABLE\"]\n"
+            "    flags = [\"MISSING\"]\n"
+            "    pe_start = 2048\n"
+            "    pe_count = 100\n"
+            "  }\n"
+            "}\n"
+            "logical_volumes {\n"
+            "  lv_ro {\n"
+            "    id = \"lllllllllllllllllllllllllllllll1\"\n"
+            "    status = [\"READ\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 0] }\n"
+            "  }\n"
+            "  lv_rw {\n"
+            "    id = \"lllllllllllllllllllllllllllllll2\"\n"
+            "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 4] }\n"
+            "  }\n"
+            "  lv_miss_status {\n"
+            "    id = \"lllllllllllllllllllllllllllllll3\"\n"
+            "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv1\", 0] }\n"
+            "  }\n"
+            "  lv_miss_flags {\n"
+            "    id = \"lllllllllllllllllllllllllllllll4\"\n"
+            "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"striped\" stripe_count = 1 stripes = [\"pv2\", 0] }\n"
+            "  }\n"
+            "}\n"
+            "}\n";
+
+        lvmcore_arena arena;
+        lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+        lvmcore_volume_group vg;
+        lvmcore_err err = {0};
+        lvmcore_status st = lvmcore_parse_vg_text(ro_meta, strlen(ro_meta), &arena, &vg, &err);
+        CHECK("read-only VG with missing PVs parses", st == LVMCORE_OK);
+        CHECK("VG status without WRITE sets vg.read_only == 1", vg.read_only == 1);
+        CHECK("pv0 missing == 0, pv1 (status) missing == 1, pv2 (flags) missing == 1",
+              vg.pv_count == 3 &&
+              vg.pvs[0].missing == 0 && vg.pvs[1].missing == 1 && vg.pvs[2].missing == 1);
+
+        const lvmcore_logical_volume *lv_ro = lvmcore_vg_find_lv(&vg, "lv_ro");
+        const lvmcore_logical_volume *lv_rw = lvmcore_vg_find_lv(&vg, "lv_rw");
+        const lvmcore_logical_volume *lv_ms = lvmcore_vg_find_lv(&vg, "lv_miss_status");
+        const lvmcore_logical_volume *lv_mf = lvmcore_vg_find_lv(&vg, "lv_miss_flags");
+        CHECK("lv_ro has read_only==1, visible==1, mappable==1",
+              lv_ro && lv_ro->read_only == 1 && lv_ro->visible == 1 && lv_ro->mappable == 1);
+        CHECK("lv_rw has read_only==0, visible==1, mappable==1",
+              lv_rw && lv_rw->read_only == 0 && lv_rw->visible == 1 && lv_rw->mappable == 1);
+        CHECK("LV on PV with status MISSING is unmappable",
+              lv_ms && lv_ms->mappable == 0);
+        CHECK("LV on PV with flags MISSING is unmappable",
+              lv_mf && lv_mf->mappable == 0);
     }
 
     printf("\n%d passed, %d failed (lvmcore hardening tests)\n", passes, fails);

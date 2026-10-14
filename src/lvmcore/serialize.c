@@ -10,10 +10,6 @@
  * Zero dynamic allocation, non-recursive, stack frames <= 512 bytes,
  * overflow-checked arithmetic throughout.
  */
-#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
-
 #include "lvmcore/types.h"
 #include "lvmcore/arena.h"
 #include "lvmcore/crc32.h"
@@ -101,11 +97,23 @@ static void tw_put_u64(text_writer *tw, uint64_t v) {
     }
 }
 
+/* Append a string escaping backslash and double-quote characters for LVM2 config grammar. */
+static void tw_puts_escaped(text_writer *tw, const char *s) {
+    if (!s) return;
+    while (*s) {
+        if (*s == '\\' || *s == '"') {
+            tw_putc(tw, '\\');
+        }
+        tw_putc(tw, *s);
+        s++;
+    }
+}
+
 /* Append "key = value" line with newline. */
 static void tw_line_str(text_writer *tw, const char *key, const char *val) {
     tw_puts(tw, key);
     tw_puts(tw, " = \"");
-    tw_puts(tw, val);
+    tw_puts_escaped(tw, val);
     tw_puts(tw, "\"\n");
 }
 
@@ -151,10 +159,14 @@ LVMCORE_NOINLINE static void ser_pv_full(text_writer *tw,
     tw_puts(tw, "\"\n");
     if (pv->device[0]) {
         tw_puts(tw, "\t\t\tdevice = \"");
-        tw_puts(tw, pv->device);
+        tw_puts_escaped(tw, pv->device);
         tw_puts(tw, "\"\n");
     }
-    tw_puts(tw, "\n\t\t\tstatus = [\"ALLOCATABLE\"]\n");
+    if (pv->missing) {
+        tw_puts(tw, "\n\t\t\tstatus = [\"ALLOCATABLE\", \"MISSING\"]\n");
+    } else {
+        tw_puts(tw, "\n\t\t\tstatus = [\"ALLOCATABLE\"]\n");
+    }
     tw_puts(tw, "\t\t\tflags = []\n");
     tw_puts(tw, "\t\t\tdev_size = ");
     tw_put_u64(tw, pv->dev_size_sectors);
@@ -228,10 +240,14 @@ LVMCORE_NOINLINE static void ser_lv_block(text_writer *tw,
     tw_puts(tw, "\t\t\tid = \"");
     tw_put_uuid(tw, lv->id);
     tw_puts(tw, "\"\n");
-    if (lv->visible) {
+    if (lv->visible && !lv->read_only) {
         tw_puts(tw, "\t\t\tstatus = [\"READ\", \"WRITE\", \"VISIBLE\"]\n");
-    } else {
+    } else if (lv->visible && lv->read_only) {
+        tw_puts(tw, "\t\t\tstatus = [\"READ\", \"VISIBLE\"]\n");
+    } else if (!lv->visible && !lv->read_only) {
         tw_puts(tw, "\t\t\tstatus = [\"READ\", \"WRITE\"]\n");
+    } else {
+        tw_puts(tw, "\t\t\tstatus = [\"READ\"]\n");
     }
     tw_puts(tw, "\t\t\tflags = []\n");
     tw_puts(tw, "\t\t\tcreation_time = 0\n");
@@ -255,8 +271,15 @@ LVMCORE_NOINLINE static void ser_vg_root(text_writer *tw,
     tw_puts(tw, "\"\n");
     tw_line_u64(tw, "\tseqno", vg->seqno);
     tw_line_str(tw, "\tformat", "lvm2");
-    tw_puts(tw, "\tstatus = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n");
+    if (vg->read_only) {
+        tw_puts(tw, "\tstatus = [\"RESIZEABLE\", \"READ\"]\n");
+    } else {
+        tw_puts(tw, "\tstatus = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n");
+    }
     tw_puts(tw, "\tflags = []\n");
+    if (vg->system_id[0]) {
+        tw_line_str(tw, "\tsystem_id", vg->system_id);
+    }
     tw_line_u64(tw, "\textent_size", vg->extent_size_sectors);
     tw_line_u64(tw, "\tmax_lv", 0);
     tw_line_u64(tw, "\tmax_pv", 0);
@@ -359,20 +382,15 @@ lvmcore_status lvmcore_mda_next_offset(const lvmcore_mda_header *mdah,
         return LVMCORE_OK;
     }
 
-    if (old->offset < LVMCORE_MDA_HEADER_SIZE || old->offset >= mda_size) {
+    if (old->offset < LVMCORE_MDA_HEADER_SIZE || old->offset >= mda_size ||
+        old->size == 0 || old->size > ring_size) {
         return LVMCORE_ERR_INVALID_ARG;
-    }
-    if (old->size > mda_size - old->offset + LVMCORE_MDA_HEADER_SIZE) {
-        /* wrapped copy can extend past mda_size back to header end */
     }
 
     /* Compute old_last: last byte of old metadata (inclusive). */
     uint64_t old_last;
-    if (old->offset + old->size > mda_size) {
-        uint64_t old_wrap = (old->offset + old->size) - mda_size;
-        if (old_wrap == 0 || old_wrap > LVMCORE_MDA_HEADER_SIZE) {
-            return LVMCORE_ERR_INVALID_ARG;
-        }
+    if (old->size > mda_size - old->offset) {
+        uint64_t old_wrap = old->size - (mda_size - old->offset);
         old_last = old_wrap + LVMCORE_MDA_HEADER_SIZE - 1;
     } else {
         old_last = old->offset + old->size - 1;
@@ -517,9 +535,14 @@ lvmcore_status lvmcore_mda_header_write(const lvmcore_mda_header *mdah,
     s_put_le64(sector_buf + 24, mdah->start);
     s_put_le64(sector_buf + 32, mdah->size);
 
-    /* Slot 0 at 40..87; slot 1 at 88..135 */
-    for (int i = 0; i < 2; i++) {
-        size_t base = (i == 0) ? 40 : 88;
+    /*
+     * Packed 24-byte raw_locn slots follow the 40-byte mda_header prefix:
+     *   Slot 0 (committed):    bytes 40..63
+     *   Slot 1 (precommitted): bytes 64..87
+     * Remaining bytes 88..511 stay zero (NULL-terminating raw_locns[]).
+     */
+    for (size_t i = 0; i < 2; i++) {
+        size_t base = 40u + i * 24u;
         s_put_le64(sector_buf + base,      mdah->raw_locns[i].offset);
         s_put_le64(sector_buf + base + 8,  mdah->raw_locns[i].size);
         s_put_le32(sector_buf + base + 16, mdah->raw_locns[i].checksum);

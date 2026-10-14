@@ -14,10 +14,6 @@
 #ifndef LVMCORE_PARSER_H
 #define LVMCORE_PARSER_H
 
-#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
-
 #include "lvmcore/types.h"
 #include "lvmcore/arena.h"
 #include "lvmcore/crc32.h"

@@ -6,8 +6,7 @@
 #ifndef LVMCORE_CRC32_H
 #define LVMCORE_CRC32_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include "lvmcore/types.h"
 
 #ifdef __cplusplus
 extern "C" {

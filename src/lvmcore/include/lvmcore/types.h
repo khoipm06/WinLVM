@@ -9,8 +9,62 @@
 #define LVMCORE_TYPES_H
 
 #include <stddef.h>
+#if defined(_KERNEL_MODE) && defined(_MSC_VER)
+#ifndef WINLVM_KM_STDINT_DEFINED
+#define WINLVM_KM_STDINT_DEFINED
+typedef signed __int8    int8_t;
+typedef signed __int16   int16_t;
+typedef signed __int32   int32_t;
+typedef signed __int64   int64_t;
+typedef unsigned __int8  uint8_t;
+typedef unsigned __int16 uint16_t;
+typedef unsigned __int32 uint32_t;
+typedef unsigned __int64 uint64_t;
+#ifndef _UINTPTR_T_DEFINED
+#define _UINTPTR_T_DEFINED
+#if defined(_WIN64)
+typedef unsigned __int64 uintptr_t;
+#else
+typedef unsigned __int32 uintptr_t;
+#endif
+#endif
+#ifndef _INTPTR_T_DEFINED
+#define _INTPTR_T_DEFINED
+#if defined(_WIN64)
+typedef signed __int64   intptr_t;
+#else
+typedef signed __int32   intptr_t;
+#endif
+#endif
+#ifndef UINT32_MAX
+#define UINT32_MAX 0xffffffffu
+#endif
+#ifndef UINT64_MAX
+#define UINT64_MAX 0xffffffffffffffffui64
+#endif
+#ifndef SIZE_MAX
+#if defined(_WIN64)
+#define SIZE_MAX   0xffffffffffffffffui64
+#else
+#define SIZE_MAX   0xffffffffu
+#endif
+#endif
+#endif /* WINLVM_KM_STDINT_DEFINED */
+#if !defined(__cplusplus) && !defined(__bool_true_false_are_defined) && \
+    (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L)
+#define __bool_true_false_are_defined 1
+#if _MSC_VER >= 1800
+#define bool _Bool
+#else
+typedef unsigned char bool;
+#endif
+#define true  1
+#define false 0
+#endif
+#else
 #include <stdint.h>
 #include <stdbool.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -133,6 +187,7 @@ typedef struct lvmcore_logical_volume {
     char             name[64];
     char             id[33]; /* raw 32 characters + NUL */
     int              visible;
+    int              read_only; /* 1 if LV status lacks "WRITE", 0 if "WRITE" is present */
     int              mappable;
     int              internal;
     char             unsupported_reason[64];
@@ -150,6 +205,7 @@ typedef struct lvmcore_physical_volume {
     uint64_t pe_start; /* sectors */
     uint64_t pe_count;
     uint64_t dev_size_sectors;
+    int      missing; /* 1 if PV status/flags contains "MISSING", 0 otherwise */
 } lvmcore_physical_volume;
 
 /* Volume group flags. */
@@ -164,6 +220,7 @@ typedef struct lvmcore_volume_group {
     uint64_t                 seqno;
     uint64_t                 extent_size_sectors;
     uint32_t                 flags;
+    int                      read_only; /* 1 if VG status lacks "WRITE", 0 if "WRITE" is present */
     size_t                   pv_count;
     lvmcore_physical_volume *pvs;
     size_t                   lv_count;
