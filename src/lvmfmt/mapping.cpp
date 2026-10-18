@@ -75,6 +75,10 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
         error = "segment references unknown physical volume '" + stripe.target + "'";
         return std::nullopt;
       }
+      if (pv->is_missing()) {
+        error = "segment references missing physical volume '" + stripe.target + "'";
+        return std::nullopt;
+      }
       const auto pv_offset_extents = extents_to_sectors(stripe.start_extent, vg.extent_size_sectors);
       if (!pv_offset_extents) {
         error = "stripe offset arithmetic overflows";

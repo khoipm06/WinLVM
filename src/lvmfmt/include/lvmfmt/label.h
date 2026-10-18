@@ -16,6 +16,7 @@ namespace lvmfmt {
 
 inline constexpr std::uint32_t kLabelSize = 512;
 inline constexpr std::uint32_t kMdaHeaderSize = 512;
+inline constexpr std::uint32_t kRawLocnIgnored = 0x1u;
 
 // A (offset, size) pair as stored in the PV header. Offsets are relative to
 // the start of the physical volume.
@@ -41,12 +42,18 @@ struct MdaHeader {
   std::uint64_t commit_offset = 0;  // relative to `start`
   std::uint64_t commit_size = 0;
   std::uint32_t commit_checksum = 0;
+  std::uint32_t commit_flags = 0;
 };
 
 // Scans the head of the device for a LABELONE label and parses the PV header.
 std::optional<PvLabel> read_pv_label(ByteSource& source, std::string& error);
 
-// Reads and validates the mda_header at `area.offset`.
+// Reads and validates an mda_header at `area.offset`, including empty or
+// ignored headers (CRC, magic, version, start, and size are still enforced).
+std::optional<MdaHeader> read_mda_header_raw(ByteSource& source, const DiskArea& area,
+                                             std::string& error);
+
+// Reads and validates a committed, non-ignored mda_header at `area.offset`.
 std::optional<MdaHeader> read_mda_header(ByteSource& source, const DiskArea& area,
                                          std::string& error);
 
@@ -55,7 +62,7 @@ std::optional<MdaHeader> read_mda_header(ByteSource& source, const DiskArea& are
 std::optional<std::string> read_metadata_text(ByteSource& source, const MdaHeader& mda,
                                               std::string& error);
 
-// Convenience: label -> first usable metadata area -> text.
+// Convenience: label -> highest-seqno usable metadata area -> text.
 std::optional<std::string> read_vg_metadata(ByteSource& source, const PvLabel& label,
                                             std::string& error);
 

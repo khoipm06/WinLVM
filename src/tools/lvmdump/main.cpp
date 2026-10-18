@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
   }
 
   std::string error;
-  auto source = lvmfmt::open_file_source(path, error);
+  auto source = lvmfmt::open_storage_source(path, false, error);
   if (!source) {
     std::cerr << "error: " << error << "\n";
     return 1;

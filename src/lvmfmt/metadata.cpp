@@ -22,6 +22,10 @@ const char* const kRefusedStatus[] = {
     "PVMOVE", "LOCKED", "CONVERTING", "MERGING", "SNAPSHOT", "VIRTUAL",
 };
 
+bool has_status_flag(const std::vector<std::string>& status, std::string_view flag) {
+  return std::find(status.begin(), status.end(), flag) != status.end();
+}
+
 std::optional<std::uint64_t> non_negative(std::optional<std::int64_t> v) {
   if (!v || *v < 0) return std::nullopt;
   return static_cast<std::uint64_t>(*v);
@@ -47,17 +51,6 @@ void parse_segment(const Section& sec, Segment& seg) {
 }
 
 // Names this LV's segments point at that are not physical volumes.
-//
-// Two kinds, and the distinction matters for safety:
-//
-//  * `internal` — LVM's hidden sub-volumes (RAID images, thin pool data and
-//    metadata, COW stores). Not user-visible; we skip them.
-//
-//  * `origin` — this LV is the origin of a snapshot. Its metadata still looks
-//    like a plain linear volume, but the kernel presents it as a
-//    `snapshot-origin` target so writes go through copy-on-write first.
-//    Mapping it directly from its extents would bypass the COW layer and
-//    silently destroy the snapshot. It must be refused, not mapped.
 void collect_references(const Section& lv_sec, std::set<std::string>& internal_out,
                         std::set<std::string>& origin_out) {
   static const char* const kInternalKeys[] = {
@@ -89,6 +82,35 @@ std::uint64_t LogicalVolume::extent_count() const {
   return total;
 }
 
+bool LogicalVolume::is_read_only() const {
+  return !status.empty() && !has_status_flag(status, "WRITE");
+}
+
+bool LogicalVolume::is_visible() const {
+  return status.empty() || has_status_flag(status, "VISIBLE");
+}
+
+bool PhysicalVolume::is_missing() const {
+  return has_status_flag(status, "MISSING");
+}
+
+bool PhysicalVolume::is_allocatable() const {
+  if (is_missing()) return false;
+  return status.empty() || has_status_flag(status, "ALLOCATABLE");
+}
+
+bool VolumeGroup::is_read_only() const {
+  return !status.empty() && !has_status_flag(status, "WRITE");
+}
+
+bool VolumeGroup::is_exported() const {
+  return has_status_flag(status, "EXPORTED");
+}
+
+bool VolumeGroup::is_resizeable() const {
+  return status.empty() || has_status_flag(status, "RESIZEABLE");
+}
+
 const PhysicalVolume* VolumeGroup::find_pv(std::string_view key) const {
   for (const auto& pv : pvs) {
     if (pv.key == key) return &pv;
@@ -100,7 +122,9 @@ const PhysicalVolume* VolumeGroup::find_pv_by_uuid(std::string_view uuid) const 
   auto strip_hyphens = [](std::string_view s) {
     std::string out;
     out.reserve(32);
-    for (char c : s) if (c != '-') out.push_back(c);
+    for (char c : s) {
+      if (c != '-') out.push_back(c);
+    }
     return out;
   };
   std::string target = strip_hyphens(uuid);
@@ -142,6 +166,9 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
   vg.extent_size_sectors = non_negative(vg_sec->integer("extent_size")).value_or(0);
   vg.system_id = vg_sec->string("system_id").value_or("");
   vg.status = vg_sec->string_list("status");
+  vg.max_lv = non_negative(vg_sec->integer("max_lv")).value_or(0);
+  vg.max_pv = non_negative(vg_sec->integer("max_pv")).value_or(0);
+  vg.metadata_copies = non_negative(vg_sec->integer("metadata_copies")).value_or(0);
 
   if (vg.extent_size_sectors == 0) {
     error = "volume group declares a zero extent size";
@@ -154,6 +181,7 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
       pv.key = pv_sec.name;
       pv.id = pv_sec.string("id").value_or("");
       pv.device = pv_sec.string("device").value_or("");
+      pv.status = pv_sec.string_list("status");
       pv.pe_start_sectors = non_negative(pv_sec.integer("pe_start")).value_or(0);
       pv.pe_count = non_negative(pv_sec.integer("pe_count")).value_or(0);
       pv.dev_size_sectors = non_negative(pv_sec.integer("dev_size")).value_or(0);
@@ -195,7 +223,7 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
                        });
 
       for (const char* flag : kRefusedStatus) {
-        if (std::find(lv.status.begin(), lv.status.end(), flag) != lv.status.end()) {
+        if (has_status_flag(lv.status, flag)) {
           lv.supported = false;
           lv.unsupported_reason = std::string("logical volume has status ") + flag;
           break;
@@ -220,25 +248,14 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
   }
 
   for (auto& lv : vg.lvs) {
-    // LVM's own marker: user-visible volumes carry VISIBLE in their status.
-    // Hidden sub-volumes (RAID images and metadata, thin pool data/metadata,
-    // COW stores, the pool spare) do not. This is authoritative and catches
-    // volumes nothing else references — `lvol0_pmspare` in particular, which
-    // exists as a standby and is deliberately unreferenced.
-    if (!lv.status.empty() &&
-        std::find(lv.status.begin(), lv.status.end(), "VISIBLE") == lv.status.end()) {
+    if (!lv.status.empty() && !has_status_flag(lv.status, "VISIBLE")) {
       lv.internal = true;
     }
     if (referenced.count(lv.name)) lv.internal = true;
     if (snapshot_origins.count(lv.name) && lv.supported) {
-      // See collect_references: its extents describe the origin, but the live
-      // mapping is a snapshot-origin target. Mapping it directly would bypass
-      // copy-on-write.
       lv.supported = false;
       lv.unsupported_reason = "logical volume is the origin of a snapshot";
     }
-    // A segment pointing at something that is not a PV means this LV is built
-    // on top of other LVs (RAID, thin). Those targets are internal too.
     for (const auto& seg : lv.segments) {
       for (const auto& stripe : seg.stripes) {
         if (!vg.find_pv(stripe.target)) {
