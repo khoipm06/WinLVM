@@ -1,16 +1,32 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
-#include <optional>
+
 #include "lvmfmt/metadata.h"
 #include "lvmfmt/source.h"
 
 namespace lvmfmt {
 
-// Parse human-readable sizes (e.g. "100M", "2G", "512K", "1024") into bytes.
+enum class SizeSign { Absolute, Plus, Minus };
+
+struct SizeSpec {
+  SizeSign sign = SizeSign::Absolute;
+  std::uint64_t value = 0;  // bytes for parse_size_spec, extents or percent for parse_extents_spec
+  bool is_percent = false;
+  std::string percent_origin;  // "FREE", "VG", "PVS", "LV", "ORIGIN"
+};
+
+// Parse -L / --size specification: [+|-]<number>[B|S|K|M|G|T|P]
+std::optional<SizeSpec> parse_size_spec(std::string_view str, std::string& error);
+
+// Parse -l / --extents specification: [+|-]<number>[%(FREE|VG|PVS|LV|ORIGIN)]
+std::optional<SizeSpec> parse_extents_spec(std::string_view str, std::string& error);
+
+// Parse unsigned human-readable sizes (e.g. "100M", "2G", "512K", "1024") into bytes.
 std::optional<std::uint64_t> parse_size_bytes(std::string_view str, std::string& error);
 
 // Format bytes into human-readable representation.
@@ -18,11 +34,12 @@ std::string format_size_human(std::uint64_t bytes);
 
 // Tracks allocated and free extents on a Physical Volume.
 struct PvExtentMap {
-    std::string pv_key;
-    std::string pv_uuid;
-    std::uint64_t total_extents = 0;
-    std::vector<bool> extent_used; // index 0..total_extents-1
-    std::uint64_t free_extents = 0;
+  std::string pv_key;
+  std::string pv_uuid;
+  std::uint64_t total_extents = 0;
+  std::vector<bool> extent_used;  // index 0..total_extents-1
+  std::uint64_t free_extents = 0;
+  bool allocatable = true;
 };
 
 // Build extent usage maps for all PVs in a Volume Group.
@@ -30,13 +47,13 @@ std::vector<PvExtentMap> build_vg_extent_maps(const VolumeGroup& vg);
 
 // Allocation result for new or extended segments.
 struct ExtentAllocation {
-    std::string pv_key;
-    std::uint64_t start_pe = 0;
-    std::uint64_t count = 0;
+  std::string pv_key;
+  std::uint64_t start_pe = 0;
+  std::uint64_t count = 0;
 };
 
 // Allocate extents for a linear logical volume.
-// If target_pvs is non-empty, only allocates from the specified PV keys/names.
+// If preferred_pvs is non-empty, only allocates from the specified PV keys/UUIDs.
 bool allocate_linear(const VolumeGroup& vg,
                      std::uint64_t extents_needed,
                      const std::vector<std::string>& preferred_pvs,
@@ -51,7 +68,7 @@ bool allocate_striped(const VolumeGroup& vg,
                       std::vector<std::vector<ExtentAllocation>>& out_stripe_allocations,
                       std::string& error);
 
-// Extend an existing LV with new allocations.
+// Extend an existing LV (preserving linear or striped layout) with new allocations.
 bool extend_lv(VolumeGroup& vg,
                std::string_view lv_name,
                std::uint64_t additional_extents,
@@ -74,4 +91,4 @@ bool move_pv_extents(VolumeGroup& vg,
                      ByteSource* dest_storage,
                      std::string& error);
 
-} // namespace lvmfmt
+}  // namespace lvmfmt
