@@ -7,7 +7,12 @@
 
 namespace winlvm::service {
 
-enum class MutationError : std::uint32_t { Busy = 1, InvalidGeometry = 2, Unsupported = 3 };
+enum class MutationError : std::uint32_t {
+  Ok = 0,
+  Busy = 1,
+  InvalidGeometry = 2,
+  Unsupported = 3
+};
 enum class MutationKind : std::uint32_t { Shrink = 1, Extend = 2 };
 
 struct Geometry {
