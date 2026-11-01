@@ -170,11 +170,11 @@ inline const std::vector<CommandDesc>& get_all_commands() {
         {
             "vgchange",
             "Change volume group attributes",
-            "vgchange [OPTIONS] [VGName...]",
-            "vgchange modifies volume group state, such as activating (-ay) or deactivating (-an) all constituent logical volumes.",
+            "vgchange [OPTIONS] [VGName] [PVPath...]",
+            "vgchange modifies volume group state, such as activating (-ay) or deactivating (-an) logical volumes or changing read/write permissions (-p r|rw).",
             {
                 "-a, --activate {y|n|ay|an} : Activate or deactivate logical volumes in the VG",
-                "-u, --uuid : Generate and assign a new random UUID to the VG"
+                "-p, --permission {r|rw} : Set read-only (r) or read-write (rw) permission"
             }
         },
         {
@@ -389,7 +389,7 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "segtypes",
             "List available segment types",
             "segtypes",
-            "segtypes lists the segment types supported by this implementation (linear, striped, zero, error).",
+            "segtypes lists the segment types supported by this implementation (linear, striped).",
             {}
         },
         {

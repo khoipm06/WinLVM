@@ -64,7 +64,10 @@ add_executable(lvm
   src/tools/lvm/main.cpp
   src/tools/lvm/cmd_pv.cpp
   src/tools/lvm/cmd_vg.cpp
-  src/tools/lvm/cmd_lv.cpp
+  src/tools/lvm/cmd_lv_create.cpp
+  src/tools/lvm/cmd_lv_resize.cpp
+  src/tools/lvm/cmd_lv_manage.cpp
+  src/tools/lvm/lv_extent_alloc.cpp
   src/tools/lvm/cmd_misc.cpp
 )
 target_include_directories(lvm PRIVATE src/tools/lvm)
