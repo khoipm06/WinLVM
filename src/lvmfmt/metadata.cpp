@@ -134,9 +134,9 @@ const PhysicalVolume* VolumeGroup::find_pv_by_uuid(std::string_view uuid) const 
   return nullptr;
 }
 
-const LogicalVolume* VolumeGroup::find_lv(std::string_view name) const {
+const LogicalVolume* VolumeGroup::find_lv(std::string_view lv_name) const {
   for (const auto& lv : lvs) {
-    if (lv.name == name) return &lv;
+    if (lv.name == lv_name) return &lv;
   }
   return nullptr;
 }

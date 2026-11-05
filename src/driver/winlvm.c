@@ -1,47 +1,85 @@
 /*
- * winlvm.c — winlvm.sys: DriverEntry, dispatch wiring, and the two
- * kind-discriminating dispatchers (PnP, device control).
- *
- * WDM shape (mirrors maharmstone/winmd; FEASIBILITY.md §5.1): the INF
- * enumerates ROOT\winlvm, PnP creates the root bus PDO and calls our
- * AddDevice. No control device object.
- *
- * NEVER ZwCreateFile: backing devices are addressed through the device
- * objects we already hold (IoGetDeviceObjectPointer in the notify callback,
- * IoCallDriver everywhere).
+ * winlvm.c — DriverEntry, control device security, ring log, WMI provider,
+ *            and top-level IRP dispatchers for winlvm.sys.
  */
 #include <initguid.h>
 #include "winlvm.h"
 #include <ntstrsafe.h>
 
-#define WINLVM_LOG_BUFFER_SIZE 32768
-static char g_kernel_log[WINLVM_LOG_BUFFER_SIZE] = {0};
-static volatile LONG g_kernel_log_pos = 0;
+/* Private device class GUID for \Device\WinLvmControl SDDL enforcement. */
+/* {8C3A4E71-9B42-4D1F-A6E5-3F1D8C2B9A04} */
+DEFINE_GUID(GUID_DEVCLASS_WINLVM_CONTROL,
+    0x8c3a4e71, 0x9b42, 0x4d1f, 0xa6, 0xe5, 0x3f, 0x1d, 0x8c, 0x2b, 0x9a, 0x04);
 
-void WinLvmLog(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    char buf[256];
-    NTSTATUS st = RtlStringCbVPrintfA(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    if (!NT_SUCCESS(st)) return;
+static KSPIN_LOCK g_log_lock;
+static char       g_kernel_log[WINLVM_LOG_BUFFER_SIZE];
+static ULONG      g_log_head = 0;
+static ULONG      g_log_len = 0;
+static BOOLEAN    g_log_ready = FALSE;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "%s", buf);
-
-    size_t len = strlen(buf);
-    LONG pos = InterlockedAdd(&g_kernel_log_pos, (LONG)len) - (LONG)len;
-    if (pos + (LONG)len < WINLVM_LOG_BUFFER_SIZE) {
-        RtlCopyMemory(&g_kernel_log[pos], buf, len);
-    }
-}
-
-/* Globals. g_bus_ext is set by AddDevice and cleared on REMOVE; the disk
- * arrival callback may fire before AddDevice, so it must be null-checked. */
 WINLVM_BUS_EXT *g_bus_ext = NULL;
 PVOID           g_disk_notify_cookie = NULL;
 PVOID           g_volume_notify_cookie = NULL;
 PDEVICE_OBJECT  g_control_device = NULL;
 BOOLEAN         g_control_link_created = FALSE;
+
+void WinLvmLog(const char *fmt, ...) {
+    va_list args;
+    char buf[256];
+    va_start(args, fmt);
+    NTSTATUS st = RtlStringCbVPrintfA(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (!NT_SUCCESS(st)) return;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "%s", buf);
+    if (!g_log_ready) return;
+
+    const char *src = buf;
+    ULONG n = (ULONG)strlen(src);
+    if (n == 0) return;
+    if (n > WINLVM_LOG_BUFFER_SIZE) {
+        src += (n - WINLVM_LOG_BUFFER_SIZE);
+        n = WINLVM_LOG_BUFFER_SIZE;
+    }
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_log_lock, &irql);
+    ULONG tail = (g_log_head + g_log_len) % WINLVM_LOG_BUFFER_SIZE;
+    ULONG first = WINLVM_LOG_BUFFER_SIZE - tail;
+    if (first > n) first = n;
+    RtlCopyMemory(&g_kernel_log[tail], src, first);
+    if (n > first) {
+        RtlCopyMemory(&g_kernel_log[0], src + first, n - first);
+    }
+    if (g_log_len + n <= WINLVM_LOG_BUFFER_SIZE) {
+        g_log_len += n;
+    } else {
+        ULONG drop = (g_log_len + n) - WINLVM_LOG_BUFFER_SIZE;
+        g_log_head = (g_log_head + drop) % WINLVM_LOG_BUFFER_SIZE;
+        g_log_len = WINLVM_LOG_BUFFER_SIZE;
+    }
+    KeReleaseSpinLock(&g_log_lock, irql);
+}
+
+ULONG WinLvmLogDrain(char *out, ULONG cap) {
+    if (!g_log_ready || !out || cap == 0) return 0;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_log_lock, &irql);
+    ULONG to_copy = (g_log_len < cap) ? g_log_len : cap;
+    if (to_copy > 0) {
+        ULONG first = WINLVM_LOG_BUFFER_SIZE - g_log_head;
+        if (first > to_copy) first = to_copy;
+        RtlCopyMemory(out, &g_kernel_log[g_log_head], first);
+        if (to_copy > first) {
+            RtlCopyMemory(out + first, &g_kernel_log[0], to_copy - first);
+        }
+        g_log_head = (g_log_head + to_copy) % WINLVM_LOG_BUFFER_SIZE;
+        g_log_len -= to_copy;
+    }
+    KeReleaseSpinLock(&g_log_lock, irql);
+    return to_copy;
+}
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     UNICODE_STRING device_name;
@@ -49,6 +87,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    KeInitializeSpinLock(&g_log_lock);
+    g_log_head = 0;
+    g_log_len = 0;
+    g_log_ready = TRUE;
+    WinLvmProbeSubsystemInit();
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = WinLvmCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = WinLvmCreateClose;
@@ -65,9 +109,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->DriverUnload                         = WinLvmUnload;
 
     RtlInitUnicodeString(&device_name, WINLVM_CONTROL_DEVICE_NAME);
-    status = IoCreateDevice(DriverObject, sizeof(WINLVM_CONTROL_EXT), &device_name,
-                            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
-                            &g_control_device);
+    status = IoCreateDeviceSecure(
+        DriverObject,
+        sizeof(WINLVM_CONTROL_EXT),
+        &device_name,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL,
+        &GUID_DEVCLASS_WINLVM_CONTROL,
+        &g_control_device);
     if (!NT_SUCCESS(status)) {
         g_control_device = NULL;
         return status;
@@ -84,10 +135,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     g_control_link_created = TRUE;
     g_control_device->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    /* PnP registration happens at bus START (WinLvmPnp IRP_MN_START_DEVICE),
-     * not here: existing-disk callbacks fired in DriverEntry would race
-     * ahead of AddDevice and see g_bus_ext == NULL, so their probes would
-     * be dropped and the LVs never enumerated. */
     WL_TRACE("DriverEntry");
     return STATUS_SUCCESS;
 }
@@ -96,6 +143,8 @@ void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
     UNICODE_STRING dos_name;
 
     UNREFERENCED_PARAMETER(DriverObject);
+    WinLvmStopAndDrainProbeWork();
+
     RtlInitUnicodeString(&dos_name, WINLVM_CONTROL_DOS_NAME);
     if (g_control_link_created) {
         IoDeleteSymbolicLink(&dos_name);
@@ -105,10 +154,6 @@ void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
         IoDeleteDevice(g_control_device);
         g_control_device = NULL;
     }
-    WinLvmUnregisterDiskNotify();
-    /* Child PDOs and VG records are torn down by IRP_MN_REMOVE_DEVICE /
-     * IRP_MN_SURPRISE_REMOVAL on the bus FDO; DriverUnload runs only after
-     * the last device stack is gone. */
 }
 
 NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -119,37 +164,21 @@ NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     return STATUS_SUCCESS;
 }
 
-/* Verifier 0x220 saga (dedicated.dmp sequence, 2026-09-12): VfWmiTestStartedPdoStack
- * sends WMI IRPs at every started devnode.
- *   - 0x21F: NULL IRP_MJ_SYSTEM_CONTROL dispatch slot → wire a handler.
- *   - v17 0x220: bus FDO forwarded the probe down to PnpManager's root PDO —
- *     the completing driver was outside the ProviderId's stack.
- *   - v18 0x220: bus FDO completed the probe in-driver with no WMI
- *     registration — still not the recognized WMI provider for the LV PDO.
- * Root asymmetry (Oracle verdict, 2026-09-12): the verifier probe's ProviderId
- * is a device object outside the bus stack — the LV child PDO — and with no
- * IoWMIRegistrationControl anywhere, no in-stack routing can ever satisfy it.
- * Decisive fix (H5, classpnp/Toaster pattern): register a zero-GUID
- * WMILIB_CONTEXT on BOTH the bus FDO and every LV child PDO at START and
- * dispatch through WmiSystemControl, so the WMI core has a real "who owns WMI
- * here" answer and routes ProviderId-addressed probes to the LV PDO's own
- * stack, where the PDO (bottom of stack) legitimately completes them. */
 NTSTATUS WinLvmQueryWmiRegInfo(PDEVICE_OBJECT DeviceObject, PULONG RegFlags,
                                PUNICODE_STRING InstanceName,
                                PUNICODE_STRING *RegistryPath,
                                PUNICODE_STRING MofResourceName,
                                PDEVICE_OBJECT *Pdo) {
-    /* WDK 26100 WMI_QUERY_REGINFO_CALLBACK: GuidCount/GuidList are
-     * WMILIB_CONTEXT fields, not callback params (the v18 signature was a
-     * silent ABI mismatch). InstanceName and MofResourceName are only
-     * consumed when INSTANCE_PDO / a MOF resource are absent — leave intact. */
+    UNREFERENCED_PARAMETER(InstanceName);
+    UNREFERENCED_PARAMETER(MofResourceName);
+
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
     if (kind != WL_EXT_BUS && kind != WL_EXT_LV) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
     *RegFlags = WMIREG_FLAG_INSTANCE_PDO;
-    *RegistryPath = NULL;   /* no registry-backed WMI data; SAL maybenull */
+    *RegistryPath = NULL;
     *Pdo = (kind == WL_EXT_BUS)
         ? ((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->pdo
         : DeviceObject;
@@ -157,26 +186,54 @@ NTSTATUS WinLvmQueryWmiRegInfo(PDEVICE_OBJECT DeviceObject, PULONG RegFlags,
 }
 
 void WinLvmWmiInit(PDEVICE_OBJECT DeviceObject) {
-    /* Caller (START_DEVICE) runs at PASSIVE_LEVEL — IoWMIRegistrationControl
-     * requirement. Failure is nonfatal: registering is what makes the WMI
-     * core hold a provider entry for this device (Oracle H5); if it fails
-     * the stack still functions, only verifier probes stay unsatisfiable. */
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
-    WMILIB_CONTEXT *wmi = (kind == WL_EXT_BUS)
-        ? &((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->wmi
-        : &((WINLVM_LV_EXT *)DeviceObject->DeviceExtension)->wmi;
+    WMILIB_CONTEXT *wmi = NULL;
+    BOOLEAN *registered = NULL;
 
+    if (kind == WL_EXT_BUS) {
+        WINLVM_BUS_EXT *bus = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
+        wmi = &bus->wmi;
+        registered = &bus->wmi_registered;
+    } else if (kind == WL_EXT_LV) {
+        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
+        wmi = &lv->wmi;
+        registered = &lv->wmi_registered;
+    } else {
+        return;
+    }
+
+    if (*registered) return;
     RtlZeroMemory(wmi, sizeof(*wmi));
     wmi->QueryWmiRegInfo = WinLvmQueryWmiRegInfo;
 
     NTSTATUS st = IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_REGISTER);
+    if (NT_SUCCESS(st)) {
+        *registered = TRUE;
+    }
     WL_TRACE_1("wmi register 0x%x", (unsigned)st);
+}
+
+void WinLvmWmiDeregister(PDEVICE_OBJECT DeviceObject) {
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
+    BOOLEAN *registered = NULL;
+
+    if (kind == WL_EXT_BUS) {
+        registered = &((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->wmi_registered;
+    } else if (kind == WL_EXT_LV) {
+        registered = &((WINLVM_LV_EXT *)DeviceObject->DeviceExtension)->wmi_registered;
+    } else {
+        return;
+    }
+
+    if (*registered) {
+        *registered = FALSE;
+        IoWMIRegistrationControl(DeviceObject, WMIREG_ACTION_DEREGISTER);
+    }
 }
 
 NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
     if (kind != WL_EXT_BUS && kind != WL_EXT_LV) {
-        /* R5 fail-closed: kind must be set before any IRP can arrive. */
         Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_INVALID_DEVICE_REQUEST;
@@ -191,48 +248,30 @@ NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     switch (disposition) {
     case IrpProcessed:
-        /* Toaster canonical: IRP already completed by wmilib/DpWmiXxx —
-         * completing again = double-complete crash. Do nothing. */
         return status;
     case IrpNotCompleted:
-        /* Wmilib filled IoStatus but left completion to us. */
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return status;
     case IrpForward:
-    case IrpNotWmi: {
+    case IrpNotWmi:
         if (kind == WL_EXT_BUS) {
-            /* Not our block: classpnp contract hands the IRP down. */
             WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(ext->bus_pdo, Irp);
         }
-        /* LV PDO is the bottom of its own stack and, once registered, the
-         * ProviderId the verifier probes — completing here is legitimate. */
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return status;
-    }
     default:
-        /* Fail closed on any disposition we do not recognize. */
         Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 }
 
-/* PnP discriminator: the bus FDO half lives in winlvm_bus.c, the LV PDO
- * half in winlvm_child.c. Extension kind is at offset 0 in both. */
 NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
-    if (kind == WL_EXT_CONTROL) {
-        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
-        Irp->IoStatus.Information = 0;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_NOT_SUPPORTED;
-    }
-    if (kind == WL_EXT_BUS)
-        return WinLvmBusPnp(DeviceObject, Irp);
-    if (kind == WL_EXT_LV)
-        return WinLvmChildPnp(DeviceObject, Irp);
+    if (kind == WL_EXT_BUS) return WinLvmBusPnp(DeviceObject, Irp);
+    if (kind == WL_EXT_LV) return WinLvmChildPnp(DeviceObject, Irp);
 
     Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
     Irp->IoStatus.Information = 0;
@@ -240,188 +279,30 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     return STATUS_NOT_SUPPORTED;
 }
 
-static NTSTATUS WinLvmValidateUpdateLv(const WINLVM_UPDATE_LV_REQUEST *request,
-                                       ULONG input_length) {
-    if (!request || input_length < sizeof(*request) ||
-        request->header.size < sizeof(*request) || request->header.version != 1)
-        return STATUS_INVALID_PARAMETER;
-    if (request->lv_uuid[WL_VG_UUID_LEN - 1] != '\0')
-        return STATUS_INVALID_PARAMETER;
-    if (request->byte_size == 0 || request->logical_sector < 512 ||
-        request->physical_sector < request->logical_sector ||
-        (request->logical_sector & (request->logical_sector - 1)) != 0 ||
-        (request->physical_sector & (request->physical_sector - 1)) != 0)
-        return STATUS_INVALID_PARAMETER;
-    if (!g_bus_ext)
-        return STATUS_DEVICE_NOT_READY;
-
-    for (size_t i = 0; i < g_bus_ext->child_count; i++) {
-        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension;
-        const lvmcore_volume_group *view = lv->record ? lv->record->view : NULL;
-        if (!view || lv->lv_index >= view->lv_count)
-            continue;
-        if (RtlCompareMemory(view->lvs[lv->lv_index].id, request->lv_uuid,
-                             WL_VG_UUID_LEN) == WL_VG_UUID_LEN)
-            return STATUS_SUCCESS;
-    }
-    return STATUS_OBJECT_NAME_NOT_FOUND;
-}
-
 NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
-    ULONG input_length = irpSp->Parameters.DeviceIoControl.InputBufferLength;
-    ULONG output_length = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR information = 0;
 
-    if (METHOD_FROM_CTL_CODE(code) != METHOD_BUFFERED) {
-        status = STATUS_INVALID_DEVICE_REQUEST;
-    } else if (*(WL_EXT_KIND *)DeviceObject->DeviceExtension == WL_EXT_CONTROL) {
-        if (code == IOCTL_WINLVM_UPDATE_LV) {
-            if (Irp->AssociatedIrp.SystemBuffer == NULL) {
-                status = STATUS_BUFFER_TOO_SMALL;
-            } else {
-            status = WinLvmValidateUpdateLv(
-                (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer,
-                input_length);
-            if (status == STATUS_SUCCESS) {
-                const WINLVM_UPDATE_LV_REQUEST *request =
-                    (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
-                WINLVM_LV_EXT *target = NULL;
-                for (size_t i = 0; i < g_bus_ext->child_count; i++) {
-                    WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension;
-                    const lvmcore_volume_group *view = lv->record ? lv->record->view : NULL;
-                    if (view && lv->lv_index < view->lv_count &&
-                        RtlCompareMemory(view->lvs[lv->lv_index].id, request->lv_uuid,
-                                         WL_VG_UUID_LEN) == WL_VG_UUID_LEN) {
-                        target = lv;
-                        break;
-                    }
-                }
-                if (!target) {
-                    status = STATUS_OBJECT_NAME_NOT_FOUND;
-                } else {
-                    status = WinLvmIoGateBeginQuiesce(&target->io_gate);
-                    if (status == STATUS_SUCCESS) {
-                        target->byte_size = request->byte_size;
-                        if (request->logical_sector >= 512)
-                            target->logical_sector = request->logical_sector;
-                        if (request->physical_sector >= target->logical_sector)
-                            target->physical_sector = request->physical_sector;
-                        WL_TRACE_2("update lv: uuid %s new size %I64u",
-                                   request->lv_uuid, request->byte_size);
-                        WinLvmIoGateResume(&target->io_gate, target->pdo);
-                        status = STATUS_SUCCESS;
-                    }
-                }
-            }
+    if (kind == WL_EXT_CONTROL) {
+        if (METHOD_FROM_CTL_CODE(code) == METHOD_BUFFERED) {
+            return WinLvmControlDeviceControl(DeviceObject, Irp);
         }
-        }
-        if (code == IOCTL_WINLVM_GET_LOG) {
-            ULONG to_copy = (ULONG)g_kernel_log_pos;
-            if (to_copy > WINLVM_LOG_BUFFER_SIZE) to_copy = WINLVM_LOG_BUFFER_SIZE;
-            if (output_length < to_copy) to_copy = output_length;
-            if (to_copy > 0 && Irp->AssociatedIrp.SystemBuffer) {
-                RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, g_kernel_log, to_copy);
-            }
-            g_kernel_log_pos = 0;
-            status = STATUS_SUCCESS;
-            information = to_copy;
-        }
-        const BOOLEAN known = code == IOCTL_WINLVM_INVENTORY || code == IOCTL_WINLVM_REFRESH ||
-                              code == IOCTL_WINLVM_QUIESCE_VG || code == IOCTL_WINLVM_RESUME_VG ||
-                              code == IOCTL_WINLVM_ACTIVATE_LV || code == IOCTL_WINLVM_DEACTIVATE_LV ||
-                              code == IOCTL_WINLVM_UPDATE_LV;
-        if (code != IOCTL_WINLVM_UPDATE_LV && code != IOCTL_WINLVM_GET_LOG && known &&
-            input_length >= sizeof(WINLVM_CONTROL_REQUEST) &&
-            Irp->AssociatedIrp.SystemBuffer != NULL) {
-            const WINLVM_CONTROL_REQUEST *request =
-                (const WINLVM_CONTROL_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
-            if (request->size >= sizeof(*request) && request->version == 1) {
-                if (code == IOCTL_WINLVM_INVENTORY) {
-                    if (output_length >= sizeof(WINLVM_INVENTORY)) {
-                        WINLVM_INVENTORY *inventory =
-                            (WINLVM_INVENTORY *)Irp->AssociatedIrp.SystemBuffer;
-                        RtlZeroMemory(inventory, sizeof(*inventory));
-                        inventory->version = 1;
-                        inventory->size = sizeof(*inventory);
-                        status = STATUS_SUCCESS;
-                        information = sizeof(*inventory);
-                    } else {
-                        status = STATUS_BUFFER_TOO_SMALL;
-                        information = sizeof(WINLVM_INVENTORY);
-                    }
-                } else if (code == IOCTL_WINLVM_QUIESCE_VG) {
-                    status = STATUS_SUCCESS;
-                    if (g_bus_ext) {
-                        for (size_t i = 0; i < g_bus_ext->child_count; i++) {
-                            WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension;
-                            NTSTATUS gate_status = WinLvmIoGateBeginQuiesce(&lv->io_gate);
-                            if (gate_status != STATUS_SUCCESS && gate_status != STATUS_PENDING) status = gate_status;
-                        }
-                    }
-                } else if (code == IOCTL_WINLVM_RESUME_VG) {
-                    if (g_bus_ext) {
-                        for (size_t i = 0; i < g_bus_ext->child_count; i++) {
-                            WinLvmIoGateResume(&((WINLVM_LV_EXT *)g_bus_ext->children[i]->DeviceExtension)->io_gate, g_bus_ext->children[i]);
-                        }
-                    }
-                    status = STATUS_SUCCESS;
-                } else if (code == IOCTL_WINLVM_REFRESH) {
-                    /* Re-probe all existing disk interfaces: unregister the
-                     * existing notification (if any), reset inactive records,
-                     * then re-register with INCLUDE_EXISTING_INTERFACES so the
-                     * callback fires for all currently-present disks. */
-                    if (g_bus_ext) {
-                        WinLvmBusResetInactiveRecords(g_bus_ext);
-                        WinLvmUnregisterDiskNotify();
-                        NTSTATUS reg_status = WinLvmRegisterDiskNotify(g_bus_ext->fdo->DriverObject);
-                        if (NT_SUCCESS(reg_status)) {
-                            WL_TRACE("refresh: disk/volume notify re-registered");
-                        } else {
-                            WL_TRACE_1("refresh: notify re-registration failed 0x%x",
-                                       (unsigned)reg_status);
-                        }
-                    }
-                    status = STATUS_SUCCESS;
-                } else if (code == IOCTL_WINLVM_ACTIVATE_LV) {
-                    if (input_length >= sizeof(WINLVM_CONTROL_REQUEST) + WL_VG_UUID_LEN) {
-                        const WINLVM_UPDATE_LV_REQUEST *req =
-                            (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
-                        if (g_bus_ext) {
-                            status = WinLvmBusActivateLvByUuid(g_bus_ext, req->lv_uuid);
-                        } else {
-                            status = STATUS_DEVICE_NOT_READY;
-                        }
-                    } else {
-                        status = STATUS_BUFFER_TOO_SMALL;
-                    }
-                } else if (code == IOCTL_WINLVM_DEACTIVATE_LV) {
-                    if (input_length >= sizeof(WINLVM_CONTROL_REQUEST) + WL_VG_UUID_LEN) {
-                        const WINLVM_UPDATE_LV_REQUEST *req =
-                            (const WINLVM_UPDATE_LV_REQUEST *)Irp->AssociatedIrp.SystemBuffer;
-                        if (g_bus_ext) {
-                            status = WinLvmBusDeactivateLvByUuid(g_bus_ext, req->lv_uuid);
-                        } else {
-                            status = STATUS_DEVICE_NOT_READY;
-                        }
-                    } else {
-                        status = STATUS_BUFFER_TOO_SMALL;
-                    }
-                } else {
-                    status = STATUS_NOT_IMPLEMENTED;
-                }
-            } else {
-                status = STATUS_INVALID_PARAMETER;
-            }
-        } else if (code != IOCTL_WINLVM_UPDATE_LV && known) {
-            status = STATUS_BUFFER_TOO_SMALL;
-        }
-    } else if (*(WL_EXT_KIND *)DeviceObject->DeviceExtension == WL_EXT_LV) {
+    } else if (kind == WL_EXT_LV) {
         WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)DeviceObject->DeviceExtension;
-        status = WinLvmMountIoctl(DeviceObject, Irp, lv);
-        information = Irp->IoStatus.Information;
+        /* FSCTL_ALLOW_EXTENDED_DASD_IO uses METHOD_NEITHER and carries no buffers. */
+        if (code == FSCTL_ALLOW_EXTENDED_DASD_IO) {
+            status = WinLvmMountIoctl(DeviceObject, Irp, lv);
+            information = Irp->IoStatus.Information;
+        } else if (METHOD_FROM_CTL_CODE(code) == METHOD_BUFFERED) {
+            status = WinLvmMountIoctl(DeviceObject, Irp, lv);
+            if (status == STATUS_INVALID_DEVICE_REQUEST) {
+                status = WinLvmStorageIoctl(DeviceObject, Irp, lv);
+            }
+            information = Irp->IoStatus.Information;
+        }
     }
 
     Irp->IoStatus.Status = status;

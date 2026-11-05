@@ -1,43 +1,84 @@
-/* winlvm_mount.c — Mount Manager + storage IOCTL surface for LV PDOs.
+/*
+ * winlvm_mount.c — Mount Manager IOCTLs and volume FSCTLs for LV PDOs.
  *
- * Modeled on winmd's deliberately-tiny surface (mountmgr.c): the two
- * MOUNTDEV queries plus the storage geometry/length queries partmgr and
- * mountmgr issue before they will treat the device as a volume. Everything
- * else returns STATUS_INVALID_DEVICE_REQUEST, which is a valid answer. */
-#include <stddef.h>   /* offsetof — MOUNTDEV variable-length sizing */
-#include <ntifs.h>    /* FSCTL_* volume-lock codes (SOURCES-only include; */
-                    /* ntifs.h after ntddk.h per WDK build order) */
+ * Dual-compiled for Windows kernel mode (_KERNEL_MODE) and host unit tests
+ * via host_wdm_types.h.
+ */
+#ifdef _KERNEL_MODE
+#include <stddef.h>
 #include "winlvm.h"
+#else
+#include "host_wdm_types.h"
+#endif
+
+#ifndef IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME
+#define IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME CTL_CODE(MOUNTDEV_IOCTL, 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#ifndef IOCTL_MOUNTDEV_QUERY_STABLE_GUID
+#define IOCTL_MOUNTDEV_QUERY_STABLE_GUID CTL_CODE(MOUNTDEV_IOCTL, 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+typedef struct _MOUNTDEV_STABLE_GUID {
+    GUID StableGuid;
+} MOUNTDEV_STABLE_GUID, *PMOUNTDEV_STABLE_GUID;
+#endif
+
+static void WinLvmUuidToGuid(const char *uuid, GUID *guid) {
+    unsigned char bytes[16];
+    BOOLEAN is_hex = TRUE;
+    RtlZeroMemory(guid, sizeof(GUID));
+    for (int i = 0; i < 16; i++) {
+        char c1 = uuid[i * 2];
+        char c2 = uuid[i * 2 + 1];
+        int v1 = -1, v2 = -1;
+        if (c1 >= '0' && c1 <= '9') v1 = c1 - '0';
+        else if (c1 >= 'a' && c1 <= 'f') v1 = c1 - 'a' + 10;
+        else if (c1 >= 'A' && c1 <= 'F') v1 = c1 - 'A' + 10;
+        if (c2 >= '0' && c2 <= '9') v2 = c2 - '0';
+        else if (c2 >= 'a' && c2 <= 'f') v2 = c2 - 'a' + 10;
+        else if (c2 >= 'A' && c2 <= 'F') v2 = c2 - 'A' + 10;
+        if (v1 < 0 || v2 < 0) {
+            is_hex = FALSE;
+            break;
+        }
+        bytes[i] = (unsigned char)((v1 << 4) | v2);
+    }
+    if (is_hex) {
+        RtlCopyMemory(guid, bytes, sizeof(GUID));
+    } else {
+        RtlCopyMemory(guid, uuid, sizeof(GUID));
+    }
+}
+
+static const char *WinLvmMountGetLvUuid(const WINLVM_LV_EXT *ext) {
+#ifdef _KERNEL_MODE
+    return (ext && ext->lv_uuid[0] != '\0') ? ext->lv_uuid : NULL;
+#else
+    const lvmcore_volume_group *view = (ext && ext->record) ? ext->record->view : NULL;
+    if (!view || !view->lvs || ext->lv_index >= view->lv_count) return NULL;
+    return view->lvs[ext->lv_index].id;
+#endif
+}
 
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext) {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    PVOID sysBuf = Irp->AssociatedIrp.SystemBuffer;
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     if (code == IOCTL_MOUNTDEV_QUERY_DEVICE_NAME) {
-        /* MSDN contract (mountmgr/ni-mountmgr-ioctl_mountdev_query_device_name):
-         * buffer < sizeof(MOUNTDEV_NAME) is not answerable at all — the
-         * caller cannot even see the NameLength field. winbtrfs volume.c:313
-         * answers STATUS_BUFFER_TOO_SMALL for that case; we match. */
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(MOUNTDEV_NAME)) {
+        if (outLen < sizeof(MOUNTDEV_NAME)) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_NAME);
             return STATUS_BUFFER_TOO_SMALL;
         }
+        if (!sysBuf) return STATUS_INVALID_PARAMETER;
 
-        PMOUNTDEV_NAME mountName = (PMOUNTDEV_NAME)Irp->AssociatedIrp.SystemBuffer;
-
-        /* mountmgr requires a \Device-namespace name it can open — the
-         * volume interface symlink is not valid here (winmd pattern). */
+        PMOUNTDEV_NAME mountName = (PMOUNTDEV_NAME)sysBuf;
         UNICODE_STRING devName;
         RtlInitUnicodeString(&devName, ext->devname);
-        mountName->NameLength = (USHORT)devName.Length;
+        mountName->NameLength = devName.Length;
 
-        /* MSDN: too small for header+name -> Information = sizeof(MOUNTDEV_NAME),
-         * Status = STATUS_BUFFER_OVERFLOW, and the NameLength member MUST be
-         * filled so the caller can size its retry (winbtrfs volume.c:321-323
-         * identical, modulo its TOO_SMALL/OF split). offsetof, not sizeof:
-         * the header size is the length field plus the name that follows it. */
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength <
-            offsetof(MOUNTDEV_NAME, Name) + devName.Length) {
+        if (outLen < (ULONG)(offsetof(MOUNTDEV_NAME, Name) + devName.Length)) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_NAME);
             return STATUS_BUFFER_OVERFLOW;
         }
@@ -48,179 +89,55 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
     }
 
     if (code == IOCTL_MOUNTDEV_QUERY_UNIQUE_ID) {
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(MOUNTDEV_UNIQUE_ID)) {
+        if (outLen < sizeof(MOUNTDEV_UNIQUE_ID)) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_UNIQUE_ID);
             return STATUS_BUFFER_TOO_SMALL;
         }
+        if (!sysBuf) return STATUS_INVALID_PARAMETER;
 
-        const lvmcore_volume_group *view = ext->record->view;
-        if (!view || ext->lv_index >= view->lv_count) {
+        const char *lv_uuid = WinLvmMountGetLvUuid(ext);
+        if (!lv_uuid) {
             Irp->IoStatus.Information = 0;
             return STATUS_INVALID_DEVICE_REQUEST;
         }
-        const lvmcore_logical_volume *lv = &view->lvs[ext->lv_index];
-        PMOUNTDEV_UNIQUE_ID uniqueId = (PMOUNTDEV_UNIQUE_ID)Irp->AssociatedIrp.SystemBuffer;
-        uniqueId->UniqueIdLength = 32; /* raw 32-char LV UUID (dashes stripped) */
+        PMOUNTDEV_UNIQUE_ID uniqueId = (PMOUNTDEV_UNIQUE_ID)sysBuf;
+        uniqueId->UniqueIdLength = 32;
 
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength <
-            offsetof(MOUNTDEV_UNIQUE_ID, UniqueId) + 32) {
+        if (outLen < (ULONG)(offsetof(MOUNTDEV_UNIQUE_ID, UniqueId) + 32)) {
             Irp->IoStatus.Information = sizeof(MOUNTDEV_UNIQUE_ID);
             return STATUS_BUFFER_OVERFLOW;
         }
 
-        RtlCopyMemory(uniqueId->UniqueId, lv->id, 32);
+        RtlCopyMemory(uniqueId->UniqueId, lv_uuid, 32);
         Irp->IoStatus.Information = offsetof(MOUNTDEV_UNIQUE_ID, UniqueId) + 32;
         return STATUS_SUCCESS;
     }
 
-    if (code == IOCTL_DISK_GET_LENGTH_INFO) {
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(GET_LENGTH_INFORMATION)) {
-            Irp->IoStatus.Information = sizeof(GET_LENGTH_INFORMATION);
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        PGET_LENGTH_INFORMATION p = (PGET_LENGTH_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
-        p->Length.QuadPart = (LONGLONG)ext->byte_size;
-        Irp->IoStatus.Information = sizeof(GET_LENGTH_INFORMATION);
-        return STATUS_SUCCESS;
-    }
-
-    if (code == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DISK_GEOMETRY)) {
-            Irp->IoStatus.Information = sizeof(DISK_GEOMETRY);
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        /* Per-PV sector size query (StorageAccessAlignmentProperty) feeds
-         * ext->logical_sector; the volume answers geometry in those units.
-         * CHS values are synthetic (whole-disk volume): the only fields
-         * consumers rely on are BytesPerSector and Cylinders. */
-        ULONG bps = ext->logical_sector ? ext->logical_sector : 512;
-        ULONGLONG chs_bytes = (ULONGLONG)63 * 255 * bps;
-        PDISK_GEOMETRY g = (PDISK_GEOMETRY)Irp->AssociatedIrp.SystemBuffer;
-        g->Cylinders.QuadPart = chs_bytes ? (LONGLONG)(ext->byte_size / chs_bytes) : 0;
-        g->MediaType = FixedMedia;
-        g->TracksPerCylinder = 255;
-        g->SectorsPerTrack = 63;
-        g->BytesPerSector = bps;
-        Irp->IoStatus.Information = sizeof(DISK_GEOMETRY);
-        return STATUS_SUCCESS;
-    }
-
-    if (code == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX) {
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DISK_GEOMETRY_EX)) {
-            Irp->IoStatus.Information = sizeof(DISK_GEOMETRY_EX);
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        ULONG bps = ext->logical_sector ? ext->logical_sector : 512;
-        ULONGLONG chs_bytes = (ULONGLONG)63 * 255 * bps;
-        PDISK_GEOMETRY_EX g = (PDISK_GEOMETRY_EX)Irp->AssociatedIrp.SystemBuffer;
-        RtlZeroMemory(g, sizeof(*g));
-        g->Geometry.Cylinders.QuadPart = chs_bytes ? (LONGLONG)(ext->byte_size / chs_bytes) : 0;
-        g->Geometry.MediaType = FixedMedia;
-        g->Geometry.TracksPerCylinder = 255;
-        g->Geometry.SectorsPerTrack = 63;
-        g->Geometry.BytesPerSector = bps;
-        g->DiskSize.QuadPart = (LONGLONG)ext->byte_size;
-        Irp->IoStatus.Information = sizeof(DISK_GEOMETRY_EX);
-        return STATUS_SUCCESS;
-    }
-
-    if (code == IOCTL_STORAGE_CHECK_VERIFY ||
-        code == IOCTL_DISK_CHECK_VERIFY) {
-        /* No removable media; the media is present whenever the PDO exists. */
+    if (code == IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME) {
         Irp->IoStatus.Information = 0;
-        return STATUS_SUCCESS;
+        return STATUS_NOT_IMPLEMENTED;
     }
 
-    if (code == IOCTL_DISK_IS_WRITABLE) {
-        const lvmcore_volume_group *view = ext->record ? ext->record->view : NULL;
-        if (view && view->system_id[0] != '\0') {
-            return STATUS_MEDIA_WRITE_PROTECTED;
-        }
-        Irp->IoStatus.Information = 0;
-        return STATUS_SUCCESS;
-    }
-
-    if (code == IOCTL_DISK_GET_PARTITION_INFO) {
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(PARTITION_INFORMATION)) {
-            Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION);
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        PPARTITION_INFORMATION p = (PPARTITION_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
-        RtlZeroMemory(p, sizeof(*p));
-        p->StartingOffset.QuadPart = 0;
-        p->PartitionLength.QuadPart = (LONGLONG)ext->byte_size;
-        p->HiddenSectors = 0;
-        p->PartitionNumber = 1;
-        p->PartitionType = 0x07; /* PARTITION_IFS */
-        p->BootIndicator = FALSE;
-        p->RecognizedPartition = TRUE;
-        p->RewritePartition = FALSE;
-        Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION);
-        return STATUS_SUCCESS;
-    }
-
-    if (code == IOCTL_DISK_GET_PARTITION_INFO_EX) {
-        /* We present a whole-disk-style volume; reporting a single
-         * unrecognized (PARTITION_ENTRY_UNUSED) entry lets partmgr treat
-         * the PDO as an unpartitioned device it can put a volume on. */
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(PARTITION_INFORMATION_EX)) {
-            Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION_EX);
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        PPARTITION_INFORMATION_EX p = (PPARTITION_INFORMATION_EX)Irp->AssociatedIrp.SystemBuffer;
-        RtlZeroMemory(p, sizeof(*p));
-        p->PartitionStyle = PARTITION_STYLE_MBR;
-        p->PartitionNumber = 0;
-        p->RewritePartition = FALSE;
-        p->StartingOffset.QuadPart = 0;
-        p->PartitionLength.QuadPart = (LONGLONG)ext->byte_size;
-        p->Mbr.PartitionType = PARTITION_ENTRY_UNUSED;
-        p->Mbr.BootIndicator = FALSE;
-        p->Mbr.RecognizedPartition = FALSE;
-        p->Mbr.HiddenSectors = 0;
-        Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION_EX);
-        return STATUS_SUCCESS;
-    }
-
-    if (code == IOCTL_DISK_GET_DRIVE_LAYOUT_EX) {
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DRIVE_LAYOUT_INFORMATION_EX)) {
-            Irp->IoStatus.Information = sizeof(DRIVE_LAYOUT_INFORMATION_EX);
+    if (code == IOCTL_MOUNTDEV_QUERY_STABLE_GUID) {
+        if (outLen < sizeof(MOUNTDEV_STABLE_GUID)) {
+            Irp->IoStatus.Information = sizeof(MOUNTDEV_STABLE_GUID);
             return STATUS_BUFFER_TOO_SMALL;
         }
-        PDRIVE_LAYOUT_INFORMATION_EX layout = (PDRIVE_LAYOUT_INFORMATION_EX)Irp->AssociatedIrp.SystemBuffer;
-        RtlZeroMemory(layout, sizeof(DRIVE_LAYOUT_INFORMATION_EX));
-        layout->PartitionStyle = PARTITION_STYLE_MBR;
-        layout->PartitionCount = 1;
-        layout->Mbr.Signature = 0x574C564D; /* 'WLVM' */
-        layout->Mbr.CheckSum = 0;
+        if (!sysBuf) return STATUS_INVALID_PARAMETER;
 
-        PPARTITION_INFORMATION_EX entry = &layout->PartitionEntry[0];
-        entry->PartitionStyle = PARTITION_STYLE_MBR;
-        entry->StartingOffset.QuadPart = 0;
-        entry->PartitionLength.QuadPart = (LONGLONG)ext->byte_size;
-        entry->PartitionNumber = 1;
-        entry->RewritePartition = FALSE;
-        entry->Mbr.PartitionType = 0x07; /* PARTITION_IFS (Installable File System, NTFS/raw) */
-        entry->Mbr.BootIndicator = FALSE;
-        entry->Mbr.RecognizedPartition = TRUE;
-        entry->Mbr.HiddenSectors = 0;
-
-        Irp->IoStatus.Information = sizeof(DRIVE_LAYOUT_INFORMATION_EX);
+        const char *lv_uuid = WinLvmMountGetLvUuid(ext);
+        if (!lv_uuid) {
+            Irp->IoStatus.Information = 0;
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        PMOUNTDEV_STABLE_GUID mdsg = (PMOUNTDEV_STABLE_GUID)sysBuf;
+        WinLvmUuidToGuid(lv_uuid, &mdsg->StableGuid);
+        Irp->IoStatus.Information = sizeof(MOUNTDEV_STABLE_GUID);
         return STATUS_SUCCESS;
     }
 
-    /* Raw-volume semantics: diskspd/format-style tools open \\.\E: while a
-     * filesystem may still hold cached state. The volume manager sends
-     * dismount/lock FSCTLs and expects an answer; a stateless passthrough
-     * volume has no cached state to flush — answer SUCCESS immediately
-     * (classpnp raw-volume pattern; winbtrfs does the same in its volume
-     * ioctl default). Without this, the 2026-09-13 diskspd raw-open
-     * wedge: mountmgr's dismount handshake waited forever. */
     if (code == FSCTL_DISMOUNT_VOLUME || code == FSCTL_LOCK_VOLUME ||
-        code == FSCTL_UNLOCK_VOLUME) {
-        return STATUS_SUCCESS;
-    }
-    if (code == FSCTL_ALLOW_EXTENDED_DASD_IO) {
+        code == FSCTL_UNLOCK_VOLUME || code == FSCTL_ALLOW_EXTENDED_DASD_IO) {
         Irp->IoStatus.Information = 0;
         return STATUS_SUCCESS;
     }

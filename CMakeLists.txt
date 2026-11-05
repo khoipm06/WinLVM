@@ -103,37 +103,10 @@ if(ZSTD_EXE)
 else()
   message(WARNING "zstd not found: corpus oracle tests will be skipped.")
 endif()
-
-# ---------------------------------------------------------------------------
-# Driver parser test — validates the freestanding C parser matches lvmfmt.
-# ---------------------------------------------------------------------------
 if(ZSTD_EXE)
-  add_executable(winlvm_driver_parser_tests
-    tests/lvm_read/test_driver_parser.c
-    src/driver/lvm_read.c
-  )
-  target_include_directories(winlvm_driver_parser_tests PRIVATE src/driver)
-  if(TARGET corpus)
-    add_dependencies(winlvm_driver_parser_tests corpus)
-  endif()
-  # Pass the raw corpus images directory; oracles come from the source tree
-  add_test(NAME winlvm_driver_parser_tests
-    COMMAND winlvm_driver_parser_tests "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
-
-  # Adversarial vectors for the freestanding parser: stripe-array boundary,
-  # CRC edge cases, wraparound sizes, fail-closed typeless segments. Fully
-  # synthetic — no corpus dependency.
-  add_executable(winlvm_lvm_hardening_tests
-    tests/lvm_read/test_lvm_read_hardening.c
-    src/driver/lvm_read.c
-  )
-  target_include_directories(winlvm_lvm_hardening_tests PRIVATE src/driver)
-  add_test(NAME winlvm_lvm_hardening_tests COMMAND winlvm_lvm_hardening_tests)
-
-
-
   # -------------------------------------------------------------------------
-  # lvmcore test suite: parser, hardening, and differential verification gate.
+  # lvmcore test suite: parser, hardening, and serialization.
+  # (Supersedes legacy driver lvm_read.c parser tests)
   # -------------------------------------------------------------------------
   add_executable(test_lvmcore_parser
     tests/lvmcore/test_lvmcore_parser.c
@@ -151,18 +124,6 @@ if(ZSTD_EXE)
   target_link_libraries(test_lvmcore_hardening PRIVATE lvmcore)
   add_test(NAME test_lvmcore_hardening COMMAND test_lvmcore_hardening)
 
-  add_executable(test_lvmcore_differential
-    tests/lvmcore/test_lvmcore_differential.c
-    src/driver/lvm_read.c
-  )
-  target_include_directories(test_lvmcore_differential PRIVATE src/driver)
-  target_link_libraries(test_lvmcore_differential PRIVATE lvmcore)
-  if(TARGET corpus)
-    add_dependencies(test_lvmcore_differential corpus)
-  endif()
-  add_test(NAME test_lvmcore_differential
-    COMMAND test_lvmcore_differential "${CORPUS_OUT}")
-
   add_executable(test_lvmcore_serialize
     tests/lvmcore/test_lvmcore_serialize.c
   )
@@ -178,6 +139,7 @@ if(ZSTD_EXE)
   add_executable(test_winlvm_vg
     tests/lvmcore/test_winlvm_vg.c
     src/driver/winlvm_vg.c
+    src/driver/winlvm_map.c
   )
   target_include_directories(test_winlvm_vg PRIVATE src/driver)
   target_link_libraries(test_winlvm_vg PRIVATE lvmcore)
@@ -208,11 +170,14 @@ add_executable(winlvm_tests
   tests/test_corpus.cpp
   tests/test_service.cpp
   tests/test_lvm_cli.cpp
-  tests/test_mount_ioctl.cpp
+  tests/test_storage_surface.cpp
   tests/test_lvm_control_plane.cpp
+  src/tools/lvm/lv_extent_alloc.cpp
+  src/driver/winlvm_storage.c
+  src/driver/winlvm_mount.c
 )
-target_include_directories(winlvm_tests PRIVATE src)
-target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol)
+target_include_directories(winlvm_tests PRIVATE src tests src/driver)
+target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol lvmcore)
 target_compile_definitions(winlvm_tests PRIVATE
   WINLVM_CORPUS_EXPECTED="${CORPUS_SRC}/expected"
   WINLVM_CORPUS_IMAGES="${CORPUS_OUT}"

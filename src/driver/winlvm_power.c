@@ -1,9 +1,5 @@
-/* winlvm_power.c — power dispatch.
- *
- * Power IRPs: LV PDOs are leaf devices (complete immediately); the bus
- * FDO forwards down the root stack. Extension kind is at offset 0 in both.
- *
- * Moved verbatim from winlvm.c (2026-09-12 module split).
+/*
+ * winlvm_power.c — WDM power IRP dispatch for control, bus FDO, and LV PDOs.
  */
 #include "winlvm.h"
 

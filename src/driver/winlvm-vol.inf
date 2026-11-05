@@ -1,12 +1,8 @@
 ; winlvm-vol.inf
 ;
-; LV volume children (hwid WinLvmVolume, enumerated by the winlvm bus).
-; Raw PDO: the bus driver owns every child IRP (PnP + mount IOCTLs), so NO
-; function driver is installed here (empty AddService). AddService=winlvm
-; in this section made PnP call our AddDevice on every child PDO, stacking
-; a second bus on each LV: bus-on-bus recursion = the 2026-09-11 crash-loop.
-; The bus driver must set RawDeviceOK in QUERY_CAPABILITIES for a raw child
-; devnode to start.
+; Raw child PDO INF for WinLVM logical volume devices enumerated by the
+; winlvm bus driver. No function driver is attached (empty AddService) so
+; the bus driver handles all child PnP, storage, and mount IRPs directly.
 
 [Version]
 Signature="$WINDOWS NT$"
@@ -25,7 +21,7 @@ PnpLockdown=1
 %WinLvmVolumeDesc%=WinLvmVolume_Install,WinLvmVolume
 
 [WinLvmVolume_Install.NT]
-; raw PDO: no files, no service
+; Raw PDO: no files, no service.
 [WinLvmVolume_Install.NT.Services]
 AddService = ,0x00000002
 
