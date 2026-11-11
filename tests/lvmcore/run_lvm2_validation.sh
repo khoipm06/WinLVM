@@ -2,40 +2,29 @@
 # run_lvm2_validation.sh — LVM2 vgcfgrestore acceptance sweep for winlvm lvmcore.
 #
 # For every VG-bearing corpus case:
-#   1. Dump the VG from the corpus image via build/lvmcore_dump_vgcfg
-#      (vgcfgbackup file format: contents/version/description/creation_host/
-#       creation_time header + serialized VG text block).
-#   2. In ONE privileged docker container (winlvm-lvm2:latest, lvm2 preinstalled):
-#      copy image(s) to scratch, losetup each (sector-size 4096 for sector4k),
-#      vgcfgrestore --test --force (expect exit 0; --force is required by LVM2
-#      when the VG contains thin volumes, no-op otherwise),
-#      real vgcfgrestore to the scratch + vgck (expect exit 0),
-#      detach loops (trap-guarded), copy first restored scratch out for
-#      full-circle.
-#   3. Full circle: re-dump the restored scratch image with our own tool and
-#      semantic-compare against the original dump. Ignored (expected variance):
-#      - header lines (description/creation_time/creation_host)
-#      - seqno (LVM2 bumps it on every restore write)
-#      - PV "device = ..." paths (vgcfgrestore rewrites them to the actual
-#        loop node; LVM2 matches PVs by UUID, paths are informational)
+#   1. Dump the VG from the corpus image via <BUILD_DIR>/lvmcore_dump_vgcfg.
+#   2. In a privileged container image containing upstream lvm2:
+#      copy image(s) to scratch, attach loop device(s) (4096B sectors for sector4k),
+#      run vgcfgrestore --test --force, real vgcfgrestore, and vgck, then copy
+#      the restored scratch image back out.
+#   3. Re-dump the restored scratch image with lvmcore_dump_vgcfg and
+#      semantically compare against the original dump (ignoring header metadata,
+#      incremented seqno, and loop device path hints).
 #
-# 2-PV VGs: the full VG metadata lives in every PV's metadata area, so the
-# dump comes from the -a image alone, but vgcfgrestore/vgck need BOTH PVs
-# visible: -a and -b images are both attached (comma-joined --devices).
+# Original corpus images are mounted read-only and never modified.
 #
-# Prints PASS:/FAIL: per case; writes everything to lvm2-validation.log
-# next to this script. Original corpus images are never written to.
-#
-# Usage: tests/lvmcore/run_lvm2_validation.sh [logfile]
+# Usage:
+#   BUILD_DIR=./build tests/lvmcore/run_lvm2_validation.sh [logfile]
 
 set -u -o pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-DUMP_TOOL="$REPO_ROOT/build/lvmcore_dump_vgcfg"
-IMAGES_DIR="$REPO_ROOT/build/corpus-images"
-WORK_DIR="$(mktemp -d /tmp/lvm2val.XXXXXX)"
-LOG_FILE="${1:-$REPO_ROOT/tests/lvmcore/lvm2-validation.log}"
-CONTAINER_IMAGE="winlvm-lvm2:latest"
+BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
+DUMP_TOOL="${DUMP_TOOL:-$BUILD_DIR/lvmcore_dump_vgcfg}"
+IMAGES_DIR="${IMAGES_DIR:-$BUILD_DIR/corpus-images}"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/winlvm-lvm2val.XXXXXX")"
+LOG_FILE="${1:-$BUILD_DIR/lvm2-validation.log}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-winlvm-lvm2:latest}"
 
 # case|images (comma-sep)|vgname|logical-sector-size
 CASES=(
@@ -53,15 +42,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$(dirname "$LOG_FILE")"
+
 log() { printf '%s\n' "$*" | tee -a "$LOG_FILE"; }
 
 pass=0; fail=0
 
 : > "$LOG_FILE"
-log "# winlvm lvmcore → LVM2 vgcfgrestore validation"
+log "# winlvm lvmcore -> LVM2 vgcfgrestore validation"
 log "# date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-log "# container: $CONTAINER_IMAGE (lvm2 toolchain in docker)"
-log "# dump tool: $DUMP_TOOL"
+log "# container: $CONTAINER_IMAGE"
 log "# cases: ${#CASES[@]}"
 log ""
 
@@ -85,16 +75,12 @@ for entry in "${CASES[@]}"; do
   log "case: $case  images: $imgs  vg: $vgn  sector-size: $ssz"
   log "----------------------------------------------------------------"
 
-  # 1. host dump (VG metadata is fully present in each PV's metadata area)
   if ! "$DUMP_TOOL" "$img" "$dump" >>"$LOG_FILE" 2>&1; then
     log "FAIL: $case (lvmcore_dump_vgcfg failed)"
     fail=$((fail+1)); continue
   fi
   log "dump OK: $case.dump ($(wc -c <"$dump") bytes)"
 
-  # 2. container acceptance: --test, real restore, vgck, restore-scratch copyback.
-  #    Args passed as environment variables (bash -c positional args after the
-  #    script string land in $0..$N, not $1..$N).
   out=$(docker run --rm --privileged \
     -v /dev:/dev \
     -v "$IMAGES_DIR:/images:ro" \
@@ -141,9 +127,6 @@ DOCKER_RUN_FAILED"
   [ "$restore_rc" = "0" ] || { log "  real vgcfgrestore RC='$restore_rc' (expected 0)"; case_ok=0; }
   [ "$vgck_rc" = "0" ] || { log "  vgck RC='$vgck_rc' (expected 0)"; case_ok=0; }
 
-  # 3. full circle: re-dump restored scratch, semantic compare.
-  #    Ignored: header lines, seqno (bumped by restore), device paths (rewritten
-  #    by vgcfgrestore to the loop node; PV identity is the UUID).
   if [ "$case_ok" = "1" ] && [ "$copyback_rc" = "0" ]; then
     redump="$WORK_DIR/$case.redump"
     if "$DUMP_TOOL" "$WORK_DIR/$case.restored.img" "$redump" >>"$LOG_FILE" 2>&1; then
