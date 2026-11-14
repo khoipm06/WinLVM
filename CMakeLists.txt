@@ -134,8 +134,7 @@ if(ZSTD_EXE)
   add_test(NAME test_lvmcore_serialize
     COMMAND test_lvmcore_serialize "${CORPUS_OUT}")
 
-  # W2 Task 8: multi-VG registry + PV arrival state machine host core.
-  # Pure logic test on synthetic VGs — no corpus dependency.
+  # Host logic tests for multi-VG registry, PV arrival state machine, and mapper.
   add_executable(test_winlvm_vg
     tests/lvmcore/test_winlvm_vg.c
     src/driver/winlvm_vg.c
@@ -144,6 +143,21 @@ if(ZSTD_EXE)
   target_include_directories(test_winlvm_vg PRIVATE src/driver)
   target_link_libraries(test_winlvm_vg PRIVATE lvmcore)
   add_test(NAME test_winlvm_vg COMMAND test_winlvm_vg)
+
+  # Differential kernel-mapper suite against decompressed corpus images and SHA-256 oracles.
+  add_executable(test_driver_corpus_map
+    tests/lvmcore/test_driver_corpus_map.c
+    tests/test_sha256.c
+    src/driver/winlvm_vg.c
+    src/driver/winlvm_map.c
+  )
+  target_include_directories(test_driver_corpus_map PRIVATE src/driver tests)
+  target_link_libraries(test_driver_corpus_map PRIVATE lvmcore)
+  if(TARGET corpus)
+    add_dependencies(test_driver_corpus_map corpus)
+  endif()
+  add_test(NAME test_driver_corpus_map
+    COMMAND test_driver_corpus_map "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
 
   add_executable(lvmcore_dump_vgcfg
     tests/lvmcore/lvmcore_dump_vgcfg.c
@@ -172,6 +186,7 @@ add_executable(winlvm_tests
   tests/test_lvm_cli.cpp
   tests/test_storage_surface.cpp
   tests/test_lvm_control_plane.cpp
+  tests/test_sha256.c
   src/tools/lvm/lv_extent_alloc.cpp
   src/driver/winlvm_storage.c
   src/driver/winlvm_mount.c
@@ -182,8 +197,9 @@ target_compile_definitions(winlvm_tests PRIVATE
   WINLVM_CORPUS_EXPECTED="${CORPUS_SRC}/expected"
   WINLVM_CORPUS_IMAGES="${CORPUS_OUT}"
   WINLVM_LVM_EXE="$<TARGET_FILE:lvm>"
+  WINLVM_LVMDUMP_EXE="$<TARGET_FILE:lvmdump>"
 )
-add_dependencies(winlvm_tests lvm)
+add_dependencies(winlvm_tests lvm lvmdump)
 if(TARGET corpus)
   add_dependencies(winlvm_tests corpus)
 endif()
