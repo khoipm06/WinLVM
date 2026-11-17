@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
   add_compile_options(/W4 /permissive- /utf-8 /Zc:__cplusplus)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
   add_compile_options(-Wall -Wextra -Wconversion -Wsign-conversion)
   # Self-contained binaries: a MinGW/msys2 toolchain otherwise produces
@@ -79,7 +80,7 @@ target_link_libraries(lvm PRIVATE lvmfmt)
 # are opaque until the luksfmt layer exists (roadmap Phase 5).
 # ---------------------------------------------------------------------------
 set(CORPUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/corpus")
-set(CORPUS_OUT "${CMAKE_BINARY_DIR}/corpus-images")
+set(CORPUS_OUT "${CMAKE_BINARY_DIR}/corpus-images" CACHE PATH "Directory containing decompressed corpus images")
 
 find_program(ZSTD_EXE zstd)
 file(GLOB CORPUS_ZST "${CORPUS_SRC}/images/*.img.zst")
@@ -100,13 +101,32 @@ if(ZSTD_EXE)
     list(APPEND CORPUS_IMAGES "${out}")
   endforeach()
   add_custom_target(corpus ALL DEPENDS ${CORPUS_IMAGES})
-else()
-  message(WARNING "zstd not found: corpus oracle tests will be skipped.")
+elseif(NOT EXISTS "${CORPUS_OUT}/linear-1pv.img")
+  message(WARNING "zstd not found and ${CORPUS_OUT}/linear-1pv.img missing: corpus oracle tests will be skipped.")
 endif()
-if(ZSTD_EXE)
+
+enable_testing()
+
+# Synthetic freestanding C11 unit tests (no corpus images required).
+add_executable(test_lvmcore_hardening
+  tests/lvmcore/test_lvmcore_hardening.c
+)
+target_link_libraries(test_lvmcore_hardening PRIVATE lvmcore)
+add_test(NAME test_lvmcore_hardening COMMAND test_lvmcore_hardening)
+
+# Host logic tests for multi-VG registry, PV arrival state machine, and mapper.
+add_executable(test_winlvm_vg
+  tests/lvmcore/test_winlvm_vg.c
+  src/driver/winlvm_vg.c
+  src/driver/winlvm_map.c
+)
+target_include_directories(test_winlvm_vg PRIVATE src/driver)
+target_link_libraries(test_winlvm_vg PRIVATE lvmcore)
+add_test(NAME test_winlvm_vg COMMAND test_winlvm_vg)
+
+if(ZSTD_EXE OR EXISTS "${CORPUS_OUT}/linear-1pv.img")
   # -------------------------------------------------------------------------
-  # lvmcore test suite: parser, hardening, and serialization.
-  # (Supersedes legacy driver lvm_read.c parser tests)
+  # lvmcore corpus-backed parser, serialization, and differential mapper tests.
   # -------------------------------------------------------------------------
   add_executable(test_lvmcore_parser
     tests/lvmcore/test_lvmcore_parser.c
@@ -118,12 +138,6 @@ if(ZSTD_EXE)
   add_test(NAME test_lvmcore_parser
     COMMAND test_lvmcore_parser "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
 
-  add_executable(test_lvmcore_hardening
-    tests/lvmcore/test_lvmcore_hardening.c
-  )
-  target_link_libraries(test_lvmcore_hardening PRIVATE lvmcore)
-  add_test(NAME test_lvmcore_hardening COMMAND test_lvmcore_hardening)
-
   add_executable(test_lvmcore_serialize
     tests/lvmcore/test_lvmcore_serialize.c
   )
@@ -133,16 +147,6 @@ if(ZSTD_EXE)
   endif()
   add_test(NAME test_lvmcore_serialize
     COMMAND test_lvmcore_serialize "${CORPUS_OUT}")
-
-  # Host logic tests for multi-VG registry, PV arrival state machine, and mapper.
-  add_executable(test_winlvm_vg
-    tests/lvmcore/test_winlvm_vg.c
-    src/driver/winlvm_vg.c
-    src/driver/winlvm_map.c
-  )
-  target_include_directories(test_winlvm_vg PRIVATE src/driver)
-  target_link_libraries(test_winlvm_vg PRIVATE lvmcore)
-  add_test(NAME test_winlvm_vg COMMAND test_winlvm_vg)
 
   # Differential kernel-mapper suite against decompressed corpus images and SHA-256 oracles.
   add_executable(test_driver_corpus_map
@@ -167,7 +171,6 @@ if(ZSTD_EXE)
     add_dependencies(lvmcore_dump_vgcfg corpus)
   endif()
 endif()
-enable_testing()
 
 add_library(winlvm_service_protocol STATIC
   src/service/protocol.cpp

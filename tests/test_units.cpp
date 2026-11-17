@@ -1,11 +1,20 @@
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <vector>
 
+#include "lvmcore/arena.h"
+#include "lvmcore/parser.h"
 #include "lvmfmt/allocator.h"
 #include "lvmfmt/bytes.h"
+#include "lvmfmt/commit.h"
 #include "lvmfmt/config.h"
 #include "lvmfmt/crc32.h"
 #include "lvmfmt/label.h"
 #include "lvmfmt/metadata.h"
+#include "lvmfmt/source.h"
 #include "testing.h"
 
 using namespace lvmfmt;
@@ -266,4 +275,208 @@ TEST(reduce_lv_enforces_striped_divisibility) {
   CHECK(reduce_lv(vg, "stripe_lv", 2, err));
   CHECK_EQ(vg.lvs[0].extent_count(), std::uint64_t{2});
   CHECK_EQ(vg.lvs[0].segments[0].extent_count, std::uint64_t{2});
+}
+
+TEST(serialize_vg_escapes_device_and_preserves_status_and_system_id) {
+  VolumeGroup vg;
+  vg.name = "vg_escape";
+  vg.id = "11111122223333444455556666777788";
+  vg.seqno = 9;
+  vg.extent_size_sectors = 8192;
+  vg.system_id = "win-host-01";
+  vg.status = {"RESIZEABLE", "READ", "WRITE", "EXPORTED"};
+
+  PhysicalVolume pv;
+  pv.key = "pv0";
+  pv.id = "aaaaaa11112222333344445555666677";
+  pv.device = "\\\\.\\PhysicalDrive11";
+  pv.status = {"ALLOCATABLE"};
+  pv.dev_size_sectors = 65536;
+  pv.pe_start_sectors = 2048;
+  pv.pe_count = 7;
+  vg.pvs.push_back(pv);
+
+  LogicalVolume lv;
+  lv.name = "lv_ro";
+  lv.id = "bbbbbb11112222333344445555666677";
+  lv.status = {"READ", "VISIBLE"};
+  Segment seg;
+  seg.start_extent = 0;
+  seg.extent_count = 2;
+  seg.type = "striped";
+  seg.stripe_count = 1;
+  seg.stripes.push_back({"pv0", 0});
+  lv.segments.push_back(seg);
+  vg.lvs.push_back(lv);
+
+  std::string err;
+  auto text = serialize_vg_to_text(vg, err);
+  CHECK_MSG(text.has_value(), err);
+  CHECK(text->find("device = \"\\\\\\\\.\\\\PhysicalDrive11\"") != std::string::npos);
+  CHECK(text->find("system_id = \"win-host-01\"") != std::string::npos);
+  CHECK(text->find("\"EXPORTED\"") != std::string::npos);
+
+  auto parsed = parse_vg_metadata(*text, err);
+  CHECK_MSG(parsed.has_value(), err);
+  CHECK_EQ(parsed->system_id, std::string("win-host-01"));
+  CHECK(parsed->is_exported());
+  CHECK_EQ(parsed->pvs.size(), std::size_t{1});
+  CHECK_EQ(parsed->pvs[0].device, std::string("\\\\.\\PhysicalDrive11"));
+  CHECK_EQ(parsed->lvs.size(), std::size_t{1});
+  CHECK(parsed->lvs[0].is_read_only());
+
+  // Freestanding kernel parser must agree on system_id and LV read-only state.
+  std::vector<std::uint8_t> arena_buf(256u * 1024u);
+  lvmcore_arena arena;
+  lvmcore_arena_init(&arena, arena_buf.data(), arena_buf.size());
+  lvmcore_volume_group core_vg{};
+  lvmcore_err core_err{};
+  CHECK_EQ(static_cast<int>(lvmcore_parse_vg_text(text->c_str(), text->size(), &arena, &core_vg, &core_err)),
+           static_cast<int>(LVMCORE_OK));
+  CHECK_EQ(std::string(core_vg.system_id), std::string("win-host-01"));
+  CHECK_EQ(core_vg.read_only, 0);
+  CHECK_EQ(core_vg.lv_count, std::size_t{1});
+  CHECK_EQ(core_vg.lvs[0].read_only, 1);
+}
+
+TEST(serialize_vg_refuses_unsupported_segments_closed) {
+  VolumeGroup vg;
+  vg.name = "vg_thin";
+  vg.id = "11111122223333444455556666777799";
+  vg.seqno = 1;
+  vg.extent_size_sectors = 8192;
+  PhysicalVolume pv;
+  pv.key = "pv0";
+  pv.id = "aaaaaa11112222333344445555666688";
+  pv.pe_start_sectors = 2048;
+  pv.pe_count = 7;
+  vg.pvs.push_back(pv);
+
+  LogicalVolume lv;
+  lv.name = "lv_thin";
+  lv.id = "bbbbbb11112222333344445555666688";
+  lv.supported = false;
+  lv.unsupported_reason = "unsupported segment type 'thin'";
+  Segment seg;
+  seg.start_extent = 0;
+  seg.extent_count = 2;
+  seg.type = "thin";
+  lv.segments.push_back(seg);
+  vg.lvs.push_back(lv);
+
+  std::string err;
+  CHECK(!serialize_vg_to_text(vg, err).has_value());
+  CHECK(!err.empty());
+}
+
+TEST(circular_mda_ring_wraps_across_boundary_and_stays_valid) {
+  namespace fs = std::filesystem;
+  const fs::path pv_path = fs::temp_directory_path() / "winlvm_unit_mda_wrap.img";
+  struct Guard {
+    fs::path p;
+    ~Guard() { std::error_code ec; fs::remove(p, ec); }
+  } guard{pv_path};
+
+  {
+    std::ofstream f(pv_path, std::ios::binary | std::ios::trunc);
+    CHECK(f.is_open());
+    std::vector<char> zeros(65536, 0);
+    for (int i = 0; i < 128; ++i) f.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+  }
+
+  std::string err;
+  auto src = open_storage_source(pv_path.string(), true, err);
+  CHECK_MSG(src != nullptr, err);
+
+  PvCreateOptions opts;
+  opts.pe_start_sectors = 2048;
+  opts.mda_size_sectors = 32;  // 16 KiB circular ring buffer
+  std::string pv_uuid;
+  CHECK_MSG(pvcreate_initialize(*src, opts, pv_uuid, err), err);
+
+  VolumeGroup vg;
+  vg.name = "vg_ring";
+  vg.id = "99999988887777666655554444333322";
+  vg.seqno = 0;
+  vg.extent_size_sectors = 8192;
+  vg.status = {"RESIZEABLE", "READ", "WRITE"};
+
+  PhysicalVolume pv;
+  pv.key = "pv0";
+  pv.id = pv_uuid;
+  pv.device = "/dev/loop0";
+  pv.status = {"ALLOCATABLE"};
+  pv.dev_size_sectors = (8ULL * 1024ULL * 1024ULL) / 512ULL;
+  pv.pe_start_sectors = 2048;
+  pv.pe_count = 1;
+  vg.pvs.push_back(pv);
+
+  LogicalVolume lv;
+  lv.name = "lv_ring";
+  lv.id = "1234567890abcdef1234567890abcdef";
+  lv.status = {"READ", "WRITE", "VISIBLE"};
+  Segment seg;
+  seg.start_extent = 0;
+  seg.extent_count = 1;
+  seg.type = "striped";
+  seg.stripe_count = 1;
+  seg.stripes.push_back({"pv0", 0});
+  lv.segments.push_back(seg);
+  vg.lvs.push_back(lv);
+
+  int wrap_count = 0;
+  int ring_revolutions = 0;
+  std::uint64_t prev_offset = 0;
+  std::vector<std::uint8_t> core_arena_buf(512u * 1024u);
+
+  for (int i = 1; i <= 60; ++i) {
+    vg.seqno = static_cast<std::uint64_t>(i);
+    vg.lvs[0].name = (i % 2 == 0) ? "lv_ring_even" : "lv_ring_odd";
+
+    std::vector<ByteSource*> targets = {src.get()};
+    CHECK_MSG(commit_vg_metadata(vg, targets, err), err);
+
+    auto lbl = read_pv_label(*src, err);
+    CHECK_MSG(lbl.has_value(), err);
+    CHECK_EQ(lbl->metadata_areas.size(), std::size_t{1});
+    CHECK_EQ(lbl->metadata_areas[0].size, std::uint64_t{16384});
+
+    auto mda = read_mda_header(*src, lbl->metadata_areas[0], err);
+    CHECK_MSG(mda.has_value(), err);
+    if (prev_offset > 0 && mda->commit_offset < prev_offset) {
+      ring_revolutions++;
+    }
+    prev_offset = mda->commit_offset;
+    if (mda->commit_offset + mda->commit_size > mda->size) {
+      wrap_count++;
+    }
+
+    auto text = read_vg_metadata(*src, *lbl, err);
+    CHECK_MSG(text.has_value(), err);
+    auto parsed = parse_vg_metadata(*text, err);
+    CHECK_MSG(parsed.has_value(), err);
+    CHECK_EQ(parsed->seqno, vg.seqno);
+    CHECK_EQ(parsed->lvs[0].name, vg.lvs[0].name);
+
+    // Confirm freestanding lvmcore also decodes the wrapped ring buffer cleanly.
+    auto read_cb = [](void* impl, std::uint64_t off, void* buf, std::size_t len) -> std::size_t {
+      auto* s = static_cast<ByteSource*>(impl);
+      return s->read(off, buf, len) ? len : 0;
+    };
+    lvmcore_byte_source csrc{src.get(), src->size(), read_cb};
+    lvmcore_arena arena;
+    lvmcore_arena_init(&arena, core_arena_buf.data(), core_arena_buf.size());
+    lvmcore_volume_group cvg{};
+    lvmcore_err cerr{};
+    CHECK_EQ(static_cast<int>(lvmcore_read_vg(&csrc, LVMCORE_READ_FLAG_DEFAULT, &arena, &cvg, &cerr)),
+             static_cast<int>(LVMCORE_OK));
+    CHECK_EQ(cvg.seqno, vg.seqno);
+  }
+
+  CHECK_MSG(wrap_count >= 2,
+            "expected >= 2 active ring wraps across 60 commits, observed " + std::to_string(wrap_count));
+  CHECK_MSG(ring_revolutions >= 3,
+            "expected >= 3 full ring revolutions across 60 commits, observed " + std::to_string(ring_revolutions));
+  testing::note("observed " + std::to_string(wrap_count) + " active wraps and " +
+                std::to_string(ring_revolutions) + " ring revolutions across 60 commits");
 }

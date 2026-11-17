@@ -87,3 +87,43 @@ TEST(mutation_refuses_backend_path_even_when_available) {
   CHECK(winlvm::service::mutate(winlvm::service::MutationKind::Shrink, "vg/lv", geometry, true) ==
         winlvm::service::MutationError::Unsupported);
 }
+
+TEST(service_parses_and_executes_inventory_and_refresh) {
+  // Inventory frame
+  std::vector<std::byte> inv_frame;
+  put32(inv_frame, winlvm::service::kProtocolVersion);
+  put32(inv_frame, static_cast<std::uint32_t>(winlvm::service::Operation::Inventory));
+  put32(inv_frame, 0);
+  put64(inv_frame, 0);
+  const auto inv_parsed = winlvm::service::parse_frame(inv_frame);
+  CHECK(inv_parsed.ok);
+  CHECK(inv_parsed.error == winlvm::service::ErrorCode::Ok);
+  CHECK(inv_parsed.request.operation == winlvm::service::Operation::Inventory);
+  CHECK(winlvm::service::execute_request(inv_parsed.request, false) ==
+        winlvm::service::ErrorCode::DriverUnavailable);
+  CHECK(winlvm::service::execute_request(inv_parsed.request, true) ==
+        winlvm::service::ErrorCode::Ok);
+
+  // Refresh frame
+  std::vector<std::byte> ref_frame;
+  put32(ref_frame, winlvm::service::kProtocolVersion);
+  put32(ref_frame, static_cast<std::uint32_t>(winlvm::service::Operation::Refresh));
+  put32(ref_frame, 0);
+  put64(ref_frame, 0);
+  const auto ref_parsed = winlvm::service::parse_frame(ref_frame);
+  CHECK(ref_parsed.ok);
+  CHECK(ref_parsed.error == winlvm::service::ErrorCode::Ok);
+  CHECK(ref_parsed.request.operation == winlvm::service::Operation::Refresh);
+  CHECK(winlvm::service::execute_request(ref_parsed.request, false) ==
+        winlvm::service::ErrorCode::DriverUnavailable);
+  CHECK(winlvm::service::execute_request(ref_parsed.request, true) ==
+        winlvm::service::ErrorCode::Ok);
+
+  CHECK_EQ(winlvm::service::error_name(winlvm::service::ErrorCode::Ok), std::string_view("ok"));
+  CHECK_EQ(winlvm::service::error_name(winlvm::service::ErrorCode::MalformedFrame),
+           std::string_view("malformed-frame"));
+  CHECK_EQ(winlvm::service::error_name(winlvm::service::ErrorCode::Unsupported),
+           std::string_view("unsupported"));
+  CHECK_EQ(winlvm::service::error_name(winlvm::service::ErrorCode::DriverUnavailable),
+           std::string_view("driver-unavailable"));
+}

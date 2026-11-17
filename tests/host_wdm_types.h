@@ -500,6 +500,7 @@ typedef struct _WINLVM_LV_EXT {
     ULONG               logical_sector;
     ULONG               physical_sector;
     ULONGLONG           byte_size;
+    BOOLEAN             read_only;
     UNICODE_STRING      ifname;
     WCHAR               devname[64];
 } WINLVM_LV_EXT, *PWINLVM_LV_EXT;

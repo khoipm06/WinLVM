@@ -1,5 +1,6 @@
 #include "testing.h"
 #include "host_wdm_types.h"
+#include "winlvm_ioctl.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -594,4 +595,97 @@ TEST(StorageSurface_VolumeFSCTLs_LockUnlockDismountDasd) {
     CHECK_EQ(fix.runMountIoctl(FSCTL_UNLOCK_VOLUME, 0, 0, nullptr, buf, info), STATUS_SUCCESS);
     CHECK_EQ(fix.runMountIoctl(FSCTL_DISMOUNT_VOLUME, 0, 0, nullptr, buf, info), STATUS_SUCCESS);
     CHECK_EQ(fix.runMountIoctl(FSCTL_ALLOW_EXTENDED_DASD_IO, 0, 0, nullptr, buf, info), STATUS_SUCCESS);
+}
+
+/* -------------------------------------------------------------------------
+ * Group 7: Read-Only Write-Protection & Control-Plane Wire ABI
+ * ------------------------------------------------------------------------- */
+
+TEST(StorageSurface_IsWritable_EnforcesReadOnlyAndSystemId) {
+    IoctlTestFixture fix;
+    std::vector<uint8_t> buf;
+    uint64_t info = 99;
+
+    // Default writable VG/LV
+    CHECK_EQ(fix.runStorageIoctl(IOCTL_DISK_IS_WRITABLE, 0, 0, nullptr, buf, info), STATUS_SUCCESS);
+    CHECK_EQ(info, 0ull);
+
+    // Read-only LV
+    fix.ext.read_only = TRUE;
+    fix.lv.read_only = 1;
+    CHECK_EQ(fix.runStorageIoctl(IOCTL_DISK_IS_WRITABLE, 0, 0, nullptr, buf, info),
+             STATUS_MEDIA_WRITE_PROTECTED);
+    CHECK_EQ(info, 0ull);
+
+    // Read-only VG
+    fix.lv.read_only = 0;
+    fix.view.read_only = 1;
+    CHECK_EQ(fix.runStorageIoctl(IOCTL_DISK_IS_WRITABLE, 0, 0, nullptr, buf, info),
+             STATUS_MEDIA_WRITE_PROTECTED);
+    CHECK_EQ(info, 0ull);
+
+    // Foreign system_id forces read-only mount
+    fix.view.read_only = 0;
+    std::strcpy(fix.view.system_id, "foreign-host-01");
+    CHECK_EQ(fix.runStorageIoctl(IOCTL_DISK_IS_WRITABLE, 0, 0, nullptr, buf, info),
+             STATUS_MEDIA_WRITE_PROTECTED);
+    CHECK_EQ(info, 0ull);
+
+    // Clearing all read-only conditions restores writability
+    fix.view.system_id[0] = '\0';
+    fix.ext.read_only = FALSE;
+    CHECK_EQ(fix.runStorageIoctl(IOCTL_DISK_IS_WRITABLE, 0, 0, nullptr, buf, info), STATUS_SUCCESS);
+}
+
+TEST(ControlPlaneAbi_WireStructSizesMatchSpec) {
+    CHECK_EQ(sizeof(WINLVM_CONTROL_REQUEST), std::size_t{8});
+    CHECK_EQ(sizeof(WINLVM_LV_REQUEST), std::size_t{48});
+    CHECK_EQ(sizeof(WINLVM_VG_REQUEST), std::size_t{72});
+    CHECK_EQ(sizeof(WINLVM_UPDATE_LV_REQUEST), std::size_t{64});
+    CHECK_EQ(sizeof(WINLVM_PROBE_DEVICE_REQUEST), std::size_t{520});
+    CHECK_EQ(sizeof(WINLVM_INVENTORY_LV_ENTRY), std::size_t{184});
+    CHECK_EQ(sizeof(WINLVM_INVENTORY), std::size_t{16});
+}
+
+TEST(ControlPlaneAbi_UuidNormalizationAndWireEquality) {
+    const char raw[] = "MMmapVdo0dx2Tu6PrQPRL3hgD6BJR3Od";
+    const char hyphenated[] = "MMmapV-do0d-x2Tu-6PrQ-PRL3-hgD6-BJR3Od";
+    const char different[] = "ZZmapV-do0d-x2Tu-6PrQ-PRL3-hgD6-BJR3Od";
+
+    char norm[33] = {};
+    CHECK_EQ(winlvm_normalize_uuid(raw, sizeof(raw), norm), 1);
+    CHECK(std::strcmp(norm, raw) == 0);
+
+    std::memset(norm, 0, sizeof(norm));
+    CHECK_EQ(winlvm_normalize_uuid(hyphenated, sizeof(hyphenated), norm), 1);
+    CHECK(std::strcmp(norm, raw) == 0);
+
+    // Exact 32-byte non-NUL-terminated buffer is accepted.
+    char exact32[32];
+    std::memcpy(exact32, raw, 32);
+    std::memset(norm, 0, sizeof(norm));
+    CHECK_EQ(winlvm_normalize_uuid(exact32, sizeof(exact32), norm), 1);
+    CHECK(std::strcmp(norm, raw) == 0);
+
+    // Unterminated wire buffer larger than 32 bytes is rejected.
+    char unterminated[WINLVM_LV_UUID_WIRE_LEN];
+    std::memset(unterminated, 'a', sizeof(unterminated));
+    CHECK_EQ(winlvm_normalize_uuid(unterminated, sizeof(unterminated), norm), 0);
+
+    // Invalid characters, wrong lengths, and NULL pointers are rejected.
+    const char bad_char[] = "MMmapV_do0d-x2Tu-6PrQ-PRL3-hgD6-BJR3Od";
+    const char too_short[] = "MMmapVdo0dx2Tu6PrQPRL3hgD6BJR3O";
+    const char too_long[] = "MMmapVdo0dx2Tu6PrQPRL3hgD6BJR3OdX";
+    CHECK_EQ(winlvm_normalize_uuid(bad_char, sizeof(bad_char), norm), 0);
+    CHECK_EQ(winlvm_normalize_uuid(too_short, sizeof(too_short), norm), 0);
+    CHECK_EQ(winlvm_normalize_uuid(too_long, sizeof(too_long), norm), 0);
+    CHECK_EQ(winlvm_normalize_uuid(nullptr, 32, norm), 0);
+    CHECK_EQ(winlvm_normalize_uuid(raw, sizeof(raw), nullptr), 0);
+    CHECK_EQ(winlvm_normalize_uuid(raw, 0, norm), 0);
+
+    // Wire equality ignores optional dashes and rejects mismatched/invalid UUIDs.
+    CHECK_EQ(winlvm_uuid_equal_wire(raw, sizeof(raw), hyphenated, sizeof(hyphenated)), 1);
+    CHECK_EQ(winlvm_uuid_equal_wire(hyphenated, sizeof(hyphenated), exact32, sizeof(exact32)), 1);
+    CHECK_EQ(winlvm_uuid_equal_wire(raw, sizeof(raw), different, sizeof(different)), 0);
+    CHECK_EQ(winlvm_uuid_equal_wire(raw, sizeof(raw), bad_char, sizeof(bad_char)), 0);
 }
