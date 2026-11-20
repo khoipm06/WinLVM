@@ -81,35 +81,13 @@ ULONG WinLvmLogDrain(char *out, ULONG cap) {
     return to_copy;
 }
 
-NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+NTSTATUS WinLvmCreateControlDevice(PDRIVER_OBJECT DriverObject) {
+    if (g_control_device) return STATUS_SUCCESS;
+
     UNICODE_STRING device_name;
     UNICODE_STRING dos_name;
-    NTSTATUS status;
-
-    UNREFERENCED_PARAMETER(RegistryPath);
-
-    KeInitializeSpinLock(&g_log_lock);
-    g_log_head = 0;
-    g_log_len = 0;
-    g_log_ready = TRUE;
-    WinLvmProbeSubsystemInit();
-
-    DriverObject->MajorFunction[IRP_MJ_CREATE]         = WinLvmCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = WinLvmCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = WinLvmCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_READ]           = WinLvmRead;
-    DriverObject->MajorFunction[IRP_MJ_WRITE]          = WinLvmWrite;
-    DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS]  = WinLvmFlush;
-    DriverObject->MajorFunction[IRP_MJ_SHUTDOWN]       = WinLvmShutdown;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = WinLvmDeviceControl;
-    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = WinLvmSystemControl;
-    DriverObject->MajorFunction[IRP_MJ_PNP]            = WinLvmPnp;
-    DriverObject->MajorFunction[IRP_MJ_POWER]          = WinLvmPower;
-    DriverObject->DriverExtension->AddDevice           = WinLvmAddDevice;
-    DriverObject->DriverUnload                         = WinLvmUnload;
-
     RtlInitUnicodeString(&device_name, WINLVM_CONTROL_DEVICE_NAME);
-    status = IoCreateDeviceSecure(
+    NTSTATUS status = IoCreateDeviceSecure(
         DriverObject,
         sizeof(WINLVM_CONTROL_EXT),
         &device_name,
@@ -134,19 +112,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
     g_control_link_created = TRUE;
     g_control_device->Flags &= ~DO_DEVICE_INITIALIZING;
-
-    WL_TRACE("DriverEntry");
     return STATUS_SUCCESS;
 }
 
-void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
-    UNICODE_STRING dos_name;
-
-    UNREFERENCED_PARAMETER(DriverObject);
-    WinLvmStopAndDrainProbeWork();
-
-    RtlInitUnicodeString(&dos_name, WINLVM_CONTROL_DOS_NAME);
+void WinLvmDeleteControlDevice(void) {
     if (g_control_link_created) {
+        UNICODE_STRING dos_name;
+        RtlInitUnicodeString(&dos_name, WINLVM_CONTROL_DOS_NAME);
         IoDeleteSymbolicLink(&dos_name);
         g_control_link_created = FALSE;
     }
@@ -154,6 +126,58 @@ void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
         IoDeleteDevice(g_control_device);
         g_control_device = NULL;
     }
+}
+
+void WinLvmFreePvTag(WINLVM_PV_TAG *tag) {
+    if (!tag) return;
+    if (tag->disk_ifname.Buffer) {
+        ExFreePoolWithTag(tag->disk_ifname.Buffer, WINLVM_WIN_TAG);
+    }
+    if (tag->backing_pdo) ObDereferenceObject(tag->backing_pdo);
+    if (tag->backing_file) ObDereferenceObject(tag->backing_file);
+    ExFreePoolWithTag(tag, WINLVM_WIN_TAG);
+}
+
+void WinLvmFreeReconcileDrops(WINLVM_RECONCILE_DROPS *drops) {
+    if (!drops) return;
+    for (size_t i = 0; i < drops->count && i < WL_MAX_DROPPED_REFS; i++) {
+        if (drops->pdos[i]) ObDereferenceObject(drops->pdos[i]);
+        if (drops->files[i]) ObDereferenceObject(drops->files[i]);
+    }
+    ExFreePoolWithTag(drops, WINLVM_WIN_TAG);
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    KeInitializeSpinLock(&g_log_lock);
+    g_log_head = 0;
+    g_log_len = 0;
+    g_log_ready = TRUE;
+    WinLvmProbeSubsystemInit();
+
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = WinLvmCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = WinLvmCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = WinLvmCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_READ]           = WinLvmRead;
+    DriverObject->MajorFunction[IRP_MJ_WRITE]          = WinLvmWrite;
+    DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS]  = WinLvmFlush;
+    DriverObject->MajorFunction[IRP_MJ_SHUTDOWN]       = WinLvmShutdown;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = WinLvmDeviceControl;
+    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = WinLvmSystemControl;
+    DriverObject->MajorFunction[IRP_MJ_PNP]            = WinLvmPnp;
+    DriverObject->MajorFunction[IRP_MJ_POWER]          = WinLvmPower;
+    DriverObject->DriverExtension->AddDevice           = WinLvmAddDevice;
+    DriverObject->DriverUnload                         = WinLvmUnload;
+
+    WL_TRACE("DriverEntry");
+    return STATUS_SUCCESS;
+}
+
+void WinLvmUnload(PDRIVER_OBJECT DriverObject) {
+    UNREFERENCED_PARAMETER(DriverObject);
+    WinLvmStopAndDrainProbeWork();
+    WinLvmDeleteControlDevice();
 }
 
 NTSTATUS WinLvmCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -234,14 +258,25 @@ void WinLvmWmiDeregister(PDEVICE_OBJECT DeviceObject) {
 NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
     if (kind != WL_EXT_BUS && kind != WL_EXT_LV) {
-        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        NTSTATUS st = Irp->IoStatus.Status;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_INVALID_DEVICE_REQUEST;
+        return st;
     }
 
     WMILIB_CONTEXT *wmi = (kind == WL_EXT_BUS)
         ? &((WINLVM_BUS_EXT *)DeviceObject->DeviceExtension)->wmi
         : &((WINLVM_LV_EXT *)DeviceObject->DeviceExtension)->wmi;
+
+    if (!wmi->QueryWmiRegInfo) {
+        if (kind == WL_EXT_BUS) {
+            WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
+            IoSkipCurrentIrpStackLocation(Irp);
+            return IoCallDriver(ext->bus_pdo, Irp);
+        }
+        NTSTATUS st = Irp->IoStatus.Status;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return st;
+    }
 
     SYSCTL_IRP_DISPOSITION disposition = IrpNotWmi;
     NTSTATUS status = WmiSystemControl(wmi, DeviceObject, Irp, &disposition);
@@ -254,17 +289,15 @@ NTSTATUS WinLvmSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return status;
     case IrpForward:
     case IrpNotWmi:
+    default:
         if (kind == WL_EXT_BUS) {
             WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)DeviceObject->DeviceExtension;
             IoSkipCurrentIrpStackLocation(Irp);
             return IoCallDriver(ext->bus_pdo, Irp);
         }
+        status = Irp->IoStatus.Status;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return status;
-    default:
-        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_INVALID_DEVICE_REQUEST;
     }
 }
 
@@ -273,10 +306,9 @@ NTSTATUS WinLvmPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (kind == WL_EXT_BUS) return WinLvmBusPnp(DeviceObject, Irp);
     if (kind == WL_EXT_LV) return WinLvmChildPnp(DeviceObject, Irp);
 
-    Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
-    Irp->IoStatus.Information = 0;
+    NTSTATUS st = Irp->IoStatus.Status;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_NOT_SUPPORTED;
+    return st;
 }
 
 NTSTATUS WinLvmDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {

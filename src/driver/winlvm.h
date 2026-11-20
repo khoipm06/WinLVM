@@ -202,6 +202,8 @@ NTSTATUS WinLvmQueryWmiRegInfo(PDEVICE_OBJECT DeviceObject, PULONG RegFlags,
                                PDEVICE_OBJECT *Pdo);
 void WinLvmWmiInit(PDEVICE_OBJECT DeviceObject);
 void WinLvmWmiDeregister(PDEVICE_OBJECT DeviceObject);
+NTSTATUS WinLvmCreateControlDevice(PDRIVER_OBJECT DriverObject);
+void WinLvmDeleteControlDevice(void);
 
 #define WL_MAX_DROPPED_REFS (WL_MAX_CHILDREN * WL_VG_MAX_PVS)
 
@@ -211,9 +213,12 @@ typedef struct {
     size_t         count;
 } WINLVM_RECONCILE_DROPS;
 
+/* winlvm.c helpers */
+void WinLvmFreePvTag(WINLVM_PV_TAG *tag);
+void WinLvmFreeReconcileDrops(WINLVM_RECONCILE_DROPS *drops);
+
 /* winlvm_pnp.c */
 DRIVER_DISPATCH WinLvmBusPnp;
-void WinLvmFreePvTag(WINLVM_PV_TAG *tag);
 void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus);
 BOOLEAN WinLvmQuiesceRecordChildren(WINLVM_BUS_EXT *bus, const wl_vg_record *r,
                                     PDEVICE_OBJECT *out_pdos, size_t *out_count);
@@ -228,7 +233,6 @@ void WinLvmSwapRecordViewLocked(wl_vg_record *r,
                                 WINLVM_VIEW_BLOCK **old_view_out,
                                 WINLVM_PV_TAG **dropped_tags,
                                 size_t *dropped_tag_count);
-void WinLvmFreeReconcileDrops(WINLVM_RECONCILE_DROPS *drops);
 
 /* winlvm_child.c */
 DRIVER_DISPATCH WinLvmChildPnp;
@@ -241,16 +245,29 @@ BOOLEAN WinLvmCollectLvBackingSlotsLocked(const wl_vg_record *record, size_t lv_
                                           ULONG *max_physical_out);
 BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus, wl_vg_record *r,
                                      size_t lv_index);
+void WinLvmReactivateRecordLvsLocked(WINLVM_BUS_EXT *bus, wl_vg_record *r,
+                                     size_t *newly_out, size_t newly_cap,
+                                     size_t *newly_count_out,
+                                     PDEVICE_OBJECT *revived_out,
+                                     size_t *revived_count_out);
+void WinLvmFinishProbeActivation(WINLVM_BUS_EXT *bus, size_t slot,
+                                 const size_t *newly, size_t newly_count,
+                                 PDEVICE_OBJECT *revived, size_t revived_count,
+                                 BOOLEAN force_invalidate);
 
 /* winlvm_probe.c */
 void WinLvmProbeSubsystemInit(void);
 void WinLvmProbeSubsystemResume(void);
 void WinLvmStopAndDrainProbeWork(void);
+BOOLEAN WinLvmShouldIgnoreLinkName(const UNICODE_STRING *name);
 NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject);
 void WinLvmUnregisterDiskNotify(void);
 void WinLvmRegisterDiskNotifyDeferred(PDRIVER_OBJECT DriverObject);
 NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context);
 NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath);
+NTSTATUS WinLvmProbeDevicePathEx(const UNICODE_STRING *symLinkOrNtPath,
+                                 BOOLEAN allow_part_scan,
+                                 BOOLEAN explicit_probe);
 
 /* winlvm_control.c */
 NTSTATUS WinLvmControlDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
@@ -261,12 +278,23 @@ NTSTATUS WinLvmBusDeactivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid);
 NTSTATUS LvFanOutIo(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 /* winlvm_sector.c */
+NTSTATUS WinLvmOpenBackingDevice(const UNICODE_STRING *symLinkOrNtPath,
+                                 PDRIVER_OBJECT own_driver,
+                                 UNICODE_STRING *nt_path_out,
+                                 PFILE_OBJECT *file_out,
+                                 PDEVICE_OBJECT *pdo_out,
+                                 BOOLEAN *read_only_out);
 void WinLvmQuerySectorSize(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_file,
                            ULONG *logical_out, ULONG *physical_out);
 BOOLEAN WinLvmQueryDiskWritable(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_file);
 NTSTATUS WinLvmReadVgFromDevice(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_file,
                                 ULONG logical_sector, WINLVM_VIEW_BLOCK **block_out,
                                 char pv_uuid_out[WL_VG_UUID_LEN]);
+BOOLEAN WinLvmGetDiskPartitions(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_file,
+                                ULONG *device_num_out, ULONG *parts_out,
+                                size_t parts_cap, size_t *parts_count_out);
+NTSTATUS WinLvmProbePartitionList(ULONG device_num, const ULONG *parts,
+                                  size_t count, BOOLEAN explicit_probe);
 size_t LvMapToPieces(WINLVM_LV_EXT *ext, const lvmcore_volume_group *view,
                      uint64_t lv_byte, uint32_t len, WL_IO_PIECE *pieces, size_t cap);
 size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len);

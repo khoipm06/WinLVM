@@ -4,16 +4,6 @@
  */
 #include "winlvm.h"
 
-void WinLvmFreePvTag(WINLVM_PV_TAG *tag) {
-    if (!tag) return;
-    if (tag->disk_ifname.Buffer) {
-        ExFreePoolWithTag(tag->disk_ifname.Buffer, WINLVM_WIN_TAG);
-    }
-    if (tag->backing_pdo) ObDereferenceObject(tag->backing_pdo);
-    if (tag->backing_file) ObDereferenceObject(tag->backing_file);
-    ExFreePoolWithTag(tag, WINLVM_WIN_TAG);
-}
-
 void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus) {
     if (!bus) return;
     WINLVM_PV_TAG *tags[WL_VG_MAX * WL_VG_MAX_PVS];
@@ -43,15 +33,6 @@ void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus) {
 
     for (size_t i = 0; i < tag_count; i++) WinLvmFreePvTag(tags[i]);
     for (size_t i = 0; i < view_count; i++) ExFreePoolWithTag(views[i], WINLVM_WIN_TAG);
-}
-
-void WinLvmFreeReconcileDrops(WINLVM_RECONCILE_DROPS *drops) {
-    if (!drops) return;
-    for (size_t i = 0; i < drops->count && i < WL_MAX_DROPPED_REFS; i++) {
-        if (drops->pdos[i]) ObDereferenceObject(drops->pdos[i]);
-        if (drops->files[i]) ObDereferenceObject(drops->files[i]);
-    }
-    ExFreePoolWithTag(drops, WINLVM_WIN_TAG);
 }
 
 BOOLEAN WinLvmQuiesceRecordChildren(WINLVM_BUS_EXT *bus, const wl_vg_record *r,
@@ -294,7 +275,8 @@ static BOOLEAN WinLvmChildIsReportable(const WINLVM_LV_EXT *lext) {
 
 static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
     PDEVICE_OBJECT orphans[WL_MAX_CHILDREN];
-    size_t orphan_count = 0;
+    PDEVICE_OBJECT active[WL_MAX_CHILDREN];
+    size_t orphan_count = 0, active_count = 0, total = 0;
     KIRQL old;
 
     KeAcquireSpinLock(&bus->lock, &old);
@@ -310,60 +292,58 @@ static NTSTATUS WinLvmQueryBusRelations(WINLVM_BUS_EXT *bus, PIRP Irp) {
         bus->children[kept] = child;
         if (kept != i) bus->children[i] = NULL;
         kept++;
+        if (WinLvmChildIsReportable(lext) && active_count < WL_MAX_CHILDREN) {
+            lext->reported_to_pnp = TRUE;
+            ObReferenceObject(child);
+            active[active_count++] = child;
+        }
     }
     bus->child_count = kept;
+    total = kept;
     KeReleaseSpinLock(&bus->lock, old);
 
     for (size_t i = 0; i < orphan_count; i++) WinLvmDeleteLvPdo(orphans[i]);
 
-    PDEVICE_RELATIONS rel = NULL;
-    size_t alloc_cap = 0;
-    for (;;) {
-        KeAcquireSpinLock(&bus->lock, &old);
-        size_t active_count = 0;
-        for (size_t i = 0; i < bus->child_count; i++) {
-            WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
-            if (WinLvmChildIsReportable(lext)) active_count++;
-        }
-        if (rel && active_count <= alloc_cap) {
-            rel->Count = 0;
-            for (size_t i = 0; i < bus->child_count; i++) {
-                PDEVICE_OBJECT child = bus->children[i];
-                WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)child->DeviceExtension;
-                if (WinLvmChildIsReportable(lext)) {
-                    lext->reported_to_pnp = TRUE;
-                    rel->Objects[rel->Count++] = child;
-                    ObReferenceObject(child);
-                }
-            }
-            size_t total = bus->child_count;
-            KeReleaseSpinLock(&bus->lock, old);
-            WL_TRACE_2("QDR bus relations: %u active of %u total children",
-                       (unsigned)rel->Count, (unsigned)total);
-            break;
-        }
-        KeReleaseSpinLock(&bus->lock, old);
-
-        if (rel) { ExFreePoolWithTag(rel, WINLVM_WIN_TAG); rel = NULL; }
-        alloc_cap = active_count;
-        size_t bytes = sizeof(DEVICE_RELATIONS) + alloc_cap * sizeof(PDEVICE_OBJECT);
-        rel = (PDEVICE_RELATIONS)ExAllocatePoolZero(NonPagedPool, bytes, WINLVM_WIN_TAG);
-        if (!rel) return STATUS_INSUFFICIENT_RESOURCES;
+    PDEVICE_RELATIONS existing = (PDEVICE_RELATIONS)Irp->IoStatus.Information;
+    size_t existing_count = existing ? (size_t)existing->Count : 0;
+    if (existing_count > ((size_t)MAXULONG / sizeof(PDEVICE_OBJECT)) - active_count - 1) {
+        for (size_t i = 0; i < active_count; i++) ObDereferenceObject(active[i]);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    if (Irp->IoStatus.Information) ExFreePool((PVOID)Irp->IoStatus.Information);
+    size_t new_count = existing_count + active_count;
+    size_t elem_count = (new_count > 0) ? new_count : 1;
+    size_t bytes = FIELD_OFFSET(DEVICE_RELATIONS, Objects) +
+                   elem_count * sizeof(PDEVICE_OBJECT);
+    PDEVICE_RELATIONS rel = (PDEVICE_RELATIONS)ExAllocatePoolZero(
+        PagedPool, bytes, WINLVM_WIN_TAG);
+    if (!rel) {
+        for (size_t i = 0; i < active_count; i++) ObDereferenceObject(active[i]);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    rel->Count = (ULONG)new_count;
+    for (size_t i = 0; i < existing_count; i++) {
+        rel->Objects[i] = existing->Objects[i];
+    }
+    for (size_t i = 0; i < active_count; i++) {
+        rel->Objects[existing_count + i] = active[i];
+    }
+    if (existing) ExFreePool(existing);
+
     Irp->IoStatus.Information = (ULONG_PTR)rel;
     Irp->IoStatus.Status = STATUS_SUCCESS;
+    WL_TRACE_2("QDR bus relations: %u active of %u total children",
+               (unsigned)active_count, (unsigned)total);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     WL_EXT_KIND kind = *(WL_EXT_KIND *)DeviceObject->DeviceExtension;
     if (kind != WL_EXT_BUS) {
-        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
-        Irp->IoStatus.Information = 0;
+        NTSTATUS st = Irp->IoStatus.Status;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_NOT_SUPPORTED;
+        return st;
     }
 
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
@@ -373,9 +353,11 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     case IRP_MN_QUERY_DEVICE_RELATIONS:
         if (irpSp->Parameters.QueryDeviceRelations.Type == BusRelations) {
             NTSTATUS st = WinLvmQueryBusRelations(ext, Irp);
-            Irp->IoStatus.Status = st;
-            IoCompleteRequest(Irp, IO_NO_INCREMENT);
-            return st;
+            if (!NT_SUCCESS(st)) {
+                Irp->IoStatus.Status = st;
+                IoCompleteRequest(Irp, IO_NO_INCREMENT);
+                return st;
+            }
         }
         break;
 
@@ -398,6 +380,15 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return st;
     }
+
+    case IRP_MN_QUERY_STOP_DEVICE:
+    case IRP_MN_CANCEL_STOP_DEVICE:
+    case IRP_MN_STOP_DEVICE:
+    case IRP_MN_QUERY_REMOVE_DEVICE:
+    case IRP_MN_CANCEL_REMOVE_DEVICE:
+    case IRP_MN_SURPRISE_REMOVAL:
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
 
     case IRP_MN_REMOVE_DEVICE: {
         WinLvmStopAndDrainProbeWork();
@@ -437,13 +428,15 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         for (size_t i = 0; i < tag_count; i++) WinLvmFreePvTag(tags[i]);
         for (size_t i = 0; i < view_count; i++) ExFreePoolWithTag(views[i], WINLVM_WIN_TAG);
 
+        WinLvmDeleteControlDevice();
         WinLvmWmiDeregister(DeviceObject);
         PDEVICE_OBJECT lower = ext->bus_pdo;
-        IoDetachDevice(lower);
-        IoDeleteDevice(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         IoSkipCurrentIrpStackLocation(Irp);
-        return IoCallDriver(lower, Irp);
+        NTSTATUS st = IoCallDriver(lower, Irp);
+        IoDetachDevice(lower);
+        IoDeleteDevice(DeviceObject);
+        return st;
     }
 
     default:
@@ -460,11 +453,18 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
-    PDEVICE_OBJECT fdo = NULL;
-    NTSTATUS status = IoCreateDevice(DriverObject, sizeof(WINLVM_BUS_EXT),
-                                     NULL, FILE_DEVICE_BUS_EXTENDER,
-                                     FILE_DEVICE_SECURE_OPEN, FALSE, &fdo);
+    WinLvmProbeSubsystemResume();
+    NTSTATUS status = WinLvmCreateControlDevice(DriverObject);
     if (!NT_SUCCESS(status)) return status;
+
+    PDEVICE_OBJECT fdo = NULL;
+    status = IoCreateDevice(DriverObject, sizeof(WINLVM_BUS_EXT),
+                            NULL, FILE_DEVICE_BUS_EXTENDER,
+                            FILE_DEVICE_SECURE_OPEN, FALSE, &fdo);
+    if (!NT_SUCCESS(status)) {
+        WinLvmDeleteControlDevice();
+        return status;
+    }
 
     WINLVM_BUS_EXT *ext = (WINLVM_BUS_EXT *)fdo->DeviceExtension;
     RtlZeroMemory(ext, sizeof(*ext));
@@ -477,6 +477,7 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
     ext->bus_pdo = IoAttachDeviceToDeviceStack(fdo, PhysicalDeviceObject);
     if (!ext->bus_pdo) {
         IoDeleteDevice(fdo);
+        WinLvmDeleteControlDevice();
         return STATUS_NO_SUCH_DEVICE;
     }
 

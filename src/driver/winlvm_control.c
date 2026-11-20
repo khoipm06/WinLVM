@@ -395,7 +395,7 @@ static NTSTATUS WinLvmHandleProbeDevice(const WINLVM_PROBE_DEVICE_REQUEST *req, 
     path.Buffer = (PWCH)req->device_path;
     path.Length = (USHORT)(wlen * sizeof(WCHAR));
     path.MaximumLength = (USHORT)((wlen + 1) * sizeof(WCHAR));
-    return WinLvmProbeDevicePath(&path);
+    return WinLvmProbeDevicePathEx(&path, TRUE, TRUE);
 }
 
 NTSTATUS WinLvmControlDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {

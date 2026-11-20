@@ -94,7 +94,7 @@ static BOOLEAN WinLvmUnicodeContainsI(const UNICODE_STRING *haystack, const WCHA
     return FALSE;
 }
 
-static BOOLEAN WinLvmShouldIgnoreLinkName(const UNICODE_STRING *name) {
+BOOLEAN WinLvmShouldIgnoreLinkName(const UNICODE_STRING *name) {
     return WinLvmUnicodeContainsI(name, L"winlvm") ||
            WinLvmUnicodeContainsI(name, L"cdrom") ||
            WinLvmUnicodeContainsI(name, L"volumesnapshot");
@@ -260,20 +260,42 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context) {
         WINLVM_BUS_EXT *bus = g_bus_ext;
         if (!bus) return STATUS_SUCCESS;
 
-        WINLVM_PV_TAG *removed_tag = NULL;
-        BOOLEAN found = FALSE;
+        USHORT len = change->SymbolicLinkName->Length;
+        if ((len % sizeof(WCHAR)) != 0 || len > (USHORT)(0xFFFEu - sizeof(WCHAR))) {
+            return STATUS_SUCCESS;
+        }
+        /* Copy SymbolicLinkName out of PagedPool at PASSIVE_LEVEL before acquiring bus->lock. */
+        PWCHAR sym_buf = (PWCHAR)ExAllocatePoolZero(
+            NonPagedPool, (size_t)len + sizeof(WCHAR), WINLVM_WIN_TAG);
+        if (!sym_buf) return STATUS_SUCCESS;
+        RtlCopyMemory(sym_buf, change->SymbolicLinkName->Buffer, len);
+        if (len >= 4 * sizeof(WCHAR) && sym_buf[0] == L'\\' &&
+            (sym_buf[1] == L'\\' || sym_buf[1] == L'?') &&
+            (sym_buf[2] == L'.' || sym_buf[2] == L'?') && sym_buf[3] == L'\\') {
+            sym_buf[1] = L'?';
+            sym_buf[2] = L'?';
+        }
+        UNICODE_STRING np_link;
+        np_link.Length = len;
+        np_link.MaximumLength = (USHORT)(len + sizeof(WCHAR));
+        np_link.Buffer = sym_buf;
+
+        WINLVM_PV_TAG *removed_tags[WL_VG_MAX * WL_VG_MAX_PVS];
+        size_t removed_count = 0;
         KIRQL old;
         KeAcquireSpinLock(&bus->lock, &old);
-        for (size_t i = 0; i < WL_VG_MAX && !found; i++) {
+        for (size_t i = 0; i < WL_VG_MAX; i++) {
             wl_vg_record *r = &bus->vg_records[i];
             if (!r->vg_uuid[0]) continue;
             for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
                 WINLVM_PV_TAG *tag = (WINLVM_PV_TAG *)r->pv_tag[p];
                 if (tag && tag->disk_ifname.Buffer &&
-                    WinLvmUnicodeEqualI(&tag->disk_ifname, change->SymbolicLinkName)) {
+                    WinLvmUnicodeEqualI(&tag->disk_ifname, &np_link)) {
                     char pv_uuid[WL_VG_UUID_LEN];
                     RtlCopyMemory(pv_uuid, r->pv_uuid[p], WL_VG_UUID_LEN);
-                    removed_tag = tag;
+                    if (removed_count < WL_VG_MAX * WL_VG_MAX_PVS) {
+                        removed_tags[removed_count++] = tag;
+                    }
                     r->pv_tag[p] = NULL;
                     wl_vg_pv_removed(bus->vg_records, WL_VG_MAX, pv_uuid);
 
@@ -283,15 +305,14 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context) {
                             lext->unavailable = TRUE;
                         }
                     }
-                    found = TRUE;
-                    break;
                 }
             }
         }
         KeReleaseSpinLock(&bus->lock, old);
 
-        if (removed_tag) WinLvmFreePvTag(removed_tag);
-        if (found) IoInvalidateDeviceRelations(bus->pdo, BusRelations);
+        ExFreePoolWithTag(sym_buf, WINLVM_WIN_TAG);
+        for (size_t k = 0; k < removed_count; k++) WinLvmFreePvTag(removed_tags[k]);
+        if (removed_count > 0) IoInvalidateDeviceRelations(bus->pdo, BusRelations);
         return STATUS_SUCCESS;
     }
 
@@ -301,58 +322,20 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context) {
     return WinLvmQueueProbeForInterface(change->SymbolicLinkName);
 }
 
-NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
+NTSTATUS WinLvmProbeDevicePathEx(const UNICODE_STRING *symLinkOrNtPath,
+                                 BOOLEAN allow_part_scan,
+                                 BOOLEAN explicit_probe) {
     WINLVM_BUS_EXT *bus = g_bus_ext;
     if (!bus) return STATUS_DEVICE_NOT_READY;
-    if (!symLinkOrNtPath || !symLinkOrNtPath->Buffer ||
-        symLinkOrNtPath->Length < sizeof(WCHAR) ||
-        (symLinkOrNtPath->Length % sizeof(WCHAR)) != 0 ||
-        symLinkOrNtPath->Length > (USHORT)(0xFFFEu - sizeof(WCHAR))) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    USHORT len = symLinkOrNtPath->Length;
-    PWCHAR path_buf = (PWCHAR)ExAllocatePoolZero(
-        NonPagedPool, (size_t)len + sizeof(WCHAR), WINLVM_WIN_TAG);
-    if (!path_buf) return STATUS_INSUFFICIENT_RESOURCES;
-    RtlCopyMemory(path_buf, symLinkOrNtPath->Buffer, len);
-    if (len >= 4 * sizeof(WCHAR) &&
-        path_buf[0] == L'\\' && path_buf[1] == L'\\' &&
-        path_buf[2] == L'.' && path_buf[3] == L'\\') {
-        path_buf[1] = L'?';
-        path_buf[2] = L'?';
-    }
 
     UNICODE_STRING nt_path;
-    nt_path.Buffer = path_buf;
-    nt_path.Length = len;
-    nt_path.MaximumLength = (USHORT)(len + sizeof(WCHAR));
-    if (WinLvmShouldIgnoreLinkName(&nt_path)) {
-        ExFreePoolWithTag(path_buf, WINLVM_WIN_TAG);
-        return STATUS_INVALID_DEVICE_REQUEST;
-    }
-
     PFILE_OBJECT disk_file = NULL;
     PDEVICE_OBJECT disk_pdo = NULL;
     BOOLEAN pv_read_only = FALSE;
-    NTSTATUS status = IoGetDeviceObjectPointer(
-        &nt_path, FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
-        &disk_file, &disk_pdo);
-    if (status == STATUS_ACCESS_DENIED || status == STATUS_MEDIA_WRITE_PROTECTED) {
-        status = IoGetDeviceObjectPointer(
-            &nt_path, FILE_READ_DATA | FILE_READ_ATTRIBUTES,
-            &disk_file, &disk_pdo);
-        if (NT_SUCCESS(status)) pv_read_only = TRUE;
-    }
-    if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(path_buf, WINLVM_WIN_TAG);
-        return status;
-    }
-    if (disk_pdo->DriverObject == bus->fdo->DriverObject) {
-        ObDereferenceObject(disk_file);
-        ExFreePoolWithTag(path_buf, WINLVM_WIN_TAG);
-        return STATUS_INVALID_DEVICE_REQUEST;
-    }
+    NTSTATUS status = WinLvmOpenBackingDevice(
+        symLinkOrNtPath, bus->fdo->DriverObject,
+        &nt_path, &disk_file, &disk_pdo, &pv_read_only);
+    if (!NT_SUCCESS(status)) return status;
 
     if (!pv_read_only && !WinLvmQueryDiskWritable(disk_pdo, disk_file)) {
         pv_read_only = TRUE;
@@ -364,8 +347,15 @@ NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
     char pv_uuid[WL_VG_UUID_LEN];
     status = WinLvmReadVgFromDevice(disk_pdo, disk_file, logical_sector, &block, pv_uuid);
     if (!NT_SUCCESS(status)) {
+        ULONG dev_num = 0, parts[32];
+        size_t part_count = 0;
+        BOOLEAN has_parts = (allow_part_scan && status == STATUS_NOT_FOUND &&
+                             WinLvmGetDiskPartitions(disk_pdo, disk_file, &dev_num,
+                                                     parts, 32, &part_count));
+        ObDereferenceObject(disk_pdo);
         ObDereferenceObject(disk_file);
-        ExFreePoolWithTag(path_buf, WINLVM_WIN_TAG);
+        ExFreePoolWithTag(nt_path.Buffer, WINLVM_WIN_TAG);
+        if (has_parts) return WinLvmProbePartitionList(dev_num, parts, part_count, explicit_probe);
         return status;
     }
 
@@ -373,19 +363,18 @@ NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
         NonPagedPool, sizeof(WINLVM_PV_TAG), WINLVM_WIN_TAG);
     if (!tag) {
         ExFreePoolWithTag(block, WINLVM_WIN_TAG);
+        ObDereferenceObject(disk_pdo);
         ObDereferenceObject(disk_file);
-        ExFreePoolWithTag(path_buf, WINLVM_WIN_TAG);
+        ExFreePoolWithTag(nt_path.Buffer, WINLVM_WIN_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    /* Ownership of +1 disk_pdo (IoGetAttachedDeviceReference) and +1 disk_file transfers to tag. */
     tag->backing_pdo = disk_pdo;
     tag->backing_file = disk_file;
     tag->disk_ifname = nt_path;
     tag->logical_sector = logical_sector;
     tag->physical_sector = physical_sector;
     tag->read_only = pv_read_only;
-    ObReferenceObject(disk_pdo);
-    ObReferenceObject(disk_file);
-    ObDereferenceObject(disk_file);
 
     PDEVICE_OBJECT quiesced[WL_MAX_CHILDREN];
     size_t quiesced_count = 0;
@@ -414,6 +403,8 @@ NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
     WINLVM_PV_TAG *tags_to_free[WL_VG_MAX_PVS + 1];
     size_t free_tag_count = 0;
     WINLVM_VIEW_BLOCK *old_view = NULL;
+    PDEVICE_OBJECT revived[WL_MAX_CHILDREN];
+    size_t revived_count = 0;
     size_t slot = 0;
     size_t newly[WL_VG_MAX_LVS];
     size_t newly_count = 0;
@@ -457,6 +448,23 @@ NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
         }
         if (!tag_kept) tags_to_free[free_tag_count++] = tag;
         for (size_t i = 0; i < newly_count; i++) wl_vg_lv_set_activated(r, newly[i], 1);
+    } else if (res == WL_ARR_DUPLICATE && explicit_probe && existed_idx >= 0) {
+        slot = (size_t)existed_idx;
+        wl_vg_record *r = &bus->vg_records[slot];
+        BOOLEAN swapped = FALSE;
+        if (r->refs == 0) {
+            for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
+                if (RtlEqualMemory(r->pv_uuid[p], pv_uuid, 32)) {
+                    if (r->pv_tag[p]) tags_to_free[free_tag_count++] = (WINLVM_PV_TAG *)r->pv_tag[p];
+                    r->pv_tag[p] = tag;
+                    swapped = TRUE;
+                    break;
+                }
+            }
+        }
+        if (!swapped) tags_to_free[free_tag_count++] = tag;
+        WinLvmReactivateRecordLvsLocked(bus, r, newly, WL_VG_MAX_LVS, &newly_count,
+                                        revived, &revived_count);
     } else {
         tags_to_free[free_tag_count++] = tag;
     }
@@ -466,19 +474,15 @@ NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
     if (drops) WinLvmFreeReconcileDrops(drops);
     for (size_t i = 0; i < free_tag_count; i++) WinLvmFreePvTag(tags_to_free[i]);
     if (quiesced_count > 0) WinLvmResumeRecordChildren(quiesced, quiesced_count);
-    for (size_t i = 0; i < newly_count; i++) {
-        wl_vg_record *r = &bus->vg_records[slot];
-        if (!WinLvmProbeWorkerCreateLvPdo(bus, r, newly[i])) {
-            KeAcquireSpinLock(&bus->lock, &old);
-            wl_vg_lv_set_activated(r, newly[i], 0);
-            KeReleaseSpinLock(&bus->lock, old);
-        }
-    }
-    if (newly_count > 0 || res == WL_ARR_RECONCILED) {
-        IoInvalidateDeviceRelations(bus->pdo, BusRelations);
-    }
+    WinLvmFinishProbeActivation(bus, slot, newly, newly_count,
+                                revived, revived_count,
+                                (BOOLEAN)(res == WL_ARR_RECONCILED));
     if (block) ExFreePoolWithTag(block, WINLVM_WIN_TAG);
     return (res == WL_ARR_REJECTED) ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+}
+
+NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
+    return WinLvmProbeDevicePathEx(symLinkOrNtPath, TRUE, FALSE);
 }
 
 static void WinLvmProbeWorker(PVOID context) {
