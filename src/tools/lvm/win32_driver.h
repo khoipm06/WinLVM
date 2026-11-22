@@ -55,7 +55,7 @@ inline std::wstring to_lower_w(std::wstring_view s) {
 inline std::wstring ascii_to_wide(std::string_view s) {
   std::wstring out;
   out.reserve(s.size());
-  for (unsigned char c : s) out.push_back(static_cast<wchar_t>(c));
+  for (char c : s) out.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
   return out;
 }
 
@@ -88,6 +88,24 @@ inline bool contains_ci_w(std::wstring_view s, std::wstring_view needle) {
   const std::wstring ls = to_lower_w(s);
   const std::wstring ln = to_lower_w(needle);
   return ls.find(ln) != std::wstring::npos;
+}
+
+inline bool is_harddisk_partition_dos_name(std::wstring_view name) {
+  if (!starts_with_ci_w(name, L"Harddisk")) return false;
+  const std::wstring_view rest = name.substr(8);
+  std::size_t digits_end = 0;
+  while (digits_end < rest.size() && rest[digits_end] >= L'0' && rest[digits_end] <= L'9') {
+    ++digits_end;
+  }
+  if (digits_end == 0) return false;
+  const std::wstring_view after_disk = rest.substr(digits_end);
+  if (!starts_with_ci_w(after_disk, L"Partition")) return false;
+  const std::wstring_view part_digits = after_disk.substr(9);
+  if (!is_digits_w(part_digits)) return false;
+  for (wchar_t c : part_digits) {
+    if (c != L'0') return true;
+  }
+  return false;
 }
 
 inline std::wstring query_dos_target(const std::wstring& dos_name) {
@@ -179,6 +197,8 @@ inline std::vector<Win32CandidateDevice> discover_win32_candidate_devices() {
                  detail::is_digits_w(name.substr(13))) {
         match = true;
       } else if (detail::starts_with_ci_w(name, L"Volume{") && name.back() == L'}') {
+        match = true;
+      } else if (detail::is_harddisk_partition_dos_name(name)) {
         match = true;
       }
       if (match) {
@@ -334,12 +354,15 @@ inline bool driver_quiesce_vg(const std::string& vg_name, bool quiesce) {
 
 inline std::vector<std::string> discover_win32_pv_paths_for_vg(std::string_view vg_name) {
   std::vector<std::string> paths;
+  std::set<std::string> seen_pv_uuids;
   for (const auto& cand : discover_win32_candidate_devices()) {
     std::string err;
     auto src = open_storage_source(cand.open_path, false, err);
     if (!src) continue;
     auto label = read_pv_label(*src, err);
     if (!label) continue;
+    const std::string raw_pv = normalize_uuid_raw32(label->pv_uuid);
+    if (!seen_pv_uuids.insert(raw_pv).second) continue;
     if (vg_name.empty()) {
       paths.push_back(cand.open_path);
       continue;

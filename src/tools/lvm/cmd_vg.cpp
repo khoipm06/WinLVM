@@ -351,13 +351,19 @@ int cmd_vgscan(const std::vector<std::string>& args) {
     for (const auto& p : pos) candidates.push_back({p, resolve_win32_probe_path(p)});
   }
 
+  driver_refresh();
+
   std::set<std::string> found_vgs;
+  std::set<std::string> seen_pv_uuids;
   for (const auto& cand : candidates) {
     std::string err;
     auto src = open_storage_source(cand.open_path, false, err);
     if (!src) continue;
     auto label = read_pv_label(*src, err);
     if (!label) continue;
+    if (pos.empty() && !seen_pv_uuids.insert(normalize_uuid_raw32(label->pv_uuid)).second) {
+      continue;
+    }
 
     driver_probe_device(cand.probe_path);
 
@@ -368,7 +374,6 @@ int cmd_vgscan(const std::vector<std::string>& args) {
       std::cout << "  Found volume group \"" << vg->name << "\" using metadata type lvm2\n";
     }
   }
-  driver_refresh();
   return 0;
 #else
   if (pos.empty()) {

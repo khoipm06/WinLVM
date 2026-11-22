@@ -171,6 +171,7 @@ int cmd_pvs(const std::vector<std::string>& args) {
     std::cout << "  PV         VG         Fmt  Attr PSize   PFree   PV UUID\n";
   }
 
+  std::set<std::string> seen_pv_uuids;
   for (const auto& dev : pos) {
     std::string err;
     auto storage = open_storage_source(dev, false, err);
@@ -182,6 +183,10 @@ int cmd_pvs(const std::vector<std::string>& args) {
     auto label = read_pv_label(*storage, err);
     if (!label) {
       if (!auto_scan) std::cerr << "error: " << dev << ": " << err << "\n";
+      continue;
+    }
+    const std::string raw_pv_uuid = normalize_uuid_raw32(label->pv_uuid);
+    if (auto_scan && !seen_pv_uuids.insert(raw_pv_uuid).second) {
       continue;
     }
 
@@ -237,6 +242,7 @@ int cmd_pvdisplay(const std::vector<std::string>& args) {
   }
 #endif
 
+  std::set<std::string> seen_pv_uuids;
   for (const auto& dev : pos) {
     std::string err;
     auto storage = open_storage_source(dev, false, err);
@@ -248,6 +254,10 @@ int cmd_pvdisplay(const std::vector<std::string>& args) {
     auto label = read_pv_label(*storage, err);
     if (!label) {
       if (!auto_scan) std::cerr << "error: " << dev << ": " << err << "\n";
+      continue;
+    }
+    const std::string raw_pv_uuid = normalize_uuid_raw32(label->pv_uuid);
+    if (auto_scan && !seen_pv_uuids.insert(raw_pv_uuid).second) {
       continue;
     }
 
@@ -299,8 +309,11 @@ int cmd_pvscan(const std::vector<std::string>& args) {
     }
   }
 
+  driver_refresh();
+
   std::uint64_t total_pvs = 0;
   std::uint64_t total_bytes = 0;
+  std::set<std::string> seen_pv_uuids;
   for (const auto& cand : candidates) {
     std::string err;
     auto storage = open_storage_source(cand.open_path, false, err);
@@ -308,6 +321,9 @@ int cmd_pvscan(const std::vector<std::string>& args) {
 
     auto label = read_pv_label(*storage, err);
     if (!label) continue;
+    if (pos.empty() && !seen_pv_uuids.insert(normalize_uuid_raw32(label->pv_uuid)).second) {
+      continue;
+    }
 
     // Attach this physical/WinLUKS block device into winlvm.sys if online.
     driver_probe_device(cand.probe_path);
@@ -323,7 +339,6 @@ int cmd_pvscan(const std::vector<std::string>& args) {
     std::cout << "  PV " << cand.open_path << "   " << vg_info << " ["
               << format_size_human(label->device_size) << "]\n";
   }
-  driver_refresh();
   std::cout << "  Total: " << total_pvs << " [" << format_size_human(total_bytes) << "]\n";
   return 0;
 #else
