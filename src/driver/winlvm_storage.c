@@ -11,18 +11,19 @@
 #include "host_wdm_types.h"
 #endif
 
-#if !defined(_KERNEL_MODE) && !defined(HOST_WDM_TYPES_H)
 #ifndef StorageDeviceSeekPenaltyProperty
 #define StorageDeviceSeekPenaltyProperty 7
 #endif
 
 #ifndef _DEVICE_SEEK_PENALTY_DESCRIPTOR_DEFINED
+#if !defined(_KERNEL_MODE) && !defined(HOST_WDM_TYPES_H)
 typedef struct _DEVICE_SEEK_PENALTY_DESCRIPTOR {
     ULONG   Version;
     ULONG   Size;
     BOOLEAN IncursSeekPenalty;
 } DEVICE_SEEK_PENALTY_DESCRIPTOR, *PDEVICE_SEEK_PENALTY_DESCRIPTOR;
 #define _DEVICE_SEEK_PENALTY_DESCRIPTOR_DEFINED
+#endif
 #endif
 
 #ifndef IOCTL_VOLUME_GET_GPT_ATTRIBUTES
@@ -40,7 +41,6 @@ typedef struct _VOLUME_GET_GPT_ATTRIBUTES_INFORMATION {
 #endif
 #ifndef IOCTL_VOLUME_POST_ONLINE
 #define IOCTL_VOLUME_POST_ONLINE CTL_CODE(IOCTL_VOLUME_BASE, 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#endif
 #endif
 
 /* 1 MiB transfer cap guarantees 4 KiB striped transfers stay within WL_MAX_READ_PIECES (256). */

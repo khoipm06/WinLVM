@@ -104,6 +104,7 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             PDEVICE_OBJECT backing = ext->backing_pdo[backing_idx];
             PFILE_OBJECT bfile = ext->backing_file[backing_idx];
             if (backing && bfile && logical &&
+                Irp->CurrentLocation > backing->StackSize &&
                 (pv_byte & mask) == 0 && (piece_len & mask) == 0) {
                 IoCopyCurrentIrpStackLocationToNext(Irp);
                 PIO_STACK_LOCATION nextSp = IoGetNextIrpStackLocation(Irp);
@@ -243,6 +244,17 @@ typedef struct {
     PIRP              sub_irps[WL_VG_MAX_PVS];
 } WL_STORAGE_FLUSH_CTX;
 
+static void WinLvmCompleteFlushParent(WL_STORAGE_FLUSH_CTX *fctx) {
+    PIRP parent = fctx->parent;
+    WL_IO_GATE *gate = fctx->gate;
+    NTSTATUS final = (NTSTATUS)fctx->status;
+    ExFreePoolWithTag(fctx, WINLVM_WIN_TAG);
+    parent->IoStatus.Status = final;
+    parent->IoStatus.Information = 0;
+    IoCompleteRequest(parent, IO_NO_INCREMENT);
+    WinLvmIoGateLeave(gate);
+}
+
 static NTSTATUS WinLvmStorageFlushCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
     UNREFERENCED_PARAMETER(DeviceObject);
     WL_STORAGE_FLUSH_CTX *fctx = (WL_STORAGE_FLUSH_CTX *)Context;
@@ -253,13 +265,7 @@ static NTSTATUS WinLvmStorageFlushCompletion(PDEVICE_OBJECT DeviceObject, PIRP I
     }
     IoFreeIrp(Irp);
     if (InterlockedDecrement(&fctx->remaining) == 0) {
-        PIRP parent = fctx->parent;
-        WL_IO_GATE *gate = fctx->gate;
-        parent->IoStatus.Status = (NTSTATUS)fctx->status;
-        parent->IoStatus.Information = 0;
-        ExFreePoolWithTag(fctx, WINLVM_WIN_TAG);
-        IoCompleteRequest(parent, IO_NO_INCREMENT);
-        WinLvmIoGateLeave(gate);
+        WinLvmCompleteFlushParent(fctx);
     }
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
@@ -285,7 +291,8 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return STATUS_DEVICE_NOT_CONNECTED;
     }
 
-    if (ext->backing_count > 1) {
+    if (ext->backing_count > 1 ||
+        (ext->backing_pdo[0] && Irp->CurrentLocation <= ext->backing_pdo[0]->StackSize)) {
         WL_STORAGE_FLUSH_CTX *fctx = (WL_STORAGE_FLUSH_CTX *)ExAllocatePoolZero(
             NonPagedPool, sizeof(WL_STORAGE_FLUSH_CTX), WINLVM_WIN_TAG);
         if (!fctx) {
@@ -330,10 +337,15 @@ NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             return fail;
         }
 
+        /* Hold a +1 dispatch reference so fctx and ext->io_gate remain valid
+         * across the entire submission loop even on synchronous completions. */
         IoMarkIrpPending(Irp);
-        InterlockedExchange(&fctx->remaining, (LONG)built);
+        InterlockedExchange(&fctx->remaining, (LONG)built + 1);
         for (size_t k = 0; k < built; k++) {
-            IoCallDriver(ext->backing_pdo[k], fctx->sub_irps[k]);
+            (void)IoCallDriver(ext->backing_pdo[k], fctx->sub_irps[k]);
+        }
+        if (InterlockedDecrement(&fctx->remaining) == 0) {
+            WinLvmCompleteFlushParent(fctx);
         }
         return STATUS_PENDING;
     }

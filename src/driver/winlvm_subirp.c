@@ -4,6 +4,18 @@
  */
 #include "winlvm.h"
 
+static void WinLvmCompleteFanOutParent(WL_IO_CTX *wctx) {
+    PIRP parent = wctx->parent;
+    WL_IO_GATE *gate = wctx->gate;
+    NTSTATUS final = (NTSTATUS)wctx->status;
+    ULONG_PTR info = NT_SUCCESS(final) ? (ULONG_PTR)wctx->bytes_copied : 0;
+    ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
+    parent->IoStatus.Status = final;
+    parent->IoStatus.Information = info;
+    IoCompleteRequest(parent, IO_NO_INCREMENT);
+    WinLvmIoGateLeave(gate);
+}
+
 static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
                                        PVOID Context) {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -45,19 +57,17 @@ static NTSTATUS WinLvmFanOutCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         }
     }
 
-    if (Irp->MdlAddress) IoFreeMdl(Irp->MdlAddress);
+    PMDL mdl = Irp->MdlAddress;
+    Irp->MdlAddress = NULL;
+    if (mdl) IoFreeMdl(mdl);
     IoFreeIrp(Irp);
-    if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
+    if (pc->bounce_buf) {
+        ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
+        pc->bounce_buf = NULL;
+    }
 
     if (InterlockedDecrement(&wctx->remaining) == 0) {
-        PIRP parent = wctx->parent;
-        WL_IO_GATE *gate = wctx->gate;
-        NTSTATUS final = (NTSTATUS)wctx->status;
-        parent->IoStatus.Status = final;
-        parent->IoStatus.Information = NT_SUCCESS(final) ? (ULONG_PTR)wctx->bytes_copied : 0;
-        ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
-        IoCompleteRequest(parent, IO_NO_INCREMENT);
-        WinLvmIoGateLeave(gate);
+        WinLvmCompleteFanOutParent(wctx);
     }
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
@@ -202,11 +212,13 @@ NTSTATUS LvFanOutIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (fail != STATUS_SUCCESS) {
         for (size_t i = 0; i < built; i++) {
             WL_IO_PIECE *pc = &wctx->pieces[i];
-            if (pc->sub_irp && pc->sub_irp->MdlAddress) {
-                IoFreeMdl(pc->sub_irp->MdlAddress);
+            if (pc->sub_irp) {
+                PMDL mdl = pc->sub_irp->MdlAddress;
+                pc->sub_irp->MdlAddress = NULL;
+                if (mdl) IoFreeMdl(mdl);
+                IoFreeIrp(pc->sub_irp);
             }
             if (pc->bounce_buf) ExFreePoolWithTag(pc->bounce_buf, WINLVM_WIN_TAG);
-            if (pc->sub_irp) IoFreeIrp(pc->sub_irp);
         }
         ExFreePoolWithTag(wctx, WINLVM_WIN_TAG);
         WinLvmIoGateLeave(&ext->io_gate);
@@ -216,11 +228,16 @@ NTSTATUS LvFanOutIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return fail;
     }
 
+    /* Hold a +1 dispatch reference so wctx and ext->io_gate stay pinned
+     * throughout the submission loop even if every sub-IRP completes inline. */
     IoMarkIrpPending(Irp);
-    InterlockedExchange(&wctx->remaining, (LONG)built);
+    InterlockedExchange(&wctx->remaining, (LONG)built + 1);
     for (size_t i = 0; i < built; i++) {
         WL_IO_PIECE *pc = &wctx->pieces[i];
-        IoCallDriver(ext->backing_pdo[pc->backing_idx], pc->sub_irp);
+        (void)IoCallDriver(ext->backing_pdo[pc->backing_idx], pc->sub_irp);
+    }
+    if (InterlockedDecrement(&wctx->remaining) == 0) {
+        WinLvmCompleteFanOutParent(wctx);
     }
     return STATUS_PENDING;
 }

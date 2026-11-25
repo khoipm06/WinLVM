@@ -214,8 +214,12 @@ void WinLvmIoGateRemove(WL_IO_GATE *gate) {
         IoCompleteRequest(irp, IO_NO_INCREMENT);
     }
 
-    /* Drain all in-flight completions before the caller deletes the PDO. */
+    /* Drain all in-flight completions before the caller deletes the PDO.
+     * Re-acquiring gate->lock after Wait acts as a barrier guaranteeing any
+     * WinLvmIoGateLeave that signaled gate->drained has released gate->lock. */
     if (wait_drained && KeGetCurrentIrql() == PASSIVE_LEVEL) {
         KeWaitForSingleObject(&gate->drained, Executive, KernelMode, FALSE, NULL);
+        KeAcquireSpinLock(&gate->lock, &irql);
+        KeReleaseSpinLock(&gate->lock, irql);
     }
 }
