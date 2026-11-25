@@ -157,6 +157,11 @@ BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus,
     ext->physical_sector = max_physical;
     ext->byte_size = byte_size;
     ext->read_only = read_only;
+    ext->drive_letter = 0;
+    ext->system_power_state = PowerSystemWorking;
+    ext->device_power_state = PowerDeviceD0;
+    KeInitializeMutex(&ext->ifname_mutex, 0);
+    ext->ifname_torn_down = FALSE;
 
     lv_pdo->SectorSize = (USHORT)ext->logical_sector;
     lv_pdo->StackSize = (UCHAR)(max_stack + 1);
@@ -203,15 +208,57 @@ static void WinLvmUnlinkLvPdoLocked(WINLVM_BUS_EXT *bus, PDEVICE_OBJECT LvPdo) {
     }
 }
 
-static void WinLvmTeardownLvPdoResources(PDEVICE_OBJECT LvPdo) {
+void WinLvmLvRegisterAndEnableInterface(PDEVICE_OBJECT LvPdo) {
+    if (!LvPdo || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
     WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)LvPdo->DeviceExtension;
+    KeWaitForSingleObject(&lvext->ifname_mutex, Executive, KernelMode, FALSE, NULL);
+    if (!lvext->ifname_torn_down) {
+        if (!lvext->ifname.Buffer) {
+            UNICODE_STRING ifname;
+            NTSTATUS ifst = IoRegisterDeviceInterface(
+                LvPdo, &GUID_DEVINTERFACE_VOLUME, NULL, &ifname);
+            WL_TRACE_1("child start: reg ifname 0x%08x", (unsigned)ifst);
+            if (NT_SUCCESS(ifst)) lvext->ifname = ifname;
+        }
+        if (lvext->ifname.Buffer) {
+            NTSTATUS set_st = IoSetDeviceInterfaceState(&lvext->ifname, TRUE);
+            WL_TRACE_1("child start: set ifstate 0x%08x", (unsigned)set_st);
+        }
+    }
+    KeReleaseMutex(&lvext->ifname_mutex, FALSE);
+}
 
-    WinLvmWmiDeregister(LvPdo);
+void WinLvmLvSetInterfaceEnabled(PDEVICE_OBJECT LvPdo, BOOLEAN enable) {
+    if (!LvPdo || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)LvPdo->DeviceExtension;
+    KeWaitForSingleObject(&lvext->ifname_mutex, Executive, KernelMode, FALSE, NULL);
+    if (lvext->ifname.Buffer && (!enable || !lvext->ifname_torn_down)) {
+        IoSetDeviceInterfaceState(&lvext->ifname, enable);
+    }
+    KeReleaseMutex(&lvext->ifname_mutex, FALSE);
+}
+
+void WinLvmLvDestroyInterface(PDEVICE_OBJECT LvPdo) {
+    if (!LvPdo || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)LvPdo->DeviceExtension;
+    KeWaitForSingleObject(&lvext->ifname_mutex, Executive, KernelMode, FALSE, NULL);
+    lvext->ifname_torn_down = TRUE;
     if (lvext->ifname.Buffer) {
         IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
         RtlFreeUnicodeString(&lvext->ifname);
         RtlZeroMemory(&lvext->ifname, sizeof(lvext->ifname));
     }
+    KeReleaseMutex(&lvext->ifname_mutex, FALSE);
+}
+
+static void WinLvmTeardownLvPdoResources(PDEVICE_OBJECT LvPdo) {
+    WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)LvPdo->DeviceExtension;
+    PDEVICE_OBJECT drop_pdos[WL_VG_MAX_PVS];
+    PFILE_OBJECT drop_files[WL_VG_MAX_PVS];
+    size_t drop_count = 0;
+
+    WinLvmWmiDeregister(LvPdo);
+    WinLvmLvDestroyInterface(LvPdo);
 
     WinLvmIoGateRemove(&lvext->io_gate);
 
@@ -219,81 +266,18 @@ static void WinLvmTeardownLvPdoResources(PDEVICE_OBJECT LvPdo) {
         KIRQL old;
         KeAcquireSpinLock(&g_bus_ext->lock, &old);
         WinLvmUnlinkLvPdoLocked(g_bus_ext, LvPdo);
+        WinLvmDetachChildBackingLocked(lvext, drop_pdos, drop_files, &drop_count);
+        lvext->drive_letter = 0;
         KeReleaseSpinLock(&g_bus_ext->lock, old);
-    } else if (lvext->record) {
+    } else {
         WinLvmUnlinkLvPdoLocked(NULL, LvPdo);
+        WinLvmDetachChildBackingLocked(lvext, drop_pdos, drop_files, &drop_count);
+        lvext->drive_letter = 0;
     }
 
-    for (size_t i = 0; i < lvext->backing_count && i < WL_VG_MAX_PVS; i++) {
-        if (lvext->backing_pdo[i]) {
-            ObDereferenceObject(lvext->backing_pdo[i]);
-            lvext->backing_pdo[i] = NULL;
-        }
-        if (lvext->backing_file[i]) {
-            ObDereferenceObject(lvext->backing_file[i]);
-            lvext->backing_file[i] = NULL;
-        }
-    }
-    lvext->backing_count = 0;
-}
-
-static BOOLEAN WinLvmChildBackingMatchesLocked(const WINLVM_LV_EXT *ce,
-                                               const wl_vg_record *r,
-                                               size_t lv_index) {
-    if (!ce || !r || ce->record != r || ce->lv_index != lv_index ||
-        ce->backing_count == 0 || ce->backing_count > WL_VG_MAX_PVS) {
-        return FALSE;
-    }
-    for (size_t j = 0; j < ce->backing_count; j++) {
-        uint32_t s = ce->pv_slot[j];
-        if (s >= r->pv_count || s >= WL_VG_MAX_PVS || r->pv_state[s] != WL_PV_PRESENT) {
-            return FALSE;
-        }
-        const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)r->pv_tag[s];
-        if (!tag || tag->backing_pdo != ce->backing_pdo[j] ||
-            tag->backing_file != ce->backing_file[j]) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-void WinLvmReactivateRecordLvsLocked(WINLVM_BUS_EXT *bus, wl_vg_record *r,
-                                     size_t *newly_out, size_t newly_cap,
-                                     size_t *newly_count_out,
-                                     PDEVICE_OBJECT *revived_out,
-                                     size_t *revived_count_out) {
-    *newly_count_out = 0;
-    *revived_count_out = 0;
-    if (!bus || !r || r->dead || !r->view || !r->view->lvs) return;
-
-    for (size_t k = 0; k < r->view->lv_count && k < WL_VG_MAX_LVS; k++) {
-        if (!wl_vg_lv_child_eligible(&r->view->lvs[k]) || !wl_vg_lv_pv_complete(r, k)) {
-            continue;
-        }
-        PDEVICE_OBJECT existing = NULL;
-        for (size_t c = 0; c < bus->child_count; c++) {
-            WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;
-            if (RtlEqualMemory(ce->lv_uuid, r->view->lvs[k].id, 32)) {
-                existing = bus->children[c];
-                break;
-            }
-        }
-        if (existing) {
-            WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)existing->DeviceExtension;
-            if ((ce->deactivating || ce->unavailable || !wl_vg_lv_activated(r, k)) &&
-                WinLvmChildBackingMatchesLocked(ce, r, k) &&
-                *revived_count_out < WL_MAX_CHILDREN) {
-                ObReferenceObject(existing);
-                ce->deactivating = FALSE;
-                ce->unavailable = FALSE;
-                wl_vg_lv_set_activated(r, k, 1);
-                revived_out[(*revived_count_out)++] = existing;
-            }
-        } else if (!wl_vg_lv_activated(r, k) && *newly_count_out < newly_cap) {
-            wl_vg_lv_set_activated(r, k, 1);
-            newly_out[(*newly_count_out)++] = k;
-        }
+    for (size_t i = 0; i < drop_count; i++) {
+        if (drop_pdos[i]) ObDereferenceObject(drop_pdos[i]);
+        if (drop_files[i]) ObDereferenceObject(drop_files[i]);
     }
 }
 
@@ -302,9 +286,9 @@ void WinLvmFinishProbeActivation(WINLVM_BUS_EXT *bus, size_t slot,
                                  PDEVICE_OBJECT *revived, size_t revived_count,
                                  BOOLEAN force_invalidate) {
     KIRQL old;
+    BOOLEAN any_rebound = FALSE;
     for (size_t i = 0; i < revived_count; i++) {
-        WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)revived[i]->DeviceExtension;
-        if (ce->ifname.Buffer) IoSetDeviceInterfaceState(&ce->ifname, TRUE);
+        if (WinLvmRebindChildPdo(bus, revived[i])) any_rebound = TRUE;
         ObDereferenceObject(revived[i]);
     }
     for (size_t i = 0; i < newly_count; i++) {
@@ -326,7 +310,7 @@ void WinLvmFinishProbeActivation(WINLVM_BUS_EXT *bus, size_t slot,
             KeReleaseSpinLock(&bus->lock, old);
         }
     }
-    if (newly_count > 0 || revived_count > 0 || force_invalidate) {
+    if (newly_count > 0 || any_rebound || force_invalidate) {
         IoInvalidateDeviceRelations(bus->pdo, BusRelations);
     }
 }
@@ -419,24 +403,21 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         if (caps) {
             caps->RawDeviceOK = TRUE;
             caps->SurpriseRemovalOK = TRUE;
+            caps->DeviceState[PowerSystemWorking] = PowerDeviceD0;
+            caps->DeviceState[PowerSystemSleeping1] = PowerDeviceD3;
+            caps->DeviceState[PowerSystemSleeping2] = PowerDeviceD3;
+            caps->DeviceState[PowerSystemSleeping3] = PowerDeviceD3;
+            caps->DeviceState[PowerSystemHibernate] = PowerDeviceD3;
+            caps->DeviceState[PowerSystemShutdown] = PowerDeviceD3;
             Irp->IoStatus.Status = STATUS_SUCCESS;
         }
         break;
     }
 
     case IRP_MN_START_DEVICE:
-        if (!lvext->ifname.Buffer) {
-            UNICODE_STRING ifname;
-            NTSTATUS ifst = IoRegisterDeviceInterface(
-                DeviceObject, &GUID_DEVINTERFACE_VOLUME, NULL, &ifname);
-            WL_TRACE_1("child start: reg ifname 0x%08x", (unsigned)ifst);
-            if (NT_SUCCESS(ifst)) lvext->ifname = ifname;
-        }
-        if (lvext->ifname.Buffer) {
-            NTSTATUS set_st = IoSetDeviceInterfaceState(&lvext->ifname, TRUE);
-            WL_TRACE_1("child start: set ifstate 0x%08x", (unsigned)set_st);
-        }
+        WinLvmLvRegisterAndEnableInterface(DeviceObject);
         WinLvmWmiInit(DeviceObject);
+        WinLvmQueueMountMgrArrival(DeviceObject);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
 
@@ -450,9 +431,10 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     case IRP_MN_REMOVE_DEVICE: {
         WinLvmWmiDeregister(DeviceObject);
-        if (lvext->ifname.Buffer) IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
+        WinLvmLvSetInterfaceEnabled(DeviceObject, FALSE);
 
         BOOLEAN physically_removed = TRUE;
+        size_t rec_slot = SIZE_MAX;
         if (g_bus_ext) {
             KIRQL old;
             KeAcquireSpinLock(&g_bus_ext->lock, &old);
@@ -462,6 +444,10 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 wl_vg_lv_pv_complete(lvext->record, lvext->lv_index)) {
                 physically_removed = FALSE;
             } else {
+                if (lvext->record >= g_bus_ext->vg_records &&
+                    lvext->record < g_bus_ext->vg_records + WL_VG_MAX) {
+                    rec_slot = (size_t)(lvext->record - g_bus_ext->vg_records);
+                }
                 /* Atomically unlink before dropping bus->lock so concurrent
                  * activation or QDR cannot resurrect a PDO under deletion. */
                 WinLvmUnlinkLvPdoLocked(g_bus_ext, DeviceObject);
@@ -475,6 +461,9 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         }
 
         WinLvmTeardownLvPdoResources(DeviceObject);
+        if (g_bus_ext && rec_slot < WL_VG_MAX) {
+            WinLvmBusResetRecordIfInactive(g_bus_ext, rec_slot);
+        }
         Irp->IoStatus.Status = STATUS_SUCCESS;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         IoDeleteDevice(DeviceObject);
@@ -482,7 +471,7 @@ NTSTATUS WinLvmChildPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
 
     case IRP_MN_SURPRISE_REMOVAL:
-        if (lvext->ifname.Buffer) IoSetDeviceInterfaceState(&lvext->ifname, FALSE);
+        WinLvmLvSetInterfaceEnabled(DeviceObject, FALSE);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         break;
 

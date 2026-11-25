@@ -5,16 +5,17 @@
 #include "winlvm.h"
 
 typedef struct {
-    KTIMER          timer;
-    KDPC            dpc;
-    WORK_QUEUE_ITEM item;
-    PDRIVER_OBJECT  driver;
-    BOOLEAN         active;
+    KTIMER         timer;
+    KDPC           dpc;
+    PIO_WORKITEM   io_work;
+    PDRIVER_OBJECT driver;
+    BOOLEAN        active;
 } WINLVM_REGISTER_TIMER;
 
 typedef struct {
-    WORK_QUEUE_ITEM item;
-    UNICODE_STRING  ifname;
+    PIO_WORKITEM   io_work;
+    UNICODE_STRING ifname;
+    BOOLEAN        explicit_probe;
 } WINLVM_PROBE_WORK;
 
 static KSPIN_LOCK            g_work_lock;
@@ -22,28 +23,31 @@ static LONG                  g_pending_work = 0;
 static KEVENT                g_work_drained;
 static BOOLEAN               g_stopping = FALSE;
 static BOOLEAN               g_work_init = FALSE;
+static PDEVICE_OBJECT        g_work_device = NULL;
 static WINLVM_REGISTER_TIMER g_reg_timer;
 
-static void WinLvmProbeWorker(PVOID context);
+static void WinLvmProbeWorker(PDEVICE_OBJECT DeviceObject, PVOID context);
 
 void WinLvmProbeSubsystemInit(void) {
     KeInitializeSpinLock(&g_work_lock);
     KeInitializeEvent(&g_work_drained, NotificationEvent, TRUE);
     g_pending_work = 0;
     g_stopping = FALSE;
+    g_work_device = NULL;
     RtlZeroMemory(&g_reg_timer, sizeof(g_reg_timer));
     g_work_init = TRUE;
 }
 
-void WinLvmProbeSubsystemResume(void) {
+void WinLvmProbeSubsystemResume(PDEVICE_OBJECT work_dev) {
     if (!g_work_init) return;
     KIRQL irql;
     KeAcquireSpinLock(&g_work_lock, &irql);
     g_stopping = FALSE;
+    if (work_dev) g_work_device = work_dev;
     KeReleaseSpinLock(&g_work_lock, irql);
 }
 
-static BOOLEAN WinLvmWorkAcquire(void) {
+BOOLEAN WinLvmWorkAcquire(void) {
     if (!g_work_init) return FALSE;
     KIRQL irql;
     BOOLEAN ok = FALSE;
@@ -57,7 +61,7 @@ static BOOLEAN WinLvmWorkAcquire(void) {
     return ok;
 }
 
-static void WinLvmWorkRelease(void) {
+void WinLvmWorkRelease(void) {
     if (!g_work_init) return;
     KIRQL irql;
     KeAcquireSpinLock(&g_work_lock, &irql);
@@ -67,12 +71,26 @@ static void WinLvmWorkRelease(void) {
     KeReleaseSpinLock(&g_work_lock, irql);
 }
 
+PIO_WORKITEM WinLvmAllocBusWorkItem(void) {
+    if (!g_work_init) return NULL;
+    KIRQL irql;
+    PDEVICE_OBJECT dev = NULL;
+    KeAcquireSpinLock(&g_work_lock, &irql);
+    if (!g_stopping) dev = g_work_device;
+    if (dev) ObReferenceObject(dev);
+    KeReleaseSpinLock(&g_work_lock, irql);
+    if (!dev) return NULL;
+    PIO_WORKITEM wi = IoAllocateWorkItem(dev);
+    ObDereferenceObject(dev);
+    return wi;
+}
+
 static WCHAR WinLvmAsciiLowerW(WCHAR c) {
     return (c >= L'A' && c <= L'Z') ? (WCHAR)(c + (L'a' - L'A')) : c;
 }
 
 /* Non-paged ASCII case-insensitive equality safe at DISPATCH_LEVEL. */
-static BOOLEAN WinLvmUnicodeEqualI(const UNICODE_STRING *a, const UNICODE_STRING *b) {
+BOOLEAN WinLvmUnicodeEqualI(const UNICODE_STRING *a, const UNICODE_STRING *b) {
     if (!a || !b || !a->Buffer || !b->Buffer || a->Length != b->Length) return FALSE;
     size_t n = a->Length / sizeof(WCHAR);
     for (size_t i = 0; i < n; i++) {
@@ -100,7 +118,7 @@ BOOLEAN WinLvmShouldIgnoreLinkName(const UNICODE_STRING *name) {
            WinLvmUnicodeContainsI(name, L"volumesnapshot");
 }
 
-static BOOLEAN WinLvmIsStopping(void) {
+BOOLEAN WinLvmIsProbeStopping(void) {
     if (!g_work_init) return FALSE;
     KIRQL irql;
     KeAcquireSpinLock(&g_work_lock, &irql);
@@ -117,7 +135,7 @@ void WinLvmUnregisterDiskNotify(void) {
 }
 
 NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
-    if (WinLvmIsStopping()) return STATUS_DEVICE_REMOVED;
+    if (WinLvmIsProbeStopping()) return STATUS_DEVICE_REMOVED;
     NTSTATUS status = STATUS_SUCCESS;
     const GUID *guids[2] = { &GUID_DEVINTERFACE_DISK, &GUID_DEVINTERFACE_VOLUME };
     PVOID *cookies[2] = { &g_disk_notify_cookie, &g_volume_notify_cookie };
@@ -135,27 +153,22 @@ NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject) {
             IoUnregisterPlugPlayNotificationEx(cookie);
         }
     }
-    if (WinLvmIsStopping()) {
+    if (WinLvmIsProbeStopping()) {
         WinLvmUnregisterDiskNotify();
         return STATUS_DEVICE_REMOVED;
     }
     return status;
 }
 
-static VOID WinLvmRegisterDpcRoutine(PKDPC Dpc, PVOID DeferredContext,
-                                     PVOID SystemArgument1, PVOID SystemArgument2) {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-    ExQueueWorkItem(&((WINLVM_REGISTER_TIMER *)DeferredContext)->item, DelayedWorkQueue);
-}
-
-static VOID WinLvmRegisterWorker(PVOID context) {
+static VOID WinLvmRegisterWorker(PDEVICE_OBJECT DeviceObject, PVOID context) {
+    UNREFERENCED_PARAMETER(DeviceObject);
     WINLVM_REGISTER_TIMER *rt = (WINLVM_REGISTER_TIMER *)context;
     KIRQL irql;
     KeAcquireSpinLock(&g_work_lock, &irql);
     BOOLEAN stop = g_stopping;
     PDRIVER_OBJECT driver = rt->driver;
+    PIO_WORKITEM wi = rt->io_work;
+    rt->io_work = NULL;
     rt->active = FALSE;
     KeReleaseSpinLock(&g_work_lock, irql);
 
@@ -163,55 +176,88 @@ static VOID WinLvmRegisterWorker(PVOID context) {
         WinLvmUnregisterDiskNotify();
         (void)WinLvmRegisterDiskNotify(driver);
     }
+    if (wi) IoFreeWorkItem(wi);
     WinLvmWorkRelease();
 }
 
-void WinLvmRegisterDiskNotifyDeferred(PDRIVER_OBJECT DriverObject) {
-    if (!g_work_init) return;
+static VOID WinLvmRegisterDpcRoutine(PKDPC Dpc, PVOID DeferredContext,
+                                     PVOID SystemArgument1, PVOID SystemArgument2) {
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+    WINLVM_REGISTER_TIMER *rt = (WINLVM_REGISTER_TIMER *)DeferredContext;
+    if (rt->io_work) {
+        IoQueueWorkItem(rt->io_work, WinLvmRegisterWorker, DelayedWorkQueue, rt);
+    } else {
+        WinLvmWorkRelease();
+    }
+}
+
+void WinLvmRegisterDiskNotifyDeferred(PDEVICE_OBJECT BusFdo) {
+    if (!g_work_init || !BusFdo) return;
+    PIO_WORKITEM wi = IoAllocateWorkItem(BusFdo);
+    if (!wi) return;
+
     KIRQL irql;
+    BOOLEAN armed = FALSE;
     KeAcquireSpinLock(&g_work_lock, &irql);
     if (!g_stopping && !g_reg_timer.active) {
-        g_reg_timer.driver = DriverObject;
+        g_reg_timer.driver = BusFdo->DriverObject;
+        g_reg_timer.io_work = wi;
         g_reg_timer.active = TRUE;
         g_pending_work++;
         KeClearEvent(&g_work_drained);
         KeInitializeTimer(&g_reg_timer.timer);
         KeInitializeDpc(&g_reg_timer.dpc, WinLvmRegisterDpcRoutine, &g_reg_timer);
-        ExInitializeWorkItem(&g_reg_timer.item, WinLvmRegisterWorker, &g_reg_timer);
         LARGE_INTEGER delay;
         delay.QuadPart = -20000000LL; /* 2 seconds relative */
         KeSetTimer(&g_reg_timer.timer, delay, &g_reg_timer.dpc);
+        armed = TRUE;
     }
     KeReleaseSpinLock(&g_work_lock, irql);
+    if (!armed) IoFreeWorkItem(wi);
 }
 
 void WinLvmStopAndDrainProbeWork(void) {
     if (!g_work_init) {
         WinLvmUnregisterDiskNotify();
+        WinLvmUnregisterAllTargetNotifies();
         return;
     }
     KIRQL irql;
+    PIO_WORKITEM cancelled_wi = NULL;
     KeAcquireSpinLock(&g_work_lock, &irql);
     g_stopping = TRUE;
     if (g_reg_timer.active && KeCancelTimer(&g_reg_timer.timer)) {
         g_reg_timer.active = FALSE;
+        cancelled_wi = g_reg_timer.io_work;
+        g_reg_timer.io_work = NULL;
         if (g_pending_work > 0 && --g_pending_work == 0) {
             KeSetEvent(&g_work_drained, IO_NO_INCREMENT, FALSE);
         }
     }
     KeReleaseSpinLock(&g_work_lock, irql);
+    if (cancelled_wi) IoFreeWorkItem(cancelled_wi);
 
     KeFlushQueuedDpcs();
     WinLvmUnregisterDiskNotify();
+    WinLvmUnregisterAllTargetNotifies();
     if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
         KeWaitForSingleObject(&g_work_drained, Executive, KernelMode, FALSE, NULL);
+        /* Barrier: wait for the last WinLvmWorkRelease to release g_work_lock. */
+        KeAcquireSpinLock(&g_work_lock, &irql);
+        KeReleaseSpinLock(&g_work_lock, irql);
     }
-    /* Unregister again after all workers exit so late WinLvmRegisterWorker calls
-     * cannot leave live PnP notifications across unload. */
     WinLvmUnregisterDiskNotify();
+    WinLvmUnregisterAllTargetNotifies();
+
+    KeAcquireSpinLock(&g_work_lock, &irql);
+    g_work_device = NULL;
+    KeReleaseSpinLock(&g_work_lock, irql);
 }
 
-static NTSTATUS WinLvmQueueProbeForInterface(const UNICODE_STRING *ifname) {
+NTSTATUS WinLvmQueueProbeForInterfaceEx(const UNICODE_STRING *ifname,
+                                        BOOLEAN explicit_probe) {
     if (!ifname || !ifname->Buffer || ifname->Length < sizeof(WCHAR) ||
         (ifname->Length % sizeof(WCHAR)) != 0 ||
         ifname->Length > (USHORT)(0xFFFEu - sizeof(WCHAR))) {
@@ -219,9 +265,15 @@ static NTSTATUS WinLvmQueueProbeForInterface(const UNICODE_STRING *ifname) {
     }
     if (!WinLvmWorkAcquire()) return STATUS_DEVICE_REMOVED;
 
+    PIO_WORKITEM wi = WinLvmAllocBusWorkItem();
+    if (!wi) {
+        WinLvmWorkRelease();
+        return STATUS_DEVICE_REMOVED;
+    }
     WINLVM_PROBE_WORK *work = (WINLVM_PROBE_WORK *)ExAllocatePoolZero(
         NonPagedPool, sizeof(WINLVM_PROBE_WORK), WINLVM_WIN_TAG);
     if (!work) {
+        IoFreeWorkItem(wi);
         WinLvmWorkRelease();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -231,16 +283,18 @@ static NTSTATUS WinLvmQueueProbeForInterface(const UNICODE_STRING *ifname) {
         NonPagedPool, (size_t)len + sizeof(WCHAR), WINLVM_WIN_TAG);
     if (!buf) {
         ExFreePoolWithTag(work, WINLVM_WIN_TAG);
+        IoFreeWorkItem(wi);
         WinLvmWorkRelease();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlCopyMemory(buf, ifname->Buffer, len);
+    work->io_work = wi;
     work->ifname.Buffer = buf;
     work->ifname.Length = len;
     work->ifname.MaximumLength = (USHORT)(len + sizeof(WCHAR));
+    work->explicit_probe = explicit_probe;
 
-    ExInitializeWorkItem(&work->item, WinLvmProbeWorker, work);
-    ExQueueWorkItem(&work->item, DelayedWorkQueue);
+    IoQueueWorkItem(wi, WinLvmProbeWorker, DelayedWorkQueue, work);
     return STATUS_SUCCESS;
 }
 
@@ -280,46 +334,15 @@ NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context) {
         np_link.MaximumLength = (USHORT)(len + sizeof(WCHAR));
         np_link.Buffer = sym_buf;
 
-        WINLVM_PV_TAG *removed_tags[WL_VG_MAX * WL_VG_MAX_PVS];
-        size_t removed_count = 0;
-        KIRQL old;
-        KeAcquireSpinLock(&bus->lock, &old);
-        for (size_t i = 0; i < WL_VG_MAX; i++) {
-            wl_vg_record *r = &bus->vg_records[i];
-            if (!r->vg_uuid[0]) continue;
-            for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
-                WINLVM_PV_TAG *tag = (WINLVM_PV_TAG *)r->pv_tag[p];
-                if (tag && tag->disk_ifname.Buffer &&
-                    WinLvmUnicodeEqualI(&tag->disk_ifname, &np_link)) {
-                    char pv_uuid[WL_VG_UUID_LEN];
-                    RtlCopyMemory(pv_uuid, r->pv_uuid[p], WL_VG_UUID_LEN);
-                    if (removed_count < WL_VG_MAX * WL_VG_MAX_PVS) {
-                        removed_tags[removed_count++] = tag;
-                    }
-                    r->pv_tag[p] = NULL;
-                    wl_vg_pv_removed(bus->vg_records, WL_VG_MAX, pv_uuid);
-
-                    for (size_t c = 0; c < bus->child_count; c++) {
-                        WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;
-                        if (lext->record == r && wl_vg_lv_any_pv_gone(r, lext->lv_index)) {
-                            lext->unavailable = TRUE;
-                        }
-                    }
-                }
-            }
-        }
-        KeReleaseSpinLock(&bus->lock, old);
-
+        WinLvmReleasePvAndQuiesceChildren(bus, &np_link, NULL, FALSE);
         ExFreePoolWithTag(sym_buf, WINLVM_WIN_TAG);
-        for (size_t k = 0; k < removed_count; k++) WinLvmFreePvTag(removed_tags[k]);
-        if (removed_count > 0) IoInvalidateDeviceRelations(bus->pdo, BusRelations);
         return STATUS_SUCCESS;
     }
 
     if (!RtlEqualMemory(&change->Event, &GUID_DEVICE_INTERFACE_ARRIVAL, sizeof(GUID))) {
         return STATUS_SUCCESS;
     }
-    return WinLvmQueueProbeForInterface(change->SymbolicLinkName);
+    return WinLvmQueueProbeForInterfaceEx(change->SymbolicLinkName, FALSE);
 }
 
 NTSTATUS WinLvmProbeDevicePathEx(const UNICODE_STRING *symLinkOrNtPath,
@@ -398,84 +421,26 @@ NTSTATUS WinLvmProbeDevicePathEx(const UNICODE_STRING *symLinkOrNtPath,
         }
     }
 
-    WINLVM_PV_TAG *old_tags[WL_VG_MAX_PVS];
-    size_t old_tag_count = 0;
-    WINLVM_PV_TAG *tags_to_free[WL_VG_MAX_PVS + 1];
-    size_t free_tag_count = 0;
-    WINLVM_VIEW_BLOCK *old_view = NULL;
-    PDEVICE_OBJECT revived[WL_MAX_CHILDREN];
-    size_t revived_count = 0;
-    size_t slot = 0;
-    size_t newly[WL_VG_MAX_LVS];
-    size_t newly_count = 0;
-
+    WINLVM_PROBE_COMMIT commit;
     KeAcquireSpinLock(&bus->lock, &old);
-    int existed_idx = wl_vg_find(bus->vg_records, WL_VG_MAX, block->vg.id);
-    BOOLEAN all_quiesced = TRUE;
-    if (existed_idx >= 0) {
-        wl_vg_record *er = &bus->vg_records[existed_idx];
-        for (size_t p = 0; p < er->pv_count && p < WL_VG_MAX_PVS; p++) {
-            if (er->pv_tag[p]) old_tags[old_tag_count++] = (WINLVM_PV_TAG *)er->pv_tag[p];
-        }
-        all_quiesced = WinLvmAllRecordChildrenQuiescedLocked(bus, er);
-    }
-    wl_lv_update_fn seam = (quiesce_ok && all_quiesced) ? WinLvmUpdateLvSeam : NULL;
-    wl_arrival_result res = wl_vg_arrival(
-        bus->vg_records, WL_VG_MAX, &slot, &block->vg,
-        pv_uuid, tag, seam, bus, newly, WL_VG_MAX_LVS, &newly_count);
-
-    if ((res == WL_ARR_RECONCILED) ||
-        (existed_idx < 0 && (res == WL_ARR_COMPLETED || res == WL_ARR_PENDING))) {
-        if (res == WL_ARR_RECONCILED) old_view = bus->vg_views[slot];
-        bus->vg_views[slot] = block;
-        block = NULL;
-    }
-    if (res == WL_ARR_RECONCILED) {
-        WinLvmReconcileChildrenLocked(bus, &bus->vg_records[slot], drops);
-    }
-    if (res != WL_ARR_REJECTED && res != WL_ARR_DUPLICATE) {
-        wl_vg_record *r = &bus->vg_records[slot];
-        for (size_t oi = 0; oi < old_tag_count; oi++) {
-            BOOLEAN still_present = FALSE;
-            for (size_t p = 0; p < r->pv_count; p++) {
-                if (r->pv_tag[p] == old_tags[oi]) { still_present = TRUE; break; }
-            }
-            if (!still_present) tags_to_free[free_tag_count++] = old_tags[oi];
-        }
-        BOOLEAN tag_kept = FALSE;
-        for (size_t p = 0; p < r->pv_count; p++) {
-            if (r->pv_tag[p] == tag) { tag_kept = TRUE; break; }
-        }
-        if (!tag_kept) tags_to_free[free_tag_count++] = tag;
-        for (size_t i = 0; i < newly_count; i++) wl_vg_lv_set_activated(r, newly[i], 1);
-    } else if (res == WL_ARR_DUPLICATE && explicit_probe && existed_idx >= 0) {
-        slot = (size_t)existed_idx;
-        wl_vg_record *r = &bus->vg_records[slot];
-        BOOLEAN swapped = FALSE;
-        if (r->refs == 0) {
-            for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
-                if (RtlEqualMemory(r->pv_uuid[p], pv_uuid, 32)) {
-                    if (r->pv_tag[p]) tags_to_free[free_tag_count++] = (WINLVM_PV_TAG *)r->pv_tag[p];
-                    r->pv_tag[p] = tag;
-                    swapped = TRUE;
-                    break;
-                }
-            }
-        }
-        if (!swapped) tags_to_free[free_tag_count++] = tag;
-        WinLvmReactivateRecordLvsLocked(bus, r, newly, WL_VG_MAX_LVS, &newly_count,
-                                        revived, &revived_count);
-    } else {
-        tags_to_free[free_tag_count++] = tag;
-    }
+    wl_arrival_result res = WinLvmProbeCommitArrivalLocked(
+        bus, &block, pv_uuid, tag, quiesce_ok, explicit_probe, drops, &commit);
     KeReleaseSpinLock(&bus->lock, old);
 
-    if (old_view) ExFreePoolWithTag(old_view, WINLVM_WIN_TAG);
+    if (commit.tn_file_ref) {
+        WinLvmTargetNotifyRegisterForTag(
+            bus, commit.slot, tag, commit.tn_file_ref, &commit.tn_path, pv_uuid);
+        ObDereferenceObject(commit.tn_file_ref);
+        ExFreePoolWithTag(commit.tn_path.Buffer, WINLVM_WIN_TAG);
+    }
+    if (commit.old_view) ExFreePoolWithTag(commit.old_view, WINLVM_WIN_TAG);
     if (drops) WinLvmFreeReconcileDrops(drops);
-    for (size_t i = 0; i < free_tag_count; i++) WinLvmFreePvTag(tags_to_free[i]);
+    for (size_t i = 0; i < commit.free_tag_count; i++) {
+        WinLvmFreePvTag(commit.tags_to_free[i]);
+    }
     if (quiesced_count > 0) WinLvmResumeRecordChildren(quiesced, quiesced_count);
-    WinLvmFinishProbeActivation(bus, slot, newly, newly_count,
-                                revived, revived_count,
+    WinLvmFinishProbeActivation(bus, commit.slot, commit.newly, commit.newly_count,
+                                commit.revived, commit.revived_count,
                                 (BOOLEAN)(res == WL_ARR_RECONCILED));
     if (block) ExFreePoolWithTag(block, WINLVM_WIN_TAG);
     return (res == WL_ARR_REJECTED) ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
@@ -485,11 +450,14 @@ NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath) {
     return WinLvmProbeDevicePathEx(symLinkOrNtPath, TRUE, FALSE);
 }
 
-static void WinLvmProbeWorker(PVOID context) {
+static void WinLvmProbeWorker(PDEVICE_OBJECT DeviceObject, PVOID context) {
+    UNREFERENCED_PARAMETER(DeviceObject);
     WINLVM_PROBE_WORK *work = (WINLVM_PROBE_WORK *)context;
+    PIO_WORKITEM wi = work->io_work;
     WL_TRACE_1("probe worker: ifname %wZ", &work->ifname);
-    (void)WinLvmProbeDevicePath(&work->ifname);
+    (void)WinLvmProbeDevicePathEx(&work->ifname, TRUE, work->explicit_probe);
     ExFreePoolWithTag(work->ifname.Buffer, WINLVM_WIN_TAG);
     ExFreePoolWithTag(work, WINLVM_WIN_TAG);
+    if (wi) IoFreeWorkItem(wi);
     WinLvmWorkRelease();
 }

@@ -24,7 +24,15 @@
 #include "../winlvm_ioctl.h"
 #include "winlvm_vg.h"
 
-#define WINLVM_WIN_TAG         ((unsigned long)'WMLV')
+#define WINLVM_WIN_TAG         0x574D4C56UL /* 'WMLV' */
+#if defined(__MINGW32__) && !defined(ExAllocatePoolZero)
+static inline PVOID WinLvmExAllocatePoolZeroCompat(POOL_TYPE type, SIZE_T bytes, ULONG tag) {
+    PVOID ptr = ExAllocatePoolWithTag(type, bytes, tag);
+    if (ptr) RtlZeroMemory(ptr, bytes);
+    return ptr;
+}
+#define ExAllocatePoolZero WinLvmExAllocatePoolZeroCompat
+#endif
 #define WL_MAX_CHILDREN        32
 #define WINLVM_LOG_BUFFER_SIZE 32768u
 #define WINLVM_VIEW_ARENA_CAP  (2u * 1024 * 1024)
@@ -80,14 +88,19 @@ typedef struct {
     WL_EXT_KIND kind;
 } WINLVM_CONTROL_EXT;
 
+typedef struct _WINLVM_TARGET_NOTIFY WINLVM_TARGET_NOTIFY;
+
+#define WL_MAX_RECENT_PV_PATHS (WL_VG_MAX * WL_VG_MAX_PVS)
+
 /* Per-PV backing descriptor owned by the bus registry (pv_tag[]). */
 typedef struct {
-    PDEVICE_OBJECT backing_pdo;
-    PFILE_OBJECT   backing_file;
-    UNICODE_STRING disk_ifname;
-    ULONG          logical_sector;
-    ULONG          physical_sector;
-    BOOLEAN        read_only;
+    PDEVICE_OBJECT        backing_pdo;
+    PFILE_OBJECT          backing_file;
+    UNICODE_STRING        disk_ifname;
+    ULONG                 logical_sector;
+    ULONG                 physical_sector;
+    BOOLEAN               read_only;
+    WINLVM_TARGET_NOTIFY *target_notify;
 } WINLVM_PV_TAG;
 
 /* Heap-allocated parsed VG view and its backing lvmcore arena. */
@@ -107,8 +120,12 @@ typedef struct _WINLVM_BUS_EXT {
     WINLVM_VIEW_BLOCK *vg_views[WL_VG_MAX];
     PDEVICE_OBJECT     children[WL_MAX_CHILDREN];
     size_t             child_count;
+    UNICODE_STRING     recent_pv_paths[WL_MAX_RECENT_PV_PATHS];
+    size_t             recent_pv_count;
     WMILIB_CONTEXT     wmi;
     BOOLEAN            wmi_registered;
+    SYSTEM_POWER_STATE system_power_state;
+    DEVICE_POWER_STATE device_power_state;
 } WINLVM_BUS_EXT;
 
 typedef struct WL_IO_CTX WL_IO_CTX;
@@ -163,10 +180,15 @@ typedef struct _WINLVM_LV_EXT {
     BOOLEAN        deactivating;
     BOOLEAN        reported_to_pnp;
     BOOLEAN        wmi_registered;
-    UNICODE_STRING ifname;
-    WCHAR          devname[64];
-    WMILIB_CONTEXT wmi;
-    WL_IO_GATE     io_gate;
+    UNICODE_STRING     ifname;
+    KMUTEX             ifname_mutex;
+    BOOLEAN            ifname_torn_down;
+    WCHAR              devname[64];
+    WCHAR              drive_letter;
+    SYSTEM_POWER_STATE system_power_state;
+    DEVICE_POWER_STATE device_power_state;
+    WMILIB_CONTEXT     wmi;
+    WL_IO_GATE         io_gate;
 } WINLVM_LV_EXT;
 
 typedef struct {
@@ -219,12 +241,13 @@ void WinLvmFreeReconcileDrops(WINLVM_RECONCILE_DROPS *drops);
 
 /* winlvm_pnp.c */
 DRIVER_DISPATCH WinLvmBusPnp;
-void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus);
 BOOLEAN WinLvmQuiesceRecordChildren(WINLVM_BUS_EXT *bus, const wl_vg_record *r,
                                     PDEVICE_OBJECT *out_pdos, size_t *out_count);
 BOOLEAN WinLvmAllRecordChildrenQuiescedLocked(WINLVM_BUS_EXT *bus, const wl_vg_record *r);
 void WinLvmResumeRecordChildren(PDEVICE_OBJECT *pdos, size_t count);
 wl_update_result WinLvmUpdateLvSeam(void *ctx, const char *lv_uuid);
+BOOLEAN WinLvmReconcileSingleChildLocked(wl_vg_record *r, WINLVM_LV_EXT *lext,
+                                         WINLVM_RECONCILE_DROPS *drops);
 void WinLvmReconcileChildrenLocked(WINLVM_BUS_EXT *bus, wl_vg_record *r,
                                    WINLVM_RECONCILE_DROPS *drops);
 void WinLvmSwapRecordViewLocked(wl_vg_record *r,
@@ -237,6 +260,9 @@ void WinLvmSwapRecordViewLocked(wl_vg_record *r,
 /* winlvm_child.c */
 DRIVER_DISPATCH WinLvmChildPnp;
 void WinLvmDeleteLvPdo(PDEVICE_OBJECT LvPdo);
+void WinLvmLvRegisterAndEnableInterface(PDEVICE_OBJECT LvPdo);
+void WinLvmLvSetInterfaceEnabled(PDEVICE_OBJECT LvPdo, BOOLEAN enable);
+void WinLvmLvDestroyInterface(PDEVICE_OBJECT LvPdo);
 BOOLEAN WinLvmComputeLvReadOnly(const wl_vg_record *record, size_t lv_index,
                                 const size_t *slots, size_t slot_count);
 BOOLEAN WinLvmCollectLvBackingSlotsLocked(const wl_vg_record *record, size_t lv_index,
@@ -245,11 +271,6 @@ BOOLEAN WinLvmCollectLvBackingSlotsLocked(const wl_vg_record *record, size_t lv_
                                           ULONG *max_physical_out);
 BOOLEAN WinLvmProbeWorkerCreateLvPdo(WINLVM_BUS_EXT *bus, wl_vg_record *r,
                                      size_t lv_index);
-void WinLvmReactivateRecordLvsLocked(WINLVM_BUS_EXT *bus, wl_vg_record *r,
-                                     size_t *newly_out, size_t newly_cap,
-                                     size_t *newly_count_out,
-                                     PDEVICE_OBJECT *revived_out,
-                                     size_t *revived_count_out);
 void WinLvmFinishProbeActivation(WINLVM_BUS_EXT *bus, size_t slot,
                                  const size_t *newly, size_t newly_count,
                                  PDEVICE_OBJECT *revived, size_t revived_count,
@@ -257,22 +278,88 @@ void WinLvmFinishProbeActivation(WINLVM_BUS_EXT *bus, size_t slot,
 
 /* winlvm_probe.c */
 void WinLvmProbeSubsystemInit(void);
-void WinLvmProbeSubsystemResume(void);
+void WinLvmProbeSubsystemResume(PDEVICE_OBJECT work_dev);
 void WinLvmStopAndDrainProbeWork(void);
+BOOLEAN WinLvmWorkAcquire(void);
+void WinLvmWorkRelease(void);
+PIO_WORKITEM WinLvmAllocBusWorkItem(void);
+BOOLEAN WinLvmIsProbeStopping(void);
+BOOLEAN WinLvmUnicodeEqualI(const UNICODE_STRING *a, const UNICODE_STRING *b);
 BOOLEAN WinLvmShouldIgnoreLinkName(const UNICODE_STRING *name);
+NTSTATUS WinLvmQueueProbeForInterfaceEx(const UNICODE_STRING *ifname,
+                                        BOOLEAN explicit_probe);
 NTSTATUS WinLvmRegisterDiskNotify(PDRIVER_OBJECT DriverObject);
 void WinLvmUnregisterDiskNotify(void);
-void WinLvmRegisterDiskNotifyDeferred(PDRIVER_OBJECT DriverObject);
+void WinLvmRegisterDiskNotifyDeferred(PDEVICE_OBJECT BusFdo);
 NTSTATUS WinLvmPnpDiskNotify(PVOID NotificationStructure, PVOID Context);
 NTSTATUS WinLvmProbeDevicePath(const UNICODE_STRING *symLinkOrNtPath);
 NTSTATUS WinLvmProbeDevicePathEx(const UNICODE_STRING *symLinkOrNtPath,
                                  BOOLEAN allow_part_scan,
                                  BOOLEAN explicit_probe);
 
-/* winlvm_control.c */
-NTSTATUS WinLvmControlDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+/* winlvm_notify.c */
+void WinLvmTargetNotifyInit(void);
+void WinLvmTargetNotifyRegisterForTag(WINLVM_BUS_EXT *bus, size_t rec_slot,
+                                      WINLVM_PV_TAG *tag,
+                                      PFILE_OBJECT file_ref,
+                                      const UNICODE_STRING *path_copy,
+                                      const char pv_uuid[WL_VG_UUID_LEN]);
+void WinLvmTargetNotifyUnregisterSync(WINLVM_TARGET_NOTIFY *tn);
+void WinLvmTargetNotifyRelease(WINLVM_TARGET_NOTIFY *tn);
+void WinLvmUnregisterAllTargetNotifies(void);
+void WinLvmReleasePvAndQuiesceChildren(WINLVM_BUS_EXT *bus,
+                                       const UNICODE_STRING *np_link,
+                                       const char *pv_uuid,
+                                       BOOLEAN keep_target_notify);
+void WinLvmDetachChildBackingLocked(WINLVM_LV_EXT *lext,
+                                    PDEVICE_OBJECT *pdos_out,
+                                    PFILE_OBJECT *files_out,
+                                    size_t *count_out);
+void WinLvmQueueMountMgrArrival(PDEVICE_OBJECT LvPdo);
+
+/* winlvm_vg_ops.c */
+void WinLvmRecordRecentPvPathLocked(WINLVM_BUS_EXT *bus,
+                                    const UNICODE_STRING *path);
+size_t WinLvmCopyRecentPvPaths(WINLVM_BUS_EXT *bus,
+                               UNICODE_STRING *out, size_t cap);
+void WinLvmFreeRecentPvPathsLocked(WINLVM_BUS_EXT *bus,
+                                   PWCHAR *bufs_out, size_t *count_out);
+BOOLEAN WinLvmRebindChildPdo(WINLVM_BUS_EXT *bus, PDEVICE_OBJECT child);
+void WinLvmCollectExistingChildrenForActivationLocked(WINLVM_BUS_EXT *bus,
+                                                      wl_vg_record *r,
+                                                      size_t *newly,
+                                                      size_t *newly_count,
+                                                      BOOLEAN explicit_probe,
+                                                      PDEVICE_OBJECT *revived_out,
+                                                      size_t *revived_count_out);
+typedef struct {
+    WINLVM_VIEW_BLOCK *old_view;
+    WINLVM_PV_TAG     *tags_to_free[WL_VG_MAX_PVS + 1];
+    size_t             free_tag_count;
+    size_t             slot;
+    size_t             newly[WL_VG_MAX_LVS];
+    size_t             newly_count;
+    PDEVICE_OBJECT     revived[WL_MAX_CHILDREN];
+    size_t             revived_count;
+    PFILE_OBJECT       tn_file_ref;
+    UNICODE_STRING     tn_path;
+} WINLVM_PROBE_COMMIT;
+
+wl_arrival_result WinLvmProbeCommitArrivalLocked(WINLVM_BUS_EXT *bus,
+                                                 WINLVM_VIEW_BLOCK **block_io,
+                                                 const char pv_uuid[WL_VG_UUID_LEN],
+                                                 WINLVM_PV_TAG *tag,
+                                                 BOOLEAN quiesce_ok,
+                                                 BOOLEAN explicit_probe,
+                                                 WINLVM_RECONCILE_DROPS *drops,
+                                                 WINLVM_PROBE_COMMIT *out);
 NTSTATUS WinLvmBusActivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid);
 NTSTATUS WinLvmBusDeactivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid);
+
+/* winlvm_control.c */
+void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus);
+void WinLvmBusResetRecordIfInactive(WINLVM_BUS_EXT *bus, size_t rec_slot);
+NTSTATUS WinLvmControlDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 /* winlvm_subirp.c */
 NTSTATUS LvFanOutIo(PDEVICE_OBJECT DeviceObject, PIRP Irp);

@@ -1,86 +1,72 @@
 /*
- * winlvm_control.c — \Device\WinLvmControl IOCTL dispatch plane.
+ * winlvm_control.c — \Device\WinLvmControl IOCTL dispatch plane and inactive
+ *                    VG record cleanup.
  */
 #include "winlvm.h"
 
-NTSTATUS WinLvmBusActivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid) {
-    char norm[WL_VG_UUID_LEN];
-    if (!bus || !winlvm_normalize_uuid(lv_uuid, WINLVM_LV_UUID_WIRE_LEN, norm)) {
-        return STATUS_INVALID_PARAMETER;
-    }
+void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus) {
+    if (!bus) return;
+    WINLVM_PV_TAG *tags[WL_VG_MAX * WL_VG_MAX_PVS];
+    size_t tag_count = 0;
+    WINLVM_VIEW_BLOCK *views[WL_VG_MAX];
+    size_t view_count = 0;
 
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
     for (size_t i = 0; i < WL_VG_MAX; i++) {
         wl_vg_record *r = &bus->vg_records[i];
-        const lvmcore_volume_group *view = r->view;
-        if (!view || !view->lvs || r->pv_count == 0) continue;
-        for (size_t k = 0; k < view->lv_count; k++) {
-            if (!RtlEqualMemory(view->lvs[k].id, norm, 32)) continue;
-            if (!wl_vg_lv_child_eligible(&view->lvs[k]) || !wl_vg_lv_pv_complete(r, k)) {
-                KeReleaseSpinLock(&bus->lock, old);
-                return STATUS_DEVICE_NOT_READY;
-            }
-            for (size_t c = 0; c < bus->child_count; c++) {
-                PDEVICE_OBJECT child = bus->children[c];
-                WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)child->DeviceExtension;
-                if (RtlEqualMemory(ce->lv_uuid, norm, 32)) {
-                    ObReferenceObject(child);
-                    ce->deactivating = FALSE;
-                    ce->unavailable = FALSE;
-                    wl_vg_lv_set_activated(r, k, 1);
-                    KeReleaseSpinLock(&bus->lock, old);
-                    if (ce->ifname.Buffer) IoSetDeviceInterfaceState(&ce->ifname, TRUE);
-                    ObDereferenceObject(child);
-                    IoInvalidateDeviceRelations(bus->pdo, BusRelations);
-                    return STATUS_SUCCESS;
+        if (r->vg_uuid[0] != '\0' && r->refs == 0) {
+            for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
+                if (r->pv_tag[p] && tag_count < WL_VG_MAX * WL_VG_MAX_PVS) {
+                    tags[tag_count++] = (WINLVM_PV_TAG *)r->pv_tag[p];
+                    r->pv_tag[p] = NULL;
                 }
             }
-            wl_vg_lv_set_activated(r, k, 1);
-            KeReleaseSpinLock(&bus->lock, old);
-            if (WinLvmProbeWorkerCreateLvPdo(bus, r, k)) {
-                IoInvalidateDeviceRelations(bus->pdo, BusRelations);
-                return STATUS_SUCCESS;
+            if (bus->vg_views[i] && view_count < WL_VG_MAX) {
+                views[view_count++] = bus->vg_views[i];
+                bus->vg_views[i] = NULL;
             }
-            KeAcquireSpinLock(&bus->lock, &old);
-            wl_vg_lv_set_activated(r, k, 0);
-            KeReleaseSpinLock(&bus->lock, old);
-            return STATUS_UNSUCCESSFUL;
+            RtlZeroMemory(r, sizeof(*r));
         }
     }
     KeReleaseSpinLock(&bus->lock, old);
-    return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    for (size_t i = 0; i < tag_count; i++) WinLvmFreePvTag(tags[i]);
+    for (size_t i = 0; i < view_count; i++) ExFreePoolWithTag(views[i], WINLVM_WIN_TAG);
 }
 
-NTSTATUS WinLvmBusDeactivateLvByUuid(WINLVM_BUS_EXT *bus, const char *lv_uuid) {
-    char norm[WL_VG_UUID_LEN];
-    if (!bus || !winlvm_normalize_uuid(lv_uuid, WINLVM_LV_UUID_WIRE_LEN, norm)) {
-        return STATUS_INVALID_PARAMETER;
-    }
+void WinLvmBusResetRecordIfInactive(WINLVM_BUS_EXT *bus, size_t rec_slot) {
+    if (!bus || rec_slot >= WL_VG_MAX) return;
+    WINLVM_PV_TAG *tags[WL_VG_MAX_PVS];
+    size_t tag_count = 0;
+    WINLVM_VIEW_BLOCK *old_view = NULL;
 
     KIRQL old;
-    PDEVICE_OBJECT target_pdo = NULL;
     KeAcquireSpinLock(&bus->lock, &old);
-    for (size_t i = 0; i < bus->child_count; i++) {
-        WINLVM_LV_EXT *lv = (WINLVM_LV_EXT *)bus->children[i]->DeviceExtension;
-        if (RtlEqualMemory(lv->lv_uuid, norm, 32)) {
-            target_pdo = bus->children[i];
-            ObReferenceObject(target_pdo);
-            lv->deactivating = TRUE;
-            if (lv->record) wl_vg_lv_set_activated(lv->record, lv->lv_index, 0);
-            break;
+    wl_vg_record *r = &bus->vg_records[rec_slot];
+    if (r->vg_uuid[0] != '\0' && r->refs == 0) {
+        BOOLEAN any_act = FALSE;
+        if (!r->dead) {
+            for (size_t k = 0; k < WL_VG_MAX_LVS; k++) {
+                if (wl_vg_lv_activated(r, k)) { any_act = TRUE; break; }
+            }
+        }
+        if (!any_act) {
+            for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
+                if (r->pv_tag[p] && tag_count < WL_VG_MAX_PVS) {
+                    tags[tag_count++] = (WINLVM_PV_TAG *)r->pv_tag[p];
+                    r->pv_tag[p] = NULL;
+                }
+            }
+            old_view = bus->vg_views[rec_slot];
+            bus->vg_views[rec_slot] = NULL;
+            RtlZeroMemory(r, sizeof(*r));
         }
     }
     KeReleaseSpinLock(&bus->lock, old);
-    if (!target_pdo) return STATUS_OBJECT_NAME_NOT_FOUND;
 
-    WINLVM_LV_EXT *target = (WINLVM_LV_EXT *)target_pdo->DeviceExtension;
-    WinLvmIoGateBeginQuiesce(&target->io_gate);
-    if (target->ifname.Buffer) IoSetDeviceInterfaceState(&target->ifname, FALSE);
-    WinLvmIoGateResume(&target->io_gate, target_pdo);
-    ObDereferenceObject(target_pdo);
-    IoInvalidateDeviceRelations(bus->pdo, BusRelations);
-    return STATUS_SUCCESS;
+    for (size_t i = 0; i < tag_count; i++) WinLvmFreePvTag(tags[i]);
+    if (old_view) ExFreePoolWithTag(old_view, WINLVM_WIN_TAG);
 }
 
 static NTSTATUS WinLvmHandleUpdateLv(const WINLVM_UPDATE_LV_REQUEST *req, ULONG input_length) {
@@ -268,6 +254,7 @@ static NTSTATUS WinLvmHandleInventory(PVOID sysBuf, ULONG output_length, ULONG_P
                     if (RtlEqualMemory(ce->lv_uuid, lv->id, 32)) {
                         e->byte_size = ce->byte_size;
                         e->logical_sector = ce->logical_sector;
+                        e->drive_letter = ce->drive_letter;
                         if (!ce->unavailable && !ce->deactivating && wl_vg_lv_activated(r, k)) {
                             flags |= WINLVM_INV_LV_ACTIVE;
                         }

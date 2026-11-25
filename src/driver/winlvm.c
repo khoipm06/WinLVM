@@ -111,6 +111,7 @@ NTSTATUS WinLvmCreateControlDevice(PDRIVER_OBJECT DriverObject) {
         return status;
     }
     g_control_link_created = TRUE;
+    g_control_device->Flags |= DO_POWER_PAGABLE;
     g_control_device->Flags &= ~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;
 }
@@ -130,6 +131,12 @@ void WinLvmDeleteControlDevice(void) {
 
 void WinLvmFreePvTag(WINLVM_PV_TAG *tag) {
     if (!tag) return;
+    if (tag->target_notify) {
+        WINLVM_TARGET_NOTIFY *tn = tag->target_notify;
+        tag->target_notify = NULL;
+        WinLvmTargetNotifyUnregisterSync(tn);
+        WinLvmTargetNotifyRelease(tn);
+    }
     if (tag->disk_ifname.Buffer) {
         ExFreePoolWithTag(tag->disk_ifname.Buffer, WINLVM_WIN_TAG);
     }
@@ -155,6 +162,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     g_log_len = 0;
     g_log_ready = TRUE;
     WinLvmProbeSubsystemInit();
+    WinLvmTargetNotifyInit();
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = WinLvmCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = WinLvmCreateClose;

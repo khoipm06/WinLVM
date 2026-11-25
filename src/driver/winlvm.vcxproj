@@ -86,6 +86,8 @@
     <ClCompile Include="winlvm.c" />
     <ClCompile Include="winlvm_pnp.c" />
     <ClCompile Include="winlvm_probe.c" />
+    <ClCompile Include="winlvm_notify.c" />
+    <ClCompile Include="winlvm_vg_ops.c" />
     <ClCompile Include="winlvm_control.c" />
     <ClCompile Include="winlvm_child.c" />
     <ClCompile Include="winlvm_gate.c" />

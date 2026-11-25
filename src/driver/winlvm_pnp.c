@@ -1,39 +1,8 @@
 /*
- * winlvm_pnp.c — Bus FDO PnP lifecycle, BusRelations enumeration, PV tag
- *                cleanup, and live child geometry reconciliation.
+ * winlvm_pnp.c — Bus FDO PnP lifecycle, BusRelations enumeration,
+ *                and live child geometry reconciliation.
  */
 #include "winlvm.h"
-
-void WinLvmBusResetInactiveRecords(WINLVM_BUS_EXT *bus) {
-    if (!bus) return;
-    WINLVM_PV_TAG *tags[WL_VG_MAX * WL_VG_MAX_PVS];
-    size_t tag_count = 0;
-    WINLVM_VIEW_BLOCK *views[WL_VG_MAX];
-    size_t view_count = 0;
-
-    KIRQL old;
-    KeAcquireSpinLock(&bus->lock, &old);
-    for (size_t i = 0; i < WL_VG_MAX; i++) {
-        wl_vg_record *r = &bus->vg_records[i];
-        if (r->vg_uuid[0] != '\0' && r->refs == 0) {
-            for (size_t p = 0; p < r->pv_count && p < WL_VG_MAX_PVS; p++) {
-                if (r->pv_tag[p] && tag_count < WL_VG_MAX * WL_VG_MAX_PVS) {
-                    tags[tag_count++] = (WINLVM_PV_TAG *)r->pv_tag[p];
-                    r->pv_tag[p] = NULL;
-                }
-            }
-            if (bus->vg_views[i] && view_count < WL_VG_MAX) {
-                views[view_count++] = bus->vg_views[i];
-                bus->vg_views[i] = NULL;
-            }
-            RtlZeroMemory(r, sizeof(*r));
-        }
-    }
-    KeReleaseSpinLock(&bus->lock, old);
-
-    for (size_t i = 0; i < tag_count; i++) WinLvmFreePvTag(tags[i]);
-    for (size_t i = 0; i < view_count; i++) ExFreePoolWithTag(views[i], WINLVM_WIN_TAG);
-}
 
 BOOLEAN WinLvmQuiesceRecordChildren(WINLVM_BUS_EXT *bus, const wl_vg_record *r,
                                     PDEVICE_OBJECT *out_pdos, size_t *out_count) {
@@ -168,93 +137,100 @@ void WinLvmSwapRecordViewLocked(wl_vg_record *r,
     r->stale = 0;
 }
 
-void WinLvmReconcileChildrenLocked(WINLVM_BUS_EXT *bus, wl_vg_record *r,
-                                   WINLVM_RECONCILE_DROPS *drops) {
+BOOLEAN WinLvmReconcileSingleChildLocked(wl_vg_record *r, WINLVM_LV_EXT *lext,
+                                         WINLVM_RECONCILE_DROPS *drops) {
     const lvmcore_volume_group *v = r ? r->view : NULL;
-    if (!bus || !r || !v || !v->lvs) return;
+    if (!r || !v || !v->lvs || !lext) return FALSE;
 
-    for (size_t c = 0; c < bus->child_count; c++) {
-        WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;
-        if (lext->record != r) continue;
+    size_t match = SIZE_MAX;
+    for (size_t k = 0; k < v->lv_count; k++) {
+        if (RtlEqualMemory(v->lvs[k].id, lext->lv_uuid, 32)) { match = k; break; }
+    }
+    size_t slots[WL_VG_MAX_PVS];
+    size_t slot_count = 0;
+    ULONG max_stack = 0, max_logical = 512, max_physical = 512;
+    uint64_t new_size = (match != SIZE_MAX) ? wl_lv_byte_size(v, match) : 0;
 
-        size_t match = SIZE_MAX;
-        for (size_t k = 0; k < v->lv_count; k++) {
-            if (RtlEqualMemory(v->lvs[k].id, lext->lv_uuid, 32)) { match = k; break; }
-        }
-        size_t slots[WL_VG_MAX_PVS];
-        size_t slot_count = 0;
-        ULONG max_stack = 0, max_logical = 512, max_physical = 512;
-        uint64_t new_size = (match != SIZE_MAX) ? wl_lv_byte_size(v, match) : 0;
+    if (match == SIZE_MAX || new_size == 0 ||
+        !wl_vg_lv_child_eligible(&v->lvs[match]) ||
+        !wl_vg_lv_pv_complete(r, match) ||
+        !WinLvmCollectLvBackingSlotsLocked(r, match, slots, &slot_count,
+                                           &max_stack, &max_logical, &max_physical)) {
+        lext->unavailable = TRUE;
+        return FALSE;
+    }
 
-        if (match == SIZE_MAX || new_size == 0 ||
-            !wl_vg_lv_child_eligible(&v->lvs[match]) ||
-            !wl_vg_lv_pv_complete(r, match) ||
-            !WinLvmCollectLvBackingSlotsLocked(r, match, slots, &slot_count,
-                                               &max_stack, &max_logical, &max_physical)) {
-            lext->unavailable = TRUE;
-            continue;
-        }
+    PDEVICE_OBJECT new_pdo[WL_VG_MAX_PVS];
+    PFILE_OBJECT new_file[WL_VG_MAX_PVS];
+    ULONG new_logical[WL_VG_MAX_PVS];
+    ULONG new_physical[WL_VG_MAX_PVS];
+    uint32_t new_slot[WL_VG_MAX_PVS];
 
-        PDEVICE_OBJECT new_pdo[WL_VG_MAX_PVS];
-        PFILE_OBJECT new_file[WL_VG_MAX_PVS];
-        ULONG new_logical[WL_VG_MAX_PVS];
-        ULONG new_physical[WL_VG_MAX_PVS];
-        uint32_t new_slot[WL_VG_MAX_PVS];
-
-        for (size_t i = 0; i < lext->backing_count; i++) {
-            BOOLEAN still_used = FALSE;
-            for (size_t j = 0; j < slot_count; j++) {
-                const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)r->pv_tag[slots[j]];
-                if (lext->backing_pdo[i] == tag->backing_pdo &&
-                    lext->backing_file[i] == tag->backing_file) {
-                    still_used = TRUE;
-                    break;
-                }
-            }
-            if (!still_used && drops && drops->count < WL_MAX_DROPPED_REFS) {
-                drops->pdos[drops->count] = lext->backing_pdo[i];
-                drops->files[drops->count] = lext->backing_file[i];
-                drops->count++;
-            }
-        }
-
+    for (size_t i = 0; i < lext->backing_count; i++) {
+        BOOLEAN still_used = FALSE;
         for (size_t j = 0; j < slot_count; j++) {
             const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)r->pv_tag[slots[j]];
-            BOOLEAN was_used = FALSE;
-            for (size_t i = 0; i < lext->backing_count; i++) {
-                if (lext->backing_pdo[i] == tag->backing_pdo &&
-                    lext->backing_file[i] == tag->backing_file) {
-                    was_used = TRUE;
-                    break;
-                }
+            if (lext->backing_pdo[i] == tag->backing_pdo &&
+                lext->backing_file[i] == tag->backing_file) {
+                still_used = TRUE;
+                break;
             }
-            if (!was_used) {
-                ObReferenceObject(tag->backing_pdo);
-                ObReferenceObject(tag->backing_file);
-            }
-            new_pdo[j] = tag->backing_pdo;
-            new_file[j] = tag->backing_file;
-            new_logical[j] = tag->logical_sector;
-            new_physical[j] = tag->physical_sector;
-            new_slot[j] = (uint32_t)slots[j];
         }
+        if (!still_used && drops && drops->count < WL_MAX_DROPPED_REFS) {
+            drops->pdos[drops->count] = lext->backing_pdo[i];
+            drops->files[drops->count] = lext->backing_file[i];
+            drops->count++;
+        }
+    }
 
-        for (size_t j = 0; j < slot_count; j++) {
-            lext->backing_pdo[j] = new_pdo[j];
-            lext->backing_file[j] = new_file[j];
-            lext->backing_logical[j] = new_logical[j];
-            lext->backing_physical[j] = new_physical[j];
-            lext->pv_slot[j] = new_slot[j];
+    for (size_t j = 0; j < slot_count; j++) {
+        const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)r->pv_tag[slots[j]];
+        BOOLEAN was_used = FALSE;
+        for (size_t i = 0; i < lext->backing_count; i++) {
+            if (lext->backing_pdo[i] == tag->backing_pdo &&
+                lext->backing_file[i] == tag->backing_file) {
+                was_used = TRUE;
+                break;
+            }
         }
-        lext->backing_count = slot_count;
-        lext->lv_index = match;
-        lext->byte_size = new_size;
-        lext->logical_sector = max_logical;
-        lext->physical_sector = max_physical;
-        lext->read_only = WinLvmComputeLvReadOnly(r, match, slots, slot_count);
-        lext->unavailable = FALSE;
-        lext->pdo->SectorSize = (USHORT)max_logical;
-        if (max_stack > 0) lext->pdo->StackSize = (UCHAR)(max_stack + 1);
+        if (!was_used) {
+            ObReferenceObject(tag->backing_pdo);
+            ObReferenceObject(tag->backing_file);
+        }
+        new_pdo[j] = tag->backing_pdo;
+        new_file[j] = tag->backing_file;
+        new_logical[j] = tag->logical_sector;
+        new_physical[j] = tag->physical_sector;
+        new_slot[j] = (uint32_t)slots[j];
+    }
+
+    for (size_t j = 0; j < slot_count; j++) {
+        lext->backing_pdo[j] = new_pdo[j];
+        lext->backing_file[j] = new_file[j];
+        lext->backing_logical[j] = new_logical[j];
+        lext->backing_physical[j] = new_physical[j];
+        lext->pv_slot[j] = new_slot[j];
+    }
+    lext->backing_count = slot_count;
+    lext->lv_index = match;
+    lext->byte_size = new_size;
+    lext->logical_sector = max_logical;
+    lext->physical_sector = max_physical;
+    lext->read_only = WinLvmComputeLvReadOnly(r, match, slots, slot_count);
+    lext->unavailable = FALSE;
+    lext->pdo->SectorSize = (USHORT)max_logical;
+    if (max_stack > 0) lext->pdo->StackSize = (UCHAR)(max_stack + 1);
+    return TRUE;
+}
+
+void WinLvmReconcileChildrenLocked(WINLVM_BUS_EXT *bus, wl_vg_record *r,
+                                   WINLVM_RECONCILE_DROPS *drops) {
+    if (!bus || !r || !r->view || !r->view->lvs) return;
+    for (size_t c = 0; c < bus->child_count; c++) {
+        WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;
+        if (lext->record == r) {
+            (void)WinLvmReconcileSingleChildLocked(r, lext, drops);
+        }
     }
 }
 
@@ -369,12 +345,12 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         NTSTATUS st = IoCallDriver(ext->bus_pdo, Irp);
         if (st == STATUS_PENDING) {
             KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-            st = Irp->IoStatus.Status;
         }
+        st = Irp->IoStatus.Status;
         if (NT_SUCCESS(st)) {
             WinLvmWmiInit(DeviceObject);
-            WinLvmProbeSubsystemResume();
-            WinLvmRegisterDiskNotifyDeferred(DeviceObject->DriverObject);
+            WinLvmProbeSubsystemResume(DeviceObject);
+            WinLvmRegisterDiskNotifyDeferred(DeviceObject);
         }
         Irp->IoStatus.Status = st;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -399,6 +375,8 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         size_t tag_count = 0;
         WINLVM_VIEW_BLOCK *views[WL_VG_MAX];
         size_t view_count = 0;
+        PWCHAR recent_bufs[WL_MAX_RECENT_PV_PATHS];
+        size_t recent_count = 0;
 
         KIRQL old;
         KeAcquireSpinLock(&ext->lock, &old);
@@ -421,12 +399,14 @@ NTSTATUS WinLvmBusPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             }
             RtlZeroMemory(r, sizeof(*r));
         }
+        WinLvmFreeRecentPvPathsLocked(ext, recent_bufs, &recent_count);
         if (g_bus_ext == ext) g_bus_ext = NULL;
         KeReleaseSpinLock(&ext->lock, old);
 
         for (size_t i = 0; i < remaining_count; i++) WinLvmDeleteLvPdo(remaining_children[i]);
         for (size_t i = 0; i < tag_count; i++) WinLvmFreePvTag(tags[i]);
         for (size_t i = 0; i < view_count; i++) ExFreePoolWithTag(views[i], WINLVM_WIN_TAG);
+        for (size_t i = 0; i < recent_count; i++) ExFreePoolWithTag(recent_bufs[i], WINLVM_WIN_TAG);
 
         WinLvmDeleteControlDevice();
         WinLvmWmiDeregister(DeviceObject);
@@ -453,7 +433,7 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
-    WinLvmProbeSubsystemResume();
+    WinLvmProbeSubsystemResume(NULL);
     NTSTATUS status = WinLvmCreateControlDevice(DriverObject);
     if (!NT_SUCCESS(status)) return status;
 
@@ -471,6 +451,8 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
     ext->kind = WL_EXT_BUS;
     ext->fdo = fdo;
     ext->pdo = PhysicalDeviceObject;
+    ext->system_power_state = PowerSystemWorking;
+    ext->device_power_state = PowerDeviceD0;
     KeInitializeSpinLock(&ext->lock);
     wl_vg_registry_init(ext->vg_records, WL_VG_MAX);
 
@@ -482,7 +464,11 @@ NTSTATUS WinLvmAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDev
     }
 
     g_bus_ext = ext;
+    WinLvmProbeSubsystemResume(fdo);
     fdo->Flags |= DO_BUFFERED_IO;
+    if (PhysicalDeviceObject->Flags & DO_POWER_PAGABLE) {
+        fdo->Flags |= DO_POWER_PAGABLE;
+    }
     fdo->Flags &= ~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;
 }
