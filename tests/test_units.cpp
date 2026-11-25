@@ -501,7 +501,7 @@ vgfull {
   CHECK(vg2->find_lv("lvthin")->tags == vg1->find_lv("lvthin")->tags);
   CHECK_EQ(vg2->find_lv("lvthin")->segments[0].device_id, std::uint64_t{7});
   CHECK_EQ(vg2->find_lv("tpool")->segments[0].chunk_size_sectors, std::uint64_t{128});
-  CHECK_EQ(vg2->find_lv("lvraid")->segments[0].raid_legs.size(), std::size_t{2});
+  CHECK_EQ(vg2->find_lv("lvraid")->segments[0].raids.size(), std::size_t{4});
 }
 
 TEST(circular_mda_ring_wraps_across_boundary_and_stays_valid) {

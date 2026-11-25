@@ -365,13 +365,13 @@ TEST(corpus_tags_and_complex_fixtures_parse_cleanly) {
   CHECK(vg_thin.find_lv("tpool")->is_thin_pool);
   CHECK(vg_thin.find_lv("lvthin")->supported);
   CHECK(vg_thin.find_lv("lvthinsnap")->supported);
-  CHECK_EQ(vg_thin.find_lv("lvthinsnap")->segments[0].origin, std::string("lvthin"));
+  CHECK_EQ(vg_thin.find_lv("lvthinsnap")->segments[0].origin_lv, std::string("lvthin"));
 
   const auto vg_raid = load_vg_from_metadata_text("raid1-mirror");
   CHECK(vg_raid.find_lv("lvraid1")->supported);
   CHECK(vg_raid.find_lv("lvmirror")->supported);
   CHECK(vg_raid.find_lv("lvmirlog")->supported);
-  CHECK_EQ(vg_raid.find_lv("lvmirlog")->segments[0].mirror_log, std::string("lvmirlog_mlog"));
+  CHECK_EQ(vg_raid.find_lv("lvmirlog")->segments[0].mirror_log_lv, std::string("lvmirlog_mlog"));
 }
 
 // ===========================================================================

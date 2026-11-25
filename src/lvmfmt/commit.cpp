@@ -91,8 +91,15 @@ void write_string_array(std::ostringstream& ss,
 
 void write_status_array(std::ostringstream& ss,
                         const std::vector<std::string>& status,
+                        bool has_explicit_status,
                         const std::vector<std::string>& fallback) {
-  write_string_array(ss, "status", status.empty() ? fallback : status);
+  const auto& list = (!has_explicit_status && status.empty()) ? fallback : status;
+  write_string_array(ss, "status", list);
+}
+
+void write_tags_array(std::ostringstream& ss, const std::vector<std::string>& tags) {
+  if (tags.empty()) return;
+  write_string_array(ss, "tags", tags);
 }
 
 bool validate_vg_serializable(const VolumeGroup& vg, std::string& error) {
@@ -109,10 +116,58 @@ bool validate_vg_serializable(const VolumeGroup& vg, std::string& error) {
     return false;
   }
 
+  // Collect sub-volumes referenced by serializable composite LVs so unknown
+  // internal LVs from unsupported layouts (e.g. cache, raid5) fail closed.
+  std::vector<std::string> allowed_internals;
+  auto mark_internal = [&](const std::string& name) {
+    if (!name.empty()) allowed_internals.push_back(name);
+  };
+  for (const auto& lv : vg.lvs) {
+    for (const auto& seg : lv.segments) {
+      if (seg.type == "thin-pool") {
+        mark_internal(seg.metadata_lv);
+        mark_internal(seg.pool_lv);
+      } else if (seg.type == "snapshot") {
+        mark_internal(lv.name);
+        mark_internal(seg.cow_store_lv);
+      } else if (seg.type == "raid1") {
+        for (const auto& r : seg.raids) mark_internal(r);
+      } else if (seg.type == "mirror") {
+        for (const auto& m : seg.mirrors) mark_internal(m.target);
+        mark_internal(seg.mirror_log_lv);
+      }
+    }
+  }
+  auto is_allowed_internal = [&](const std::string& name) {
+    if (std::find(allowed_internals.begin(), allowed_internals.end(), name) !=
+        allowed_internals.end()) {
+      return true;
+    }
+    constexpr std::string_view kPmspare = "_pmspare";
+    return name.size() > kPmspare.size() &&
+           name.compare(name.size() - kPmspare.size(), kPmspare.size(), kPmspare) == 0;
+  };
+
+  static const char* const kBlockedStatus[] = {
+      "PVMOVE", "LOCKED", "CONVERTING", "MERGING", "VIRTUAL",
+  };
+
   for (const auto& lv : vg.lvs) {
     if (!lv.supported) {
       error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name + "' is unsupported (" +
               (lv.unsupported_reason.empty() ? "unknown layout" : lv.unsupported_reason) + ")";
+      return false;
+    }
+    for (const char* flag : kBlockedStatus) {
+      if (std::find(lv.status.begin(), lv.status.end(), flag) != lv.status.end()) {
+        error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                "' has unsupported status '" + flag + "'";
+        return false;
+      }
+    }
+    if (lv.internal && !is_allowed_internal(lv.name)) {
+      error = "refusing to serialize VG '" + vg.name + "': contains internal LV '" + lv.name +
+              "' from an unsupported volume layout";
       return false;
     }
     if (lv.segments.empty()) {
@@ -140,27 +195,58 @@ bool validate_vg_serializable(const VolumeGroup& vg, std::string& error) {
           }
         }
       } else if (seg.type == "thin-pool") {
-        if (seg.metadata_lv.empty() || seg.pool_lv.empty() || seg.chunk_size_sectors == 0) {
-          error = "refusing to serialize VG '" + vg.name + "': thin-pool LV '" + lv.name +
-                  "' missing metadata, pool, or chunk_size";
+        if (seg.metadata_lv.empty() || seg.pool_lv.empty() || seg.chunk_size_sectors == 0 ||
+            !vg.find_lv(seg.metadata_lv) || !vg.find_lv(seg.pool_lv)) {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has incomplete thin-pool segment metadata";
           return false;
         }
       } else if (seg.type == "thin") {
-        if (seg.pool_lv.empty() || !seg.has_device_id) {
-          error = "refusing to serialize VG '" + vg.name + "': thin LV '" + lv.name +
-                  "' missing thin_pool or device_id";
+        const LogicalVolume* pool = seg.pool_lv.empty() ? nullptr : vg.find_lv(seg.pool_lv);
+        if (!pool || seg.device_id == 0 || pool->segments.empty() ||
+            pool->segments[0].type != "thin-pool") {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has incomplete thin segment metadata";
           return false;
         }
       } else if (seg.type == "snapshot") {
-        if (seg.origin.empty() || seg.cow_store.empty() || seg.chunk_size_sectors == 0) {
-          error = "refusing to serialize VG '" + vg.name + "': snapshot LV '" + lv.name +
-                  "' missing origin, cow_store, or chunk_size";
+        if (seg.origin_lv.empty() || seg.cow_store_lv.empty() || seg.chunk_size_sectors == 0 ||
+            !vg.find_lv(seg.origin_lv) || !vg.find_lv(seg.cow_store_lv)) {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has incomplete snapshot segment metadata";
           return false;
         }
-      } else if (seg.type == "raid1" || seg.type == "mirror") {
-        if (seg.raid_legs.empty()) {
-          error = "refusing to serialize VG '" + vg.name + "': " + seg.type + " LV '" + lv.name +
-                  "' has no legs";
+      } else if (seg.type == "raid1") {
+        const std::uint64_t dc = seg.device_count ? seg.device_count : (seg.raids.size() / 2);
+        if (dc < 2 || seg.raids.size() != dc * 2) {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has invalid raid1 segment metadata";
+          return false;
+        }
+        for (const auto& r : seg.raids) {
+          if (!vg.find_lv(r)) {
+            error = "refusing to serialize VG '" + vg.name + "': raid1 LV '" + lv.name +
+                    "' references missing sub-LV '" + r + "'";
+            return false;
+          }
+        }
+      } else if (seg.type == "mirror") {
+        const std::uint64_t mc = seg.mirror_count ? seg.mirror_count : seg.mirrors.size();
+        if (mc < 2 || seg.mirrors.size() != mc) {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has invalid mirror segment metadata";
+          return false;
+        }
+        for (const auto& m : seg.mirrors) {
+          if (!vg.find_lv(m.target)) {
+            error = "refusing to serialize VG '" + vg.name + "': mirror LV '" + lv.name +
+                    "' references missing sub-LV '" + m.target + "'";
+            return false;
+          }
+        }
+        if (!seg.mirror_log_lv.empty() && !vg.find_lv(seg.mirror_log_lv)) {
+          error = "refusing to serialize VG '" + vg.name + "': mirror LV '" + lv.name +
+                  "' references missing log LV '" + seg.mirror_log_lv + "'";
           return false;
         }
       } else {
@@ -263,11 +349,9 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
   ss << "id = \"" << escape_lvm_string(format_uuid_canonical(vg.id)) << "\"\n";
   ss << "seqno = " << vg.seqno << "\n";
   ss << "format = \"lvm2\"\n";
-  write_status_array(ss, vg.status, kDefaultVgStatus);
+  write_status_array(ss, vg.status, vg.has_status, kDefaultVgStatus);
   write_string_array(ss, "flags", vg.flags);
-  if (!vg.tags.empty()) {
-    write_string_array(ss, "tags", vg.tags);
-  }
+  write_tags_array(ss, vg.tags);
   if (!vg.system_id.empty()) {
     ss << "system_id = \"" << escape_lvm_string(vg.system_id) << "\"\n";
   }
@@ -282,11 +366,9 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
     ss << "id = \"" << escape_lvm_string(format_uuid_canonical(pv.id)) << "\"\n";
     const std::string dev_hint = pv.device.empty() ? "/dev/unknown" : pv.device;
     ss << "device = \"" << escape_lvm_string(dev_hint) << "\"\n";
-    write_status_array(ss, pv.status, kDefaultPvStatus);
+    write_status_array(ss, pv.status, pv.has_status, kDefaultPvStatus);
     write_string_array(ss, "flags", pv.flags);
-    if (!pv.tags.empty()) {
-      write_string_array(ss, "tags", pv.tags);
-    }
+    write_tags_array(ss, pv.tags);
     ss << "dev_size = " << pv.dev_size_sectors << "\n";
     ss << "pe_start = " << pv.pe_start_sectors << "\n";
     ss << "pe_count = " << pv.pe_count << "\n";
@@ -299,13 +381,12 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
     for (const auto& lv : vg.lvs) {
       ss << "\n" << lv.name << " {\n";
       ss << "id = \"" << escape_lvm_string(format_uuid_canonical(lv.id)) << "\"\n";
-      write_status_array(ss, lv.status, kDefaultLvStatus);
+      write_status_array(ss, lv.status, lv.has_status, kDefaultLvStatus);
       write_string_array(ss, "flags", lv.flags);
-      if (!lv.tags.empty()) {
-        write_string_array(ss, "tags", lv.tags);
-      }
-      ss << "creation_time = " << now << "\n";
-      ss << "creation_host = \"winlvm\"\n";
+      write_tags_array(ss, lv.tags);
+      ss << "creation_time = " << (lv.creation_time ? lv.creation_time : static_cast<std::uint64_t>(now)) << "\n";
+      ss << "creation_host = \""
+         << escape_lvm_string(lv.creation_host.empty() ? "winlvm" : lv.creation_host) << "\"\n";
       ss << "segment_count = " << lv.segments.size() << "\n\n";
 
       std::size_t seg_idx = 1;
@@ -313,55 +394,7 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
         ss << "segment" << seg_idx++ << " {\n";
         ss << "start_extent = " << seg.start_extent << "\n";
         ss << "extent_count = " << seg.extent_count << "\n";
-        if (seg.type == "thin-pool") {
-          ss << "type = \"thin-pool\"\n";
-          ss << "metadata = \"" << escape_lvm_string(seg.metadata_lv) << "\"\n";
-          ss << "pool = \"" << escape_lvm_string(seg.pool_lv) << "\"\n";
-          if (seg.has_transaction_id) ss << "transaction_id = " << seg.transaction_id << "\n";
-          ss << "chunk_size = " << seg.chunk_size_sectors << "\n";
-          if (!seg.discards.empty()) ss << "discards = \"" << escape_lvm_string(seg.discards) << "\"\n";
-          if (seg.has_zero_new_blocks) ss << "zero_new_blocks = " << (seg.zero_new_blocks ? 1 : 0) << "\n";
-        } else if (seg.type == "thin") {
-          ss << "type = \"thin\"\n";
-          ss << "thin_pool = \"" << escape_lvm_string(seg.pool_lv) << "\"\n";
-          if (seg.has_transaction_id) ss << "transaction_id = " << seg.transaction_id << "\n";
-          ss << "device_id = " << seg.device_id << "\n";
-          if (!seg.origin.empty()) ss << "origin = \"" << escape_lvm_string(seg.origin) << "\"\n";
-        } else if (seg.type == "snapshot") {
-          ss << "type = \"snapshot\"\n";
-          ss << "chunk_size = " << seg.chunk_size_sectors << "\n";
-          ss << "origin = \"" << escape_lvm_string(seg.origin) << "\"\n";
-          ss << "cow_store = \"" << escape_lvm_string(seg.cow_store) << "\"\n";
-        } else if (seg.type == "raid1") {
-          const std::uint64_t dc = seg.device_count ? seg.device_count : seg.raid_legs.size();
-          ss << "type = \"raid1\"\n";
-          ss << "device_count = " << dc << "\n";
-          if (seg.region_size_sectors > 0) ss << "region_size = " << seg.region_size_sectors << "\n";
-          ss << "raids = [\n";
-          for (std::size_t r = 0; r < seg.raid_legs.size(); ++r) {
-            ss << "\"" << escape_lvm_string(seg.raid_legs[r].meta_lv) << "\", \""
-               << escape_lvm_string(seg.raid_legs[r].image_lv) << "\"";
-            if (r + 1 < seg.raid_legs.size()) ss << ",\n";
-            else ss << "\n";
-          }
-          ss << "]\n";
-        } else if (seg.type == "mirror") {
-          const std::uint64_t mc = seg.device_count ? seg.device_count : seg.raid_legs.size();
-          ss << "type = \"mirror\"\n";
-          ss << "mirror_count = " << mc << "\n";
-          if (!seg.mirror_log.empty()) {
-            ss << "mirror_log = \"" << escape_lvm_string(seg.mirror_log) << "\"\n";
-          }
-          if (seg.region_size_sectors > 0) ss << "region_size = " << seg.region_size_sectors << "\n";
-          ss << "mirrors = [\n";
-          for (std::size_t r = 0; r < seg.raid_legs.size(); ++r) {
-            ss << "\"" << escape_lvm_string(seg.raid_legs[r].image_lv) << "\", "
-               << seg.raid_legs[r].start_extent;
-            if (r + 1 < seg.raid_legs.size()) ss << ",\n";
-            else ss << "\n";
-          }
-          ss << "]\n";
-        } else {
+        if (seg.type == "linear" || seg.type == "striped") {
           const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
           ss << "type = \"striped\"\n";
           ss << "stripe_count = " << sc << "\n";
@@ -373,6 +406,57 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
             ss << "\"" << escape_lvm_string(seg.stripes[s].target) << "\", "
                << seg.stripes[s].start_extent;
             if (s + 1 < seg.stripes.size()) ss << ",\n";
+            else ss << "\n";
+          }
+          ss << "]\n";
+        } else if (seg.type == "thin-pool") {
+          ss << "type = \"thin-pool\"\n";
+          ss << "metadata = \"" << escape_lvm_string(seg.metadata_lv) << "\"\n";
+          ss << "pool = \"" << escape_lvm_string(seg.pool_lv) << "\"\n";
+          ss << "transaction_id = " << seg.transaction_id << "\n";
+          ss << "chunk_size = " << seg.chunk_size_sectors << "\n";
+          const std::string discards = seg.discards.empty() ? "passdown" : seg.discards;
+          ss << "discards = \"" << escape_lvm_string(discards) << "\"\n";
+          ss << "zero_new_blocks = " << (seg.zero_new_blocks ? 1 : 0) << "\n";
+        } else if (seg.type == "thin") {
+          ss << "type = \"thin\"\n";
+          ss << "thin_pool = \"" << escape_lvm_string(seg.pool_lv) << "\"\n";
+          ss << "transaction_id = " << seg.transaction_id << "\n";
+          ss << "device_id = " << seg.device_id << "\n";
+          if (!seg.origin_lv.empty()) {
+            ss << "origin = \"" << escape_lvm_string(seg.origin_lv) << "\"\n";
+          }
+        } else if (seg.type == "snapshot") {
+          ss << "type = \"snapshot\"\n";
+          ss << "chunk_size = " << seg.chunk_size_sectors << "\n";
+          ss << "origin = \"" << escape_lvm_string(seg.origin_lv) << "\"\n";
+          ss << "cow_store = \"" << escape_lvm_string(seg.cow_store_lv) << "\"\n";
+        } else if (seg.type == "raid1") {
+          const std::uint64_t dc = seg.device_count ? seg.device_count : (seg.raids.size() / 2);
+          ss << "type = \"raid1\"\n";
+          ss << "device_count = " << dc << "\n";
+          ss << "region_size = " << (seg.region_size_sectors ? seg.region_size_sectors : 4096ULL) << "\n";
+          ss << "raids = [\n";
+          for (std::size_t r = 0; r + 1 < seg.raids.size(); r += 2) {
+            ss << "\"" << escape_lvm_string(seg.raids[r]) << "\", \""
+               << escape_lvm_string(seg.raids[r + 1]) << "\"";
+            if (r + 2 < seg.raids.size()) ss << ",\n";
+            else ss << "\n";
+          }
+          ss << "]\n";
+        } else if (seg.type == "mirror") {
+          const std::uint64_t mc = seg.mirror_count ? seg.mirror_count : seg.mirrors.size();
+          ss << "type = \"mirror\"\n";
+          ss << "mirror_count = " << mc << "\n";
+          ss << "region_size = " << (seg.region_size_sectors ? seg.region_size_sectors : 4096ULL) << "\n";
+          if (!seg.mirror_log_lv.empty()) {
+            ss << "mirror_log = \"" << escape_lvm_string(seg.mirror_log_lv) << "\"\n";
+          }
+          ss << "mirrors = [\n";
+          for (std::size_t m = 0; m < seg.mirrors.size(); ++m) {
+            ss << "\"" << escape_lvm_string(seg.mirrors[m].target) << "\", "
+               << seg.mirrors[m].start_extent;
+            if (m + 1 < seg.mirrors.size()) ss << ",\n";
             else ss << "\n";
           }
           ss << "]\n";

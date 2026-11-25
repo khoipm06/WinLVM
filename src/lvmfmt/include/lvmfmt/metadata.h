@@ -19,12 +19,6 @@ struct SegmentStripe {
   std::uint64_t start_extent = 0;
 };
 
-struct RaidLeg {
-  std::string meta_lv;            // raid1: "<lv>_rmeta_N" (empty for mirror)
-  std::string image_lv;           // raid1: "<lv>_rimage_N"; mirror: "<lv>_mimage_N"
-  std::uint64_t start_extent = 0; // mirror leg start extent (typically 0)
-};
-
 struct Segment {
   std::uint64_t start_extent = 0;
   std::uint64_t extent_count = 0;
@@ -33,31 +27,36 @@ struct Segment {
   std::uint64_t stripe_size_sectors = 0;
   std::vector<SegmentStripe> stripes;
 
-  // Structured fields for thin-pool, thin, snapshot, raid1, and mirror.
-  std::string metadata_lv;             // thin-pool: metadata = "<tmeta_lv>"
-  std::string pool_lv;                 // thin-pool: pool = "<tdata_lv>"; thin: thin_pool = "<pool_lv>"
-  std::uint64_t chunk_size_sectors = 0;// thin-pool & snapshot: chunk_size (512B sectors)
-  std::uint64_t transaction_id = 0;    // thin-pool & thin
+  // Extended layout fields (thin-pool, thin, snapshot, raid1, mirror).
+  std::string metadata_lv;                // thin-pool: metadata = "<pool>_tmeta"
+  std::string pool_lv;                    // thin-pool: pool = "<pool>_tdata"; thin: thin_pool = "<pool>"
+  std::uint64_t transaction_id = 0;       // thin-pool / thin
   bool has_transaction_id = false;
-  bool zero_new_blocks = true;         // thin-pool
+  std::uint64_t chunk_size_sectors = 0;   // thin-pool / snapshot (512B sectors)
+  std::string discards;                   // thin-pool: "passdown" | "nopassdown" | "ignore"
+  bool zero_new_blocks = true;            // thin-pool
   bool has_zero_new_blocks = false;
-  std::string discards;                // thin-pool: "passdown", "ignore", "nopassdown"
-  std::uint64_t device_id = 0;         // thin
+  std::uint64_t device_id = 0;            // thin
   bool has_device_id = false;
-  std::string origin;                  // snapshot & thin snapshot
-  std::string cow_store;               // snapshot: cow_store / cow
-  std::uint64_t region_size_sectors = 0;// raid1 & mirror
-  std::uint64_t device_count = 0;      // raid1: device_count / raid_count; mirror: mirror_count
-  std::string mirror_log;              // mirror: mirror_log
-  std::vector<RaidLeg> raid_legs;      // raid1: raids = [...]; mirror: mirrors = [...]
+  std::string origin_lv;                  // snapshot / thin snapshot
+  std::string cow_store_lv;               // snapshot: cow_store / cow
+  std::uint64_t device_count = 0;         // raid1
+  std::uint64_t mirror_count = 0;         // mirror
+  std::uint64_t region_size_sectors = 0;  // raid1 / mirror
+  std::string mirror_log_lv;              // mirror (empty = core log)
+  std::vector<std::string> raids;         // raid1: [rmeta_0, rimage_0, rmeta_1, rimage_1, ...]
+  std::vector<SegmentStripe> mirrors;     // mirror: [(mimage_0, 0), (mimage_1, 0), ...]
 };
 
 struct LogicalVolume {
   std::string name;
   std::string id;                 // raw 32-char or canonical dashed UUID
   std::vector<std::string> status;
+  bool has_status = false;
   std::vector<std::string> flags;
   std::vector<std::string> tags;
+  std::uint64_t creation_time = 0;
+  std::string creation_host;
   std::vector<Segment> segments;
 
   // Set when this LV cannot be mapped by winlvm (e.g., raid5, cache, vdo).
@@ -86,6 +85,7 @@ struct PhysicalVolume {
   std::uint64_t pe_count = 0;
   std::uint64_t dev_size_sectors = 0;
   std::vector<std::string> status;
+  bool has_status = false;
   std::vector<std::string> flags;
   std::vector<std::string> tags;
 
@@ -100,6 +100,7 @@ struct VolumeGroup {
   std::uint64_t extent_size_sectors = 0;
   std::string system_id;
   std::vector<std::string> status;
+  bool has_status = false;
   std::vector<std::string> flags;
   std::vector<std::string> tags;
   std::vector<PhysicalVolume> pvs;

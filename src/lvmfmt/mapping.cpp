@@ -34,9 +34,9 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
       return std::nullopt;
     }
     const Segment& wseg = wrap->segments[0];
-    const LogicalVolume* orig = vg.find_lv(wseg.origin);
+    const LogicalVolume* orig = vg.find_lv(wseg.origin_lv);
     if (!orig) {
-      error = "snapshot origin '" + wseg.origin + "' not found";
+      error = "snapshot origin '" + wseg.origin_lv + "' not found";
       return std::nullopt;
     }
     const auto len_sec = extents_to_sectors(orig->extent_count(), vg.extent_size_sectors);
@@ -49,7 +49,7 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
     t.length_sectors = *len_sec;
     t.type = "snapshot";
     t.chunk_sectors = wseg.chunk_size_sectors;
-    t.origin_lv = wseg.origin;
+    t.origin_lv = wseg.origin_lv;
     t.cow_lv = lv.name;
     return std::vector<DmTarget>{std::move(t)};
   }
@@ -91,7 +91,8 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
     }
 
     if (seg.type == "thin") {
-      if (seg.pool_lv.empty() || !seg.has_device_id || !vg.find_lv(seg.pool_lv)) {
+      if (seg.pool_lv.empty() || (seg.device_id == 0 && !seg.has_device_id) ||
+          !vg.find_lv(seg.pool_lv)) {
         error = "thin segment references missing thin-pool '" + seg.pool_lv + "'";
         return std::nullopt;
       }
@@ -107,8 +108,8 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
     }
 
     if (seg.type == "snapshot") {
-      if (seg.origin.empty() || seg.cow_store.empty() || seg.chunk_size_sectors == 0 ||
-          !vg.find_lv(seg.origin) || !vg.find_lv(seg.cow_store)) {
+      if (seg.origin_lv.empty() || seg.cow_store_lv.empty() || seg.chunk_size_sectors == 0 ||
+          !vg.find_lv(seg.origin_lv) || !vg.find_lv(seg.cow_store_lv)) {
         error = "snapshot segment missing origin, cow_store, or chunk_size";
         return std::nullopt;
       }
@@ -116,17 +117,17 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
       target.start_sector = *start_sector;
       target.length_sectors = *length_sector;
       target.type = "snapshot";
-      target.origin_lv = seg.origin;
-      target.cow_lv = seg.cow_store;
+      target.origin_lv = seg.origin_lv;
+      target.cow_lv = seg.cow_store_lv;
       target.chunk_sectors = seg.chunk_size_sectors;
       table.push_back(std::move(target));
       expected_start = seg.start_extent + seg.extent_count;
       continue;
     }
 
-    if (seg.type == "raid1" || seg.type == "mirror") {
-      if (seg.raid_legs.empty()) {
-        error = seg.type + " segment has no legs";
+    if (seg.type == "raid1") {
+      if (seg.raids.size() < 2 || (seg.raids.size() % 2) != 0) {
+        error = "raid1 segment has invalid leg list";
         return std::nullopt;
       }
       DmTarget target;
@@ -134,10 +135,25 @@ std::optional<std::vector<DmTarget>> build_dm_table(const VolumeGroup& vg,
       target.length_sectors = *length_sector;
       target.type = seg.type;
       target.region_size_sectors = seg.region_size_sectors;
-      target.mirror_log = seg.mirror_log;
-      for (const auto& leg : seg.raid_legs) {
-        if (!leg.meta_lv.empty()) target.sub_lvs.push_back(leg.meta_lv);
-        target.sub_lvs.push_back(leg.image_lv);
+      target.sub_lvs = seg.raids;
+      table.push_back(std::move(target));
+      expected_start = seg.start_extent + seg.extent_count;
+      continue;
+    }
+
+    if (seg.type == "mirror") {
+      if (seg.mirrors.empty()) {
+        error = "mirror segment has no legs";
+        return std::nullopt;
+      }
+      DmTarget target;
+      target.start_sector = *start_sector;
+      target.length_sectors = *length_sector;
+      target.type = seg.type;
+      target.region_size_sectors = seg.region_size_sectors;
+      target.mirror_log = seg.mirror_log_lv;
+      for (const auto& m : seg.mirrors) {
+        target.sub_lvs.push_back(m.target);
       }
       table.push_back(std::move(target));
       expected_start = seg.start_extent + seg.extent_count;

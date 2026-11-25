@@ -565,6 +565,31 @@ bool reduce_lv(VolumeGroup& vg,
     error = "logical volume not found: " + std::string(lv_name);
     return false;
   }
+  if (!target->supported) {
+    error = "cannot reduce unsupported logical volume: " +
+            (target->unsupported_reason.empty() ? "composite or non-mappable layout"
+                                                : target->unsupported_reason);
+    return false;
+  }
+  if (target->internal) {
+    error = "cannot reduce internal logical volume: " + std::string(lv_name);
+    return false;
+  }
+  for (const auto& seg : target->segments) {
+    if (seg.type != "linear" && seg.type != "striped") {
+      error = "cannot reduce logical volume with segment type '" + seg.type + "'";
+      return false;
+    }
+  }
+  for (const auto& other : vg.lvs) {
+    for (const auto& seg : other.segments) {
+      if (seg.type == "snapshot" &&
+          (seg.origin_lv == target->name || seg.cow_store_lv == target->name)) {
+        error = "cannot reduce snapshot or snapshot origin logical volume: " + target->name;
+        return false;
+      }
+    }
+  }
 
   if (extents_to_remove == 0) return true;
 
@@ -646,10 +671,76 @@ bool move_pv_extents(VolumeGroup& vg,
   const std::uint64_t extent_bytes = vg.extent_size_sectors * 512ULL;
   std::vector<std::uint8_t> buffer(64 * 1024);
 
+  // Build sibling-leg conflict groups for raid1/mirror so pvmove never places
+  // two redundant legs onto the same PV, and reject targeting composite LVs.
+  std::vector<std::vector<std::string>> redundant_groups;
+  for (const auto& lv : vg.lvs) {
+    for (const auto& seg : lv.segments) {
+      if (seg.type == "raid1") {
+        std::vector<std::string> images;
+        std::vector<std::string> metas;
+        for (std::size_t i = 0; i + 1 < seg.raids.size(); i += 2) {
+          metas.push_back(seg.raids[i]);
+          images.push_back(seg.raids[i + 1]);
+        }
+        if (images.size() >= 2) redundant_groups.push_back(std::move(images));
+        if (metas.size() >= 2) redundant_groups.push_back(std::move(metas));
+      } else if (seg.type == "mirror") {
+        std::vector<std::string> images;
+        for (const auto& m : seg.mirrors) images.push_back(m.target);
+        if (images.size() >= 2) redundant_groups.push_back(std::move(images));
+      }
+    }
+  }
+
+  if (target_lv_name) {
+    const LogicalVolume* tlv = vg.find_lv(*target_lv_name);
+    if (!tlv) {
+      error = "logical volume not found: " + std::string(*target_lv_name);
+      return false;
+    }
+    for (const auto& seg : tlv->segments) {
+      if (seg.type != "linear" && seg.type != "striped") {
+        error = "pvmove does not support composite segment type '" + seg.type +
+                "' on logical volume '" + tlv->name + "'";
+        return false;
+      }
+    }
+  }
+
+  auto lv_uses_pv = [&](const std::string& lv_name, const std::string& pv_key) -> bool {
+    const LogicalVolume* lv = vg.find_lv(lv_name);
+    if (!lv) return false;
+    for (const auto& s : lv->segments) {
+      for (const auto& st : s.stripes) {
+        if (st.target == pv_key) return true;
+      }
+    }
+    return false;
+  };
+
+  // Pre-validate that moving extents from src_pv to dst_pv won't colocate redundant legs.
+  for (const auto& lv : vg.lvs) {
+    if (target_lv_name && lv.name != *target_lv_name) continue;
+    if (!lv_uses_pv(lv.name, src_pv->key)) continue;
+    for (const auto& grp : redundant_groups) {
+      if (std::find(grp.begin(), grp.end(), lv.name) == grp.end()) continue;
+      for (const auto& sibling : grp) {
+        if (sibling != lv.name && lv_uses_pv(sibling, dst_pv->key)) {
+          error = "refusing pvmove of '" + lv.name + "' onto '" + dst_pv->key +
+                  "': destination PV already holds redundant leg '" + sibling + "'";
+          return false;
+        }
+      }
+    }
+  }
+
+  std::size_t moved_segments = 0;
   for (auto& lv : vg.lvs) {
     if (target_lv_name && lv.name != *target_lv_name) continue;
 
     for (auto& seg : lv.segments) {
+      if (seg.type != "linear" && seg.type != "striped") continue;
       for (auto& stripe : seg.stripes) {
         if (stripe.target == src_pv->key) {
           const std::uint64_t count =
@@ -706,9 +797,15 @@ bool move_pv_extents(VolumeGroup& vg,
 
           stripe.target = dst_pv->key;
           stripe.start_extent = dst_pe;
+          moved_segments++;
         }
       }
     }
+  }
+
+  if (moved_segments == 0) {
+    error = "no allocated extents found on source PV '" + src_pv->key + "' to move";
+    return false;
   }
 
   vg.seqno++;

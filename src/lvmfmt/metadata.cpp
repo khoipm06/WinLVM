@@ -66,15 +66,15 @@ void parse_segment(const Section& sec, Segment& seg) {
     seg.device_id = *v;
     seg.has_device_id = true;
   }
-  if (auto v = sec.string("origin")) seg.origin = *v;
-  if (auto v = sec.string("cow_store")) seg.cow_store = *v;
-  else if (auto vc = sec.string("cow")) seg.cow_store = *vc;
+  if (auto v = sec.string("origin")) seg.origin_lv = *v;
+  if (auto v = sec.string("cow_store")) seg.cow_store_lv = *v;
+  else if (auto vc = sec.string("cow")) seg.cow_store_lv = *vc;
   if (auto v = non_negative(sec.integer("region_size"))) seg.region_size_sectors = *v;
   if (auto v = non_negative(sec.integer("device_count"))) seg.device_count = *v;
   else if (auto v2 = non_negative(sec.integer("raid_count"))) seg.device_count = *v2;
-  else if (auto v3 = non_negative(sec.integer("mirror_count"))) seg.device_count = *v3;
-  else if (auto v4 = non_negative(sec.integer("area_count"))) seg.device_count = *v4;
-  if (auto v = sec.string("mirror_log")) seg.mirror_log = *v;
+  else if (auto v3 = non_negative(sec.integer("area_count"))) seg.device_count = *v3;
+  if (auto v = non_negative(sec.integer("mirror_count"))) seg.mirror_count = *v;
+  if (auto v = sec.string("mirror_log")) seg.mirror_log_lv = *v;
 
   // `stripes = ["pv0", 0, "pv1", 0]` — alternating target and start extent.
   if (const auto* entry = sec.find_entry("stripes")) {
@@ -88,28 +88,26 @@ void parse_segment(const Section& sec, Segment& seg) {
   }
 
   // `raids = ["lv_rmeta_0", "lv_rimage_0", ...]` — pairs of meta + image sub-LV names.
-  if (const auto* entry = sec.find_entry("raids")) {
-    for (std::size_t i = 0; i + 1 < entry->size(); i += 2) {
-      const Value& meta = (*entry)[i];
-      const Value& img = (*entry)[i + 1];
-      if (!meta.is_string() || !img.is_string()) continue;
-      seg.raid_legs.push_back(RaidLeg{meta.string_value, img.string_value, 0});
-    }
-  }
+  seg.raids = sec.string_list("raids");
 
   // `mirrors = ["lv_mimage_0", 0, "lv_mimage_1", 0]` — alternating image sub-LV and extent.
   if (const auto* entry = sec.find_entry("mirrors")) {
     for (std::size_t i = 0; i + 1 < entry->size(); i += 2) {
-      const Value& img = (*entry)[i];
+      const Value& target = (*entry)[i];
       const Value& start = (*entry)[i + 1];
-      if (!img.is_string() || !start.is_integer() || start.integer_value < 0) continue;
-      seg.raid_legs.push_back(
-          RaidLeg{"", img.string_value, static_cast<std::uint64_t>(start.integer_value)});
+      if (!target.is_string() || !start.is_integer() || start.integer_value < 0) continue;
+      seg.mirrors.push_back(
+          SegmentStripe{target.string_value, static_cast<std::uint64_t>(start.integer_value)});
     }
+  }
+  if (seg.type == "mirror" && seg.mirror_count == 0) {
+    seg.mirror_count = seg.mirrors.size();
   }
 }
 
 // Names this LV's segments point at that are internal sub-volumes (not PVs).
+// "thin_pool" references a top-level thin-pool LV, not an internal sub-volume;
+// only its "metadata" (_tmeta) and "pool" (_tdata) are internal.
 void collect_references(const Section& lv_sec, std::set<std::string>& internal_out) {
   static const char* const kInternalKeys[] = {
       "pool_metadata", "metadata", "pool", "data", "mirror_log",
@@ -159,6 +157,7 @@ bool PhysicalVolume::is_missing() const {
 
 bool PhysicalVolume::is_allocatable() const {
   if (is_missing()) return false;
+  if (has_status) return has_status_flag(status, "ALLOCATABLE");
   return status.empty() || has_status_flag(status, "ALLOCATABLE");
 }
 
@@ -229,6 +228,7 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
   vg.extent_size_sectors = non_negative(vg_sec->integer("extent_size")).value_or(0);
   vg.system_id = vg_sec->string("system_id").value_or("");
   vg.status = vg_sec->string_list("status");
+  vg.has_status = (vg_sec->find_entry("status") != nullptr);
   vg.flags = vg_sec->string_list("flags");
   vg.tags = vg_sec->string_list("tags");
   vg.max_lv = non_negative(vg_sec->integer("max_lv")).value_or(0);
@@ -247,6 +247,7 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
       pv.id = pv_sec.string("id").value_or("");
       pv.device = pv_sec.string("device").value_or("");
       pv.status = pv_sec.string_list("status");
+      pv.has_status = (pv_sec.find_entry("status") != nullptr);
       pv.flags = pv_sec.string_list("flags");
       pv.tags = pv_sec.string_list("tags");
       pv.pe_start_sectors = non_negative(pv_sec.integer("pe_start")).value_or(0);
@@ -274,8 +275,11 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
       lv.name = lv_sec.name;
       lv.id = lv_sec.string("id").value_or("");
       lv.status = lv_sec.string_list("status");
+      lv.has_status = (lv_sec.find_entry("status") != nullptr);
       lv.flags = lv_sec.string_list("flags");
       lv.tags = lv_sec.string_list("tags");
+      lv.creation_time = non_negative(lv_sec.integer("creation_time")).value_or(0);
+      lv.creation_host = lv_sec.string("creation_host").value_or("");
 
       for (const auto& seg_sec : lv_sec.sections) {
         if (seg_sec.name.rfind("segment", 0) != 0) continue;
@@ -329,10 +333,10 @@ std::optional<VolumeGroup> parse_vg_metadata(std::string_view text, std::string&
   for (auto& lv : vg.lvs) {
     for (const auto& seg : lv.segments) {
       if (seg.type == "snapshot") {
-        if (auto* orig = const_cast<LogicalVolume*>(vg.find_lv(seg.origin))) {
+        if (auto* orig = const_cast<LogicalVolume*>(vg.find_lv(seg.origin_lv))) {
           orig->is_snapshot_origin = true;
         }
-        auto* cow = const_cast<LogicalVolume*>(vg.find_lv(seg.cow_store));
+        auto* cow = const_cast<LogicalVolume*>(vg.find_lv(seg.cow_store_lv));
         if (is_snapshot_wrapper_name(lv.name) && cow && !ends_with(cow->name, "_cow")) {
           lv.internal = true;
           cow->is_snapshot_cow = true;
