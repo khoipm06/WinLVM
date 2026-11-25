@@ -47,13 +47,6 @@ static int wl_mul_ovf(uint64_t a, uint64_t b, uint64_t *r) {
     return 0;
 }
 
-static int wl_view_pv_index(const lvmcore_volume_group *vg, const char *key) {
-    for (size_t i = 0; i < vg->pv_count; i++) {
-        if (wl_str_eq(vg->pvs[i].key, key, sizeof(vg->pvs[i].key))) return (int)i;
-    }
-    return -1;
-}
-
 static int wl_rec_pv_slot(const wl_vg_record *r, const char *pv_uuid) {
     for (size_t i = 0; i < r->pv_count; i++) {
         if (wl_uuid_eq(r->pv_uuid[i], pv_uuid)) return (int)i;
@@ -89,10 +82,20 @@ void wl_vg_unref(wl_vg_record *r) {
 }
 
 int wl_vg_lv_child_eligible(const lvmcore_logical_volume *lv) {
-    return lv && lv->visible && lv->mappable && !lv->internal;
+    return lv && lv->visible && lv->mappable && !lv->internal && !lv->is_thin_pool;
 }
 
-uint64_t wl_lv_byte_size(const lvmcore_volume_group *vg, size_t lv_index) {
+int wl_vg_lv_is_complex(const lvmcore_volume_group *vg, size_t lv_index) {
+    if (!vg || !vg->lvs || lv_index >= vg->lv_count) return 0;
+    const lvmcore_logical_volume *lv = &vg->lvs[lv_index];
+    if (lv->is_snapshot_origin || lv->is_snapshot_cow) return 1;
+    if (lv->segment_count == 0 || !lv->segments) return 0;
+    lvmcore_seg_type t = lv->segments[0].type;
+    return (t == LVMCORE_SEG_THIN || t == LVMCORE_SEG_SNAPSHOT ||
+            t == LVMCORE_SEG_RAID1 || t == LVMCORE_SEG_MIRROR) ? 1 : 0;
+}
+
+static uint64_t wl_lv_raw_byte_size(const lvmcore_volume_group *vg, size_t lv_index) {
     if (!vg || !vg->lvs || lv_index >= vg->lv_count) return 0;
     const lvmcore_logical_volume *lv = &vg->lvs[lv_index];
     if (lv->segment_count == 0 || !lv->segments) return 0;
@@ -108,70 +111,19 @@ uint64_t wl_lv_byte_size(const lvmcore_volume_group *vg, size_t lv_index) {
     return total;
 }
 
-int wl_vg_lv_pv_complete(const wl_vg_record *r, size_t lv_index) {
-    if (!r || !r->view || !r->view->lvs || !r->view->pvs || lv_index >= r->view->lv_count) {
-        return 0;
+uint64_t wl_lv_byte_size(const lvmcore_volume_group *vg, size_t lv_index) {
+    if (!vg || !vg->lvs || lv_index >= vg->lv_count) return 0;
+    const lvmcore_logical_volume *lv = &vg->lvs[lv_index];
+    if (lv->is_snapshot_cow && lv->snapshot_wrapper[0]) {
+        int widx = wl_find_lv_index(vg, lv->snapshot_wrapper);
+        if (widx < 0) return 0;
+        const lvmcore_logical_volume *wrap = &vg->lvs[widx];
+        if (wrap->segment_count == 0 || !wrap->segments) return 0;
+        int oidx = wl_find_lv_index(vg, wrap->segments[0].origin);
+        if (oidx >= 0) return wl_lv_raw_byte_size(vg, (size_t)oidx);
+        return wl_lv_raw_byte_size(vg, (size_t)widx);
     }
-    const lvmcore_logical_volume *lv = &r->view->lvs[lv_index];
-    if (!wl_vg_lv_child_eligible(lv)) return 0;
-    if (lv->segment_count == 0 || !lv->segments) return 0;
-
-    for (size_t s = 0; s < lv->segment_count; s++) {
-        const lvmcore_segment *seg = &lv->segments[s];
-        if (seg->type != LVMCORE_SEG_STRIPED) return 0;
-        if (seg->extent_count == 0 || seg->stripe_count < 1 ||
-            seg->stripe_count_used != seg->stripe_count || !seg->stripes) {
-            return 0;
-        }
-        for (size_t t = 0; t < seg->stripe_count_used; t++) {
-            int vp = wl_view_pv_index(r->view, seg->stripes[t].pv_key);
-            if (vp < 0 || r->view->pvs[vp].missing) return 0;
-            int slot = wl_rec_pv_slot(r, r->view->pvs[vp].id);
-            if (slot < 0 || r->pv_state[slot] != WL_PV_PRESENT) return 0;
-        }
-    }
-    return 1;
-}
-
-int wl_vg_lv_all_gone(const wl_vg_record *r, size_t lv_index) {
-    if (!r || !r->view || !r->view->lvs || !r->view->pvs || lv_index >= r->view->lv_count) {
-        return 0;
-    }
-    const lvmcore_logical_volume *lv = &r->view->lvs[lv_index];
-    if (lv->segment_count == 0 || !lv->segments) return 0;
-    int checked = 0;
-    for (size_t s = 0; s < lv->segment_count; s++) {
-        const lvmcore_segment *seg = &lv->segments[s];
-        if (seg->stripe_count_used == 0 || !seg->stripes) return 0;
-        for (size_t t = 0; t < seg->stripe_count_used; t++) {
-            int vp = wl_view_pv_index(r->view, seg->stripes[t].pv_key);
-            if (vp < 0) return 0;
-            int slot = wl_rec_pv_slot(r, r->view->pvs[vp].id);
-            if (slot < 0 || r->pv_state[slot] != WL_PV_GONE) return 0;
-            checked = 1;
-        }
-    }
-    return checked;
-}
-
-int wl_vg_lv_any_pv_gone(const wl_vg_record *r, size_t lv_index) {
-    if (!r || !r->view || r->dead || !r->view->lvs || !r->view->pvs ||
-        lv_index >= r->view->lv_count) {
-        return 1;
-    }
-    const lvmcore_logical_volume *lv = &r->view->lvs[lv_index];
-    if (lv->segment_count == 0 || !lv->segments) return 1;
-    for (size_t s = 0; s < lv->segment_count; s++) {
-        const lvmcore_segment *seg = &lv->segments[s];
-        if (seg->stripe_count_used == 0 || !seg->stripes) return 1;
-        for (size_t t = 0; t < seg->stripe_count_used; t++) {
-            int vp = wl_view_pv_index(r->view, seg->stripes[t].pv_key);
-            if (vp < 0 || r->view->pvs[vp].missing) return 1;
-            int slot = wl_rec_pv_slot(r, r->view->pvs[vp].id);
-            if (slot < 0 || r->pv_state[slot] == WL_PV_GONE) return 1;
-        }
-    }
-    return 0;
+    return wl_lv_raw_byte_size(vg, lv_index);
 }
 
 int wl_vg_lv_activated(const wl_vg_record *r, size_t lv_index) {
@@ -221,7 +173,9 @@ static int wl_lv_geometry_changed(const lvmcore_volume_group *old,
     if (old->read_only != newv->read_only || a->read_only != b->read_only) return 1;
     if (a->segment_count != b->segment_count) return 1;
     if (a->mappable != b->mappable || a->visible != b->visible ||
-        a->internal != b->internal) {
+        a->internal != b->internal || a->is_thin_pool != b->is_thin_pool ||
+        a->is_snapshot_origin != b->is_snapshot_origin ||
+        a->is_snapshot_cow != b->is_snapshot_cow) {
         return 1;
     }
     for (size_t s = 0; s < a->segment_count; s++) {
@@ -232,7 +186,13 @@ static int wl_lv_geometry_changed(const lvmcore_volume_group *old,
             sa->type != sb->type ||
             sa->stripe_count != sb->stripe_count ||
             sa->stripe_size_sectors != sb->stripe_size_sectors ||
-            sa->stripe_count_used != sb->stripe_count_used) {
+            sa->stripe_count_used != sb->stripe_count_used ||
+            sa->device_id != sb->device_id ||
+            sa->chunk_size_sectors != sb->chunk_size_sectors ||
+            sa->raid_leg_count != sb->raid_leg_count ||
+            !wl_str_eq(sa->pool_data, sb->pool_data, sizeof(sa->pool_data)) ||
+            !wl_str_eq(sa->origin, sb->origin, sizeof(sa->origin)) ||
+            !wl_str_eq(sa->cow_store, sb->cow_store, sizeof(sa->cow_store))) {
             return 1;
         }
         if ((sa->stripe_count_used > 0) && (!sa->stripes || !sb->stripes)) return 1;
@@ -240,6 +200,13 @@ static int wl_lv_geometry_changed(const lvmcore_volume_group *old,
             if (!wl_str_eq(sa->stripes[t].pv_key, sb->stripes[t].pv_key,
                            sizeof(sa->stripes[t].pv_key)) ||
                 sa->stripes[t].start_extent != sb->stripes[t].start_extent) {
+                return 1;
+            }
+        }
+        if ((sa->raid_leg_count > 0) && (!sa->raid_legs || !sb->raid_legs)) return 1;
+        for (size_t l = 0; l < sa->raid_leg_count; l++) {
+            if (!wl_str_eq(sa->raid_legs[l].image_lv, sb->raid_legs[l].image_lv,
+                           sizeof(sa->raid_legs[l].image_lv))) {
                 return 1;
             }
         }

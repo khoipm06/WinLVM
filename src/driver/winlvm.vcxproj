@@ -99,9 +99,15 @@
     <ClCompile Include="winlvm_storage.c" />
     <ClCompile Include="winlvm_vg.c" />
     <ClCompile Include="winlvm_map.c" />
+    <ClCompile Include="winlvm_thin.c" />
+    <ClCompile Include="winlvm_snap.c" />
+    <ClCompile Include="winlvm_raid.c" />
     <ClCompile Include="..\lvmcore\crc32.c" />
     <ClCompile Include="..\lvmcore\arena.c" />
     <ClCompile Include="..\lvmcore\parser.c" />
+    <ClCompile Include="..\lvmcore\lvmcore_thin.c" />
+    <ClCompile Include="..\lvmcore\lvmcore_snap.c" />
+    <ClCompile Include="..\lvmcore\lvmcore_raid.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="FixInfClass" BeforeTargets="Inf2Cat">
