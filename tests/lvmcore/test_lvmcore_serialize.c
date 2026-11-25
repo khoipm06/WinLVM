@@ -156,6 +156,10 @@ static const char *kCorpusImages[] = {
     "striped-2pv-b.img",
     "sector4k.img",
     "odd-geometry.img",
+    "thin-pool.img",
+    "snapshot.img",
+    "raid1-mirror-a.img",
+    "raid1-mirror-b.img",
     "mixed-vg-a.img",
     "mixed-vg-b.img"
 };
@@ -223,6 +227,10 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
         snprintf(title, sizeof(title), "round-trip VG pv_count for %s", kCorpusImages[i]);
         CHECK(title, vg_disk.pv_count == vg_round.pv_count);
         CHECK("round-trip VG read_only matches", vg_disk.read_only == vg_round.read_only);
+        CHECK("round-trip VG tag_count matches", vg_disk.tag_count == vg_round.tag_count);
+        for (size_t ti = 0; ti < vg_disk.tag_count && ti < vg_round.tag_count; ti++) {
+            CHECK("VG tag matches", strcmp(vg_disk.tags[ti].name, vg_round.tags[ti].name) == 0);
+        }
 
         for (size_t p = 0; p < vg_disk.pv_count; p++) {
             const lvmcore_physical_volume *p1 = &vg_disk.pvs[p];
@@ -235,6 +243,10 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
             CHECK("PV pe_count matches", p1->pe_count == p2->pe_count);
             CHECK("PV dev_size matches", p1->dev_size_sectors == p2->dev_size_sectors);
             CHECK("PV missing matches", p1->missing == p2->missing);
+            CHECK("PV tag_count matches", p1->tag_count == p2->tag_count);
+            for (size_t ti = 0; ti < p1->tag_count && ti < p2->tag_count; ti++) {
+                CHECK("PV tag matches", strcmp(p1->tags[ti].name, p2->tags[ti].name) == 0);
+            }
         }
 
         snprintf(title, sizeof(title), "round-trip VG lv_count for %s", kCorpusImages[i]);
@@ -251,17 +263,36 @@ static void test_corpus_roundtrip(const char *corpus_images_dir) {
             CHECK("LV visible matches", lv1->visible == lv2->visible);
             CHECK("LV read_only matches", lv1->read_only == lv2->read_only);
             CHECK("LV mappable matches", lv1->mappable == lv2->mappable);
+            CHECK("LV is_thin_pool matches", lv1->is_thin_pool == lv2->is_thin_pool);
+            CHECK("LV is_snapshot_origin matches", lv1->is_snapshot_origin == lv2->is_snapshot_origin);
+            CHECK("LV is_snapshot_cow matches", lv1->is_snapshot_cow == lv2->is_snapshot_cow);
+            CHECK("LV tag_count matches", lv1->tag_count == lv2->tag_count);
+            for (size_t ti = 0; ti < lv1->tag_count && ti < lv2->tag_count; ti++) {
+                CHECK("LV tag matches", strcmp(lv1->tags[ti].name, lv2->tags[ti].name) == 0);
+            }
             CHECK("LV segment_count matches", lv1->segment_count == lv2->segment_count);
             for (size_t s = 0; s < lv1->segment_count; s++) {
                 const lvmcore_segment *s1 = &lv1->segments[s];
                 const lvmcore_segment *s2 = &lv2->segments[s];
+                CHECK("segment type matches", s1->type == s2->type);
                 CHECK("segment start_extent matches", s1->start_extent == s2->start_extent);
                 CHECK("segment extent_count matches", s1->extent_count == s2->extent_count);
                 CHECK("segment stripe_count matches", s1->stripe_count == s2->stripe_count);
                 CHECK("segment stripe_count_used matches", s1->stripe_count_used == s2->stripe_count_used);
+                CHECK("segment device_id matches", s1->device_id == s2->device_id);
+                CHECK("segment chunk_size matches", s1->chunk_size_sectors == s2->chunk_size_sectors);
+                CHECK("segment origin matches", strcmp(s1->origin, s2->origin) == 0);
+                CHECK("segment cow_store matches", strcmp(s1->cow_store, s2->cow_store) == 0);
+                CHECK("segment pool_metadata matches", strcmp(s1->pool_metadata, s2->pool_metadata) == 0);
+                CHECK("segment pool_data matches", strcmp(s1->pool_data, s2->pool_data) == 0);
+                CHECK("segment raid_leg_count matches", s1->raid_leg_count == s2->raid_leg_count);
                 for (size_t st_idx = 0; st_idx < s1->stripe_count_used; st_idx++) {
                     CHECK("stripe pv_key matches", strcmp(s1->stripes[st_idx].pv_key, s2->stripes[st_idx].pv_key) == 0);
                     CHECK("stripe start_extent matches", s1->stripes[st_idx].start_extent == s2->stripes[st_idx].start_extent);
+                }
+                for (size_t li = 0; li < s1->raid_leg_count; li++) {
+                    CHECK("raid meta_lv matches", strcmp(s1->raid_legs[li].meta_lv, s2->raid_legs[li].meta_lv) == 0);
+                    CHECK("raid image_lv matches", strcmp(s1->raid_legs[li].image_lv, s2->raid_legs[li].image_lv) == 0);
                 }
             }
         }

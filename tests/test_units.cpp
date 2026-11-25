@@ -212,15 +212,15 @@ TEST(metadata_model_reconstructs_segments) {
 TEST(unsupported_segment_types_are_recorded_not_thrown_away) {
   std::string text = kTwoSegmentVg;
   const auto pos = text.find("\"striped\"");
-  text.replace(pos, 9, "\"thin\"");
+  text.replace(pos, 9, "\"raid5_ls\"");
 
   std::string error;
   auto vg = parse_vg_metadata(text, error);
   CHECK_MSG(vg.has_value(), error);
-  // The VG still parses — only the LV is refused.
+  // The VG still parses — only the unsupported LV is refused.
   CHECK_EQ(vg->lvs.size(), std::size_t{1});
   CHECK(!vg->lvs[0].supported);
-  CHECK_MSG(vg->lvs[0].unsupported_reason.find("thin") != std::string::npos,
+  CHECK_MSG(vg->lvs[0].unsupported_reason.find("raid5_ls") != std::string::npos,
             vg->lvs[0].unsupported_reason);
 }
 
@@ -341,7 +341,7 @@ TEST(serialize_vg_escapes_device_and_preserves_status_and_system_id) {
 
 TEST(serialize_vg_refuses_unsupported_segments_closed) {
   VolumeGroup vg;
-  vg.name = "vg_thin";
+  vg.name = "vg_cache";
   vg.id = "11111122223333444455556666777799";
   vg.seqno = 1;
   vg.extent_size_sectors = 8192;
@@ -353,20 +353,155 @@ TEST(serialize_vg_refuses_unsupported_segments_closed) {
   vg.pvs.push_back(pv);
 
   LogicalVolume lv;
-  lv.name = "lv_thin";
+  lv.name = "lv_cache";
   lv.id = "bbbbbb11112222333344445555666688";
   lv.supported = false;
-  lv.unsupported_reason = "unsupported segment type 'thin'";
+  lv.unsupported_reason = "unsupported segment type 'cache'";
   Segment seg;
   seg.start_extent = 0;
   seg.extent_count = 2;
-  seg.type = "thin";
+  seg.type = "cache";
   lv.segments.push_back(seg);
   vg.lvs.push_back(lv);
 
   std::string err;
   CHECK(!serialize_vg_to_text(vg, err).has_value());
   CHECK(!err.empty());
+}
+
+TEST(serialize_vg_roundtrips_tags_and_complex_segments) {
+  const char* meta = R"(
+vgfull {
+  id = "111111-2222-3333-4444-5555-6666-777788"
+  seqno = 5
+  status = ["RESIZEABLE", "READ", "WRITE"]
+  flags = []
+  tags = ["vg_prod", "tier1"]
+  extent_size = 8192
+  physical_volumes {
+    pv0 {
+      id = "aaaaaa-1111-2222-3333-4444-5555-666677"
+      device = "/dev/loop0"
+      status = ["ALLOCATABLE"]
+      flags = []
+      tags = ["ssd"]
+      dev_size = 262144
+      pe_start = 2048
+      pe_count = 31
+    }
+    pv1 {
+      id = "bbbbbb-1111-2222-3333-4444-5555-666677"
+      device = "/dev/loop1"
+      status = ["ALLOCATABLE"]
+      flags = []
+      tags = ["nvme"]
+      dev_size = 262144
+      pe_start = 2048
+      pe_count = 31
+    }
+  }
+  logical_volumes {
+    tpool {
+      id = "cccccc-1111-2222-3333-4444-5555-000001"
+      status = ["READ", "WRITE", "VISIBLE"]
+      segment_count = 1
+      segment1 {
+        start_extent = 0
+        extent_count = 4
+        type = "thin-pool"
+        metadata = "tpool_tmeta"
+        pool = "tpool_tdata"
+        transaction_id = 3
+        chunk_size = 128
+        discards = "passdown"
+        zero_new_blocks = 1
+      }
+    }
+    tpool_tmeta {
+      id = "cccccc-1111-2222-3333-4444-5555-000002"
+      status = ["READ", "WRITE"]
+      segment_count = 1
+      segment1 { start_extent = 0 extent_count = 1 type = "striped" stripe_count = 1 stripes = ["pv0", 0] }
+    }
+    tpool_tdata {
+      id = "cccccc-1111-2222-3333-4444-5555-000003"
+      status = ["READ", "WRITE"]
+      segment_count = 1
+      segment1 { start_extent = 0 extent_count = 4 type = "striped" stripe_count = 1 stripes = ["pv0", 1] }
+    }
+    lvthin {
+      id = "cccccc-1111-2222-3333-4444-5555-000004"
+      status = ["READ", "WRITE", "VISIBLE"]
+      tags = ["thin_data"]
+      segment_count = 1
+      segment1 {
+        start_extent = 0
+        extent_count = 2
+        type = "thin"
+        thin_pool = "tpool"
+        transaction_id = 1
+        device_id = 7
+      }
+    }
+    lvraid {
+      id = "cccccc-1111-2222-3333-4444-5555-000005"
+      status = ["READ", "WRITE", "VISIBLE"]
+      tags = ["redundant"]
+      segment_count = 1
+      segment1 {
+        start_extent = 0
+        extent_count = 2
+        type = "raid1"
+        device_count = 2
+        region_size = 4096
+        raids = ["lvraid_rmeta_0", "lvraid_rimage_0", "lvraid_rmeta_1", "lvraid_rimage_1"]
+      }
+    }
+    lvraid_rmeta_0 {
+      id = "cccccc-1111-2222-3333-4444-5555-000006"
+      status = ["READ", "WRITE"]
+      segment_count = 1
+      segment1 { start_extent = 0 extent_count = 1 type = "striped" stripe_count = 1 stripes = ["pv0", 5] }
+    }
+    lvraid_rimage_0 {
+      id = "cccccc-1111-2222-3333-4444-5555-000007"
+      status = ["READ", "WRITE"]
+      segment_count = 1
+      segment1 { start_extent = 0 extent_count = 2 type = "striped" stripe_count = 1 stripes = ["pv0", 6] }
+    }
+    lvraid_rmeta_1 {
+      id = "cccccc-1111-2222-3333-4444-5555-000008"
+      status = ["READ", "WRITE"]
+      segment_count = 1
+      segment1 { start_extent = 0 extent_count = 1 type = "striped" stripe_count = 1 stripes = ["pv1", 0] }
+    }
+    lvraid_rimage_1 {
+      id = "cccccc-1111-2222-3333-4444-5555-000009"
+      status = ["READ", "WRITE"]
+      segment_count = 1
+      segment1 { start_extent = 0 extent_count = 2 type = "striped" stripe_count = 1 stripes = ["pv1", 1] }
+    }
+  }
+}
+)";
+  std::string err;
+  auto vg1 = parse_vg_metadata(meta, err);
+  CHECK_MSG(vg1.has_value(), err);
+  CHECK_EQ(vg1->tags.size(), std::size_t{2});
+  CHECK_EQ(vg1->pvs[0].tags.size(), std::size_t{1});
+  CHECK_EQ(vg1->find_lv("lvthin")->tags[0], std::string("thin_data"));
+
+  auto text = serialize_vg_to_text(*vg1, err);
+  CHECK_MSG(text.has_value(), err);
+  auto vg2 = parse_vg_metadata(*text, err);
+  CHECK_MSG(vg2.has_value(), err);
+  CHECK(vg2->tags == vg1->tags);
+  CHECK(vg2->pvs[0].tags == vg1->pvs[0].tags);
+  CHECK(vg2->pvs[1].tags == vg1->pvs[1].tags);
+  CHECK(vg2->find_lv("lvthin")->tags == vg1->find_lv("lvthin")->tags);
+  CHECK_EQ(vg2->find_lv("lvthin")->segments[0].device_id, std::uint64_t{7});
+  CHECK_EQ(vg2->find_lv("tpool")->segments[0].chunk_size_sectors, std::uint64_t{128});
+  CHECK_EQ(vg2->find_lv("lvraid")->segments[0].raid_legs.size(), std::size_t{2});
 }
 
 TEST(circular_mda_ring_wraps_across_boundary_and_stays_valid) {

@@ -127,7 +127,7 @@ std::pair<int, int> compare_against_oracle(const std::string& case_name, const V
   int refused = 0;
 
   for (const auto& lv : vg.lvs) {
-    if (lv.internal) continue;
+    if (lv.internal || lv.is_thin_pool) continue;
 
     std::string error;
     auto table = build_dm_table(vg, lv, error);
@@ -149,15 +149,48 @@ std::pair<int, int> compare_against_oracle(const std::string& case_name, const V
                   " targets, produced " + std::to_string(table->size()));
 
     for (std::size_t i = 0; i < table->size(); ++i) {
-      std::vector<std::string> device_names;
-      for (const auto& dest : (*table)[i].destinations) {
-        const PhysicalVolume* pv = vg.find_pv(dest.pv_key);
-        device_names.push_back(device_to_major_minor(pv ? pv->device : dest.pv_key));
+      const DmTarget& t = (*table)[i];
+      if (t.type == "linear" || t.type == "striped") {
+        std::vector<std::string> device_names;
+        for (const auto& dest : t.destinations) {
+          const PhysicalVolume* pv = vg.find_pv(dest.pv_key);
+          device_names.push_back(device_to_major_minor(pv ? pv->device : dest.pv_key));
+        }
+        const std::string ours = format_dm_target(t, device_names);
+        CHECK_MSG(ours == it->second[i],
+                  case_name + "/" + lv.name + " target " + std::to_string(i) +
+                      "\n      linux: " + it->second[i] + "\n      ours:  " + ours);
+      } else {
+        // Complex targets use ephemeral Linux dm major:minor numbers in dmsetup-table.txt;
+        // compare start, length, target type, and semantic parameters.
+        std::istringstream iss(it->second[i]);
+        std::uint64_t o_start = 0, o_len = 0;
+        std::string o_type;
+        iss >> o_start >> o_len >> o_type;
+        CHECK_EQ(t.start_sector, o_start);
+        CHECK_EQ(t.length_sectors, o_len);
+        if (t.type == "raid1") {
+          std::string o_raid_level;
+          iss >> o_raid_level;
+          CHECK_EQ(o_type, std::string("raid"));
+          CHECK_EQ(o_raid_level, std::string("raid1"));
+          CHECK_MSG(it->second[i].find("region_size " + std::to_string(t.region_size_sectors)) != std::string::npos,
+                    it->second[i]);
+        } else {
+          CHECK_EQ(t.type, o_type);
+          if (t.type == "thin") {
+            std::string pool_dev;
+            std::uint64_t dev_id = 0;
+            iss >> pool_dev >> dev_id;
+            CHECK_EQ(t.device_id, dev_id);
+          } else if (t.type == "snapshot") {
+            std::string o_orig, o_cow, o_mode;
+            std::uint64_t o_chunk = 0;
+            iss >> o_orig >> o_cow >> o_mode >> o_chunk;
+            CHECK_EQ(t.chunk_sectors, o_chunk);
+          }
+        }
       }
-      const std::string ours = format_dm_target((*table)[i], device_names);
-      CHECK_MSG(ours == it->second[i],
-                case_name + "/" + lv.name + " target " + std::to_string(i) +
-                    "\n      linux: " + it->second[i] + "\n      ours:  " + ours);
     }
 
     testing::note(case_name + "/" + lv.name + ": " + std::to_string(table->size()) +
@@ -261,40 +294,84 @@ TEST(corpus_odd_geometry_uses_non_default_extent_size) {
 
 TEST(corpus_mixed_vg_refuses_unsupported_lvs_individually) {
   const auto vg = load_vg_from_metadata_text("mixed-vg");
-  CHECK_MSG(vg.lvs.size() >= 4, "mixed-vg should contain several LVs");
+  CHECK_MSG(vg.lvs.size() >= 10, "mixed-vg should contain supported and unsupported LVs");
 
-  int refused = 0;
-  for (const auto& lv : vg.lvs) {
-    if (lv.internal || lv.supported) continue;
+  // Supported LVs in mixed-vg must build valid DM targets.
+  for (const char* ok_name : {"lvplain", "lvsnap", "lvthin", "lvraid"}) {
+    const LogicalVolume* lv = vg.find_lv(ok_name);
+    CHECK(lv != nullptr);
+    CHECK_MSG(lv->supported && !lv->internal, std::string(ok_name) + " must be supported");
     std::string error;
-    CHECK(!build_dm_table(vg, lv, error).has_value());
-    CHECK_MSG(!lv.unsupported_reason.empty(), lv.name + " refused without a reason");
-    ++refused;
+    CHECK_MSG(build_dm_table(vg, *lv, error).has_value(), error);
   }
-  CHECK_MSG(refused >= 2, "expected thin/raid/snapshot LVs to be refused");
+
+  // Thin-pool container must not be directly mountable.
+  const LogicalVolume* pool = vg.find_lv("tpool");
+  CHECK(pool != nullptr);
+  CHECK(pool->is_thin_pool);
+  {
+    std::string error;
+    CHECK(!build_dm_table(vg, *pool, error).has_value());
+  }
+
+  // Out-of-scope cache LV must fail closed individually.
+  const LogicalVolume* cache_lv = vg.find_lv("lvcache");
+  CHECK(cache_lv != nullptr);
+  CHECK(!cache_lv->supported);
+  {
+    std::string error;
+    CHECK(!build_dm_table(vg, *cache_lv, error).has_value());
+    CHECK_MSG(!cache_lv->unsupported_reason.empty(), "lvcache refused without a reason");
+  }
 
   // Crucially the VG itself still parsed, with both PVs intact.
   CHECK_EQ(vg.pvs.size(), std::size_t{2});
 }
 
-// A snapshot origin looks like a plain linear LV in the metadata, but the
-// kernel maps it through copy-on-write. Mapping it directly from its extents
-// would bypass COW and destroy the snapshot, so it must be refused.
-TEST(corpus_snapshot_origin_is_refused) {
+// A snapshot origin must be exposed as a `snapshot-origin` target (never raw
+// `linear`) so writes flow through copy-on-write and never corrupt snapshots.
+TEST(corpus_snapshot_origin_maps_through_cow_target) {
   const auto vg = load_vg_from_metadata_text("mixed-vg");
   const LogicalVolume* origin = vg.find_lv("lvplain");
   CHECK(origin != nullptr);
-  CHECK_MSG(!origin->supported, "lvplain is a snapshot origin and must not be mapped directly");
-  CHECK_MSG(origin->unsupported_reason.find("snapshot") != std::string::npos,
-            origin->unsupported_reason);
+  CHECK(origin->supported);
+  CHECK(origin->is_snapshot_origin);
 
-  // The oracle confirms the kernel does not map it linearly either.
-  const auto oracle =
-      parse_oracle_table(read_file(kExpectedDir / "mixed-vg" / "dmsetup-table.txt"));
-  auto it = oracle.find("vgmix-lvplain");
-  CHECK(it != oracle.end());
-  CHECK_MSG(it->second.front().find("snapshot-origin") != std::string::npos,
-            "fixture changed: lvplain is no longer a snapshot origin");
+  std::string error;
+  auto table = build_dm_table(vg, *origin, error);
+  CHECK_MSG(table.has_value(), error);
+  CHECK_EQ(table->size(), std::size_t{1});
+  CHECK_EQ(table->front().type, std::string("snapshot-origin"));
+
+  const LogicalVolume* snap = vg.find_lv("lvsnap");
+  CHECK(snap != nullptr);
+  CHECK(snap->supported);
+  CHECK(snap->is_snapshot_cow);
+  auto snap_table = build_dm_table(vg, *snap, error);
+  CHECK_MSG(snap_table.has_value(), error);
+  CHECK_EQ(snap_table->front().type, std::string("snapshot"));
+  CHECK_EQ(snap_table->front().chunk_sectors, std::uint64_t{8});
+}
+
+TEST(corpus_tags_and_complex_fixtures_parse_cleanly) {
+  const auto vg_lin = load_vg_from_metadata_text("linear-1pv");
+  CHECK_EQ(vg_lin.tags.size(), std::size_t{1});
+  CHECK_EQ(vg_lin.tags[0], std::string("base_vg"));
+  CHECK_EQ(vg_lin.pvs[0].tags.size(), std::size_t{1});
+  CHECK_EQ(vg_lin.pvs[0].tags[0], std::string("pv_tag0"));
+  CHECK_EQ(vg_lin.find_lv("lvlin")->tags.size(), std::size_t{2});
+
+  const auto vg_thin = load_vg_from_metadata_text("thin-pool");
+  CHECK(vg_thin.find_lv("tpool")->is_thin_pool);
+  CHECK(vg_thin.find_lv("lvthin")->supported);
+  CHECK(vg_thin.find_lv("lvthinsnap")->supported);
+  CHECK_EQ(vg_thin.find_lv("lvthinsnap")->segments[0].origin, std::string("lvthin"));
+
+  const auto vg_raid = load_vg_from_metadata_text("raid1-mirror");
+  CHECK(vg_raid.find_lv("lvraid1")->supported);
+  CHECK(vg_raid.find_lv("lvmirror")->supported);
+  CHECK(vg_raid.find_lv("lvmirlog")->supported);
+  CHECK_EQ(vg_raid.find_lv("lvmirlog")->segments[0].mirror_log, std::string("lvmirlog_mlog"));
 }
 
 // ===========================================================================

@@ -57,6 +57,9 @@ static const test_case_t kCases[] = {
     { "striped-2pv",           "striped-2pv-a.img" },
     { "sector4k",              "sector4k.img" },
     { "odd-geometry",          "odd-geometry.img" },
+    { "thin-pool",             "thin-pool.img" },
+    { "snapshot",              "snapshot.img" },
+    { "raid1-mirror",          "raid1-mirror-a.img" },
     { "mixed-vg",              "mixed-vg-a.img" },
     { "luks2-default",         "luks2-default.img" },
     { "luks2-pbkdf2",          "luks2-pbkdf2.img" },
@@ -355,6 +358,40 @@ int main(int argc, char **argv) {
                 fails++; case_bad = 1;
             }
 
+            /* Compare every segment against dmsetup-table oracle. */
+            if (lv->is_snapshot_cow && lv->snapshot_wrapper[0]) {
+                const lvmcore_logical_volume *wrap = lvmcore_vg_find_lv(&vg, lv->snapshot_wrapper);
+                const lvmcore_logical_volume *orig =
+                    (wrap && wrap->segment_count > 0)
+                        ? lvmcore_vg_find_lv(&vg, wrap->segments[0].origin) : NULL;
+                uint64_t expect_len = 0;
+                if (orig) {
+                    for (size_t os = 0; os < orig->segment_count; os++)
+                        expect_len += orig->segments[os].extent_count * vg.extent_size_sectors;
+                }
+                if (ol->count != 1 || strcmp(ol->t[0].type, "snapshot") != 0 ||
+                    ol->t[0].start != 0 || ol->t[0].length != expect_len) {
+                    printf("[ FAIL ] %s/%s classic snapshot mismatch: linux=%s [%lu,+%lu) expect_len=%lu\n",
+                           c->case_name, lv->name, ol->t[0].type, ol->t[0].start, ol->t[0].length,
+                           (unsigned long)expect_len);
+                    fails++; case_bad = 1;
+                }
+                continue;
+            }
+            if (lv->is_snapshot_origin) {
+                uint64_t expect_len = 0;
+                for (size_t os = 0; os < lv->segment_count; os++)
+                    expect_len += lv->segments[os].extent_count * vg.extent_size_sectors;
+                if (ol->count != 1 || strcmp(ol->t[0].type, "snapshot-origin") != 0 ||
+                    ol->t[0].start != 0 || ol->t[0].length != expect_len) {
+                    printf("[ FAIL ] %s/%s snapshot-origin mismatch: linux=%s [%lu,+%lu) expect_len=%lu\n",
+                           c->case_name, lv->name, ol->t[0].type, ol->t[0].start, ol->t[0].length,
+                           (unsigned long)expect_len);
+                    fails++; case_bad = 1;
+                }
+                continue;
+            }
+
             if (lv->segment_count != ol->count) {
                 printf("[ FAIL ] %s/%s: segment count %lu != oracle line count %lu\n",
                        c->case_name, lv->name,
@@ -363,7 +400,6 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            /* Compare every linear and striped segment in exact order against dmsetup-table. */
             for (size_t s = 0; s < lv->segment_count; s++) {
                 lvmcore_segment *seg = &lv->segments[s];
                 oracle_target *ot = &ol->t[s];
@@ -376,6 +412,39 @@ int main(int argc, char **argv) {
                            ot->start, ot->length,
                            (unsigned long)expect_lv_start, (unsigned long)expect_len);
                     fails++; case_bad = 1; break;
+                }
+
+                if (seg->type == LVMCORE_SEG_THIN) {
+                    if (strcmp(ot->type, "thin") != 0 || seg->pool_data[0] == '\0') {
+                        printf("[ FAIL ] %s/%s seg%lu expected thin target, got %s\n",
+                               c->case_name, lv->name, (unsigned long)s, ot->type);
+                        fails++; case_bad = 1; break;
+                    }
+                    continue;
+                }
+                if (seg->type == LVMCORE_SEG_RAID1) {
+                    if (strcmp(ot->type, "raid") != 0 || seg->raid_leg_count < 2) {
+                        printf("[ FAIL ] %s/%s seg%lu expected raid target, got %s\n",
+                               c->case_name, lv->name, (unsigned long)s, ot->type);
+                        fails++; case_bad = 1; break;
+                    }
+                    continue;
+                }
+                if (seg->type == LVMCORE_SEG_MIRROR) {
+                    if (strcmp(ot->type, "mirror") != 0 || seg->raid_leg_count < 2) {
+                        printf("[ FAIL ] %s/%s seg%lu expected mirror target, got %s\n",
+                               c->case_name, lv->name, (unsigned long)s, ot->type);
+                        fails++; case_bad = 1; break;
+                    }
+                    continue;
+                }
+                if (seg->type == LVMCORE_SEG_SNAPSHOT) {
+                    if (strcmp(ot->type, "snapshot") != 0) {
+                        printf("[ FAIL ] %s/%s seg%lu expected snapshot target, got %s\n",
+                               c->case_name, lv->name, (unsigned long)s, ot->type);
+                        fails++; case_bad = 1; break;
+                    }
+                    continue;
                 }
 
                 if (seg->stripe_count == 1) {
@@ -456,9 +525,10 @@ int main(int argc, char **argv) {
     /* ---- multi-PV reconciliation: 2-PV images ----------------------- */
     {
         const char *pairs[][3] = {
-            { "linear-2pv",  "linear-2pv-a.img",  "linear-2pv-b.img" },
-            { "striped-2pv", "striped-2pv-a.img", "striped-2pv-b.img" },
-            { "mixed-vg",    "mixed-vg-a.img",    "mixed-vg-b.img" },
+            { "linear-2pv",   "linear-2pv-a.img",   "linear-2pv-b.img" },
+            { "striped-2pv",  "striped-2pv-a.img",  "striped-2pv-b.img" },
+            { "raid1-mirror", "raid1-mirror-a.img", "raid1-mirror-b.img" },
+            { "mixed-vg",     "mixed-vg-a.img",     "mixed-vg-b.img" },
         };
         for (size_t p = 0; p < sizeof(pairs) / sizeof(pairs[0]); p++) {
             const char *case_name = pairs[p][0];

@@ -1,20 +1,12 @@
 /*
- * test_driver_corpus_map.c — Differential kernel-mapper verification against
- * the decompressed Linux LVM2 corpus images and SHA-256 ground-truth oracles.
+ * test_driver_corpus_map.c — Differential kernel-mapper and block-engine
+ * verification against generated LVM2 corpus images and SHA-256 oracles.
  *
- * Exercises the exact freestanding kernel path:
+ * Exercises the exact freestanding kernel paths:
  *   lvmcore_read_pv_label -> lvmcore_read_vg -> wl_vg_arrival ->
- *   wl_map_begin / wl_map_next
- *
- * Across every mappable corpus case (linear-1pv, linear-1pv-multiseg,
- * linear-2pv, striped-2pv, sector4k, odd-geometry), reads each oracle window
- * and full LV stream using unaligned/odd transfer sizes (513, 4097, 65537)
- * spanning sector, page, stripe-chunk, extent, and PV boundaries, asserting
- * 100% byte-for-byte SHA-256 agreement (40/40 hashes across 8 LVs).
- *
- * Also verifies fail-closed refusal on mixed-vg (snapshot origin, thin,
- * thin-pool, raid1, snapshot, and hidden subvolumes) and LUKS2 containers
- * (LVMCORE_ERR_NO_LABEL), plus PV-removal map refusal.
+ *   wl_map_begin / wl_map_next (linear & striped) and
+ *   wl_complex_lv_read / wl_complex_lv_write (thin, thin-snapshot, snapshot,
+ *   snapshot-origin, raid1, mirror).
  *
  * Usage: test_driver_corpus_map <corpus-images-dir> <corpus-expected-dir>
  */
@@ -35,6 +27,7 @@
 #include "lvmcore/types.h"
 #include "lvmcore/arena.h"
 #include "lvmcore/parser.h"
+#include "lvmcore/thin.h"
 #include "winlvm_vg.h"
 #include "test_sha256.h"
 
@@ -42,6 +35,9 @@
 static uint8_t g_arena_pv[2][ARENA_CAP];
 static uint8_t g_arena_tmp[ARENA_CAP];
 static uint8_t g_io_buf[131072];
+static uint8_t g_meta_scratch[LVMCORE_THIN_SCRATCH_META_BYTES];
+static uint8_t g_aux_buf[65536];
+static uint8_t g_chunk_buf[65536];
 
 static int g_passes = 0;
 static int g_fails = 0;
@@ -58,70 +54,85 @@ static size_t file_read_cb(void *impl, uint64_t offset, void *buf, size_t len) {
     return fread(buf, 1, len, f);
 }
 
+static int pv_file_read(void *ctx, uint32_t pv_slot, uint64_t byte_off, void *buf, size_t len) {
+    const wl_vg_record *rec = (const wl_vg_record *)ctx;
+    if (!rec || pv_slot >= rec->pv_count || !rec->pv_tag[pv_slot]) return -1;
+    FILE *f = (FILE *)(uintptr_t)rec->pv_tag[pv_slot];
+    if (WL_FSEEK64(f, (int64_t)byte_off, SEEK_SET) != 0) return -1;
+    return (fread(buf, 1, len, f) == len) ? 0 : -1;
+}
+
+static int pv_file_write_ro(void *ctx, uint32_t pv_slot, uint64_t byte_off,
+                            const void *buf, size_t len) {
+    (void)ctx; (void)pv_slot; (void)byte_off; (void)buf; (void)len;
+    return -1;
+}
+
+static wl_pv_io_ops make_ro_pv_ops(const wl_vg_record *rec) {
+    wl_pv_io_ops ops = { (void *)(uintptr_t)rec, pv_file_read, pv_file_write_ro };
+    return ops;
+}
+
 static int file_open_sized(const char *path, FILE **f_out, uint64_t *size_out) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    if (WL_FSEEK64(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return 0;
-    }
+    if (WL_FSEEK64(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
     int64_t sz = WL_FTELL64(f);
-    if (sz < 0 || WL_FSEEK64(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        return 0;
-    }
+    if (sz < 0 || WL_FSEEK64(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
     *f_out = f;
     *size_out = (uint64_t)sz;
     return 1;
 }
 
-/*
- * Stream [offset, offset + length) through wl_map_begin / wl_map_next using
- * fixed transfer size `xfer_size`, resolving each chunk's PV slot via
- * rec->pv_tag[pv_index] and hashing every mapped byte into `hex_out`.
- */
-static int map_stream_sha256(const lvmcore_volume_group *vg,
-                             const wl_vg_record *rec,
-                             size_t lv_index,
-                             uint64_t offset,
-                             uint64_t length,
-                             uint64_t xfer_size,
-                             char hex_out[65]) {
+static int stream_lv_sha256(const lvmcore_volume_group *vg,
+                            const wl_vg_record *rec,
+                            size_t lv_index,
+                            uint64_t offset,
+                            uint64_t length,
+                            uint64_t xfer_size,
+                            char hex_out[65]) {
     test_sha256_ctx sha;
     test_sha256_init(&sha);
 
+    int is_complex = wl_vg_lv_is_complex(vg, lv_index);
     uint64_t cur = offset;
     uint64_t left = length;
     while (left > 0) {
         uint64_t step = left < xfer_size ? left : xfer_size;
-        wl_map_iter it;
-        wl_map_begin(&it, vg, rec, lv_index, cur, step);
-
-        uint64_t got_step = 0;
-        uint32_t pv_slot = 0;
-        uint64_t pv_byte = 0;
-        uint64_t piece_len = 0;
-        int rc;
-
-        while ((rc = wl_map_next(&it, &pv_slot, &pv_byte, &piece_len)) == 1) {
-            if (pv_slot >= rec->pv_count || !rec->pv_tag[pv_slot] || piece_len == 0) {
+        if (is_complex) {
+            wl_pv_io_ops ro_ops = make_ro_pv_ops(rec);
+            if (step > sizeof(g_io_buf)) step = sizeof(g_io_buf);
+            if (wl_complex_lv_read(vg, rec, lv_index, &ro_ops,
+                                   g_meta_scratch, sizeof(g_meta_scratch),
+                                   g_aux_buf, sizeof(g_aux_buf),
+                                   cur, g_io_buf, (size_t)step) != LVMCORE_OK) {
                 return 0;
             }
-            FILE *pv_file = (FILE *)rec->pv_tag[pv_slot];
-            uint64_t p_off = pv_byte;
-            uint64_t p_rem = piece_len;
-            while (p_rem > 0) {
-                size_t chunk = p_rem > sizeof(g_io_buf) ? sizeof(g_io_buf) : (size_t)p_rem;
-                if (WL_FSEEK64(pv_file, (int64_t)p_off, SEEK_SET) != 0) return 0;
-                if (fread(g_io_buf, 1, chunk, pv_file) != chunk) return 0;
-                test_sha256_update(&sha, g_io_buf, chunk);
-                p_off += chunk;
-                p_rem -= chunk;
+            test_sha256_update(&sha, g_io_buf, (size_t)step);
+        } else {
+            wl_map_iter it;
+            wl_map_begin(&it, vg, rec, lv_index, cur, step);
+            uint64_t got_step = 0;
+            uint32_t pv_slot = 0;
+            uint64_t pv_byte = 0;
+            uint64_t piece_len = 0;
+            int rc;
+            while ((rc = wl_map_next(&it, &pv_slot, &pv_byte, &piece_len)) == 1) {
+                if (pv_slot >= rec->pv_count || !rec->pv_tag[pv_slot] || piece_len == 0) return 0;
+                FILE *pv_file = (FILE *)rec->pv_tag[pv_slot];
+                uint64_t p_off = pv_byte;
+                uint64_t p_rem = piece_len;
+                while (p_rem > 0) {
+                    size_t chunk = p_rem > sizeof(g_io_buf) ? sizeof(g_io_buf) : (size_t)p_rem;
+                    if (WL_FSEEK64(pv_file, (int64_t)p_off, SEEK_SET) != 0) return 0;
+                    if (fread(g_io_buf, 1, chunk, pv_file) != chunk) return 0;
+                    test_sha256_update(&sha, g_io_buf, chunk);
+                    p_off += chunk;
+                    p_rem -= chunk;
+                }
+                got_step += piece_len;
             }
-            got_step += piece_len;
-        }
-        if (rc != 0 || got_step != step) {
-            return 0;
+            if (rc != 0 || got_step != step) return 0;
         }
         cur += step;
         left -= step;
@@ -136,15 +147,21 @@ typedef struct {
     size_t pv_count;
     const char *images[2];
     size_t expected_lvs;
+    int test_pv_remove_fail;
+    int test_degraded_raid;
 } mappable_case_t;
 
 static const mappable_case_t kMappableCases[] = {
-    { "linear-1pv",          1, { "linear-1pv.img", NULL },                         1 },
-    { "linear-1pv-multiseg", 1, { "linear-1pv-multiseg.img", NULL },                3 },
-    { "linear-2pv",          2, { "linear-2pv-a.img", "linear-2pv-b.img" },         1 },
-    { "striped-2pv",         2, { "striped-2pv-a.img", "striped-2pv-b.img" },       1 },
-    { "sector4k",            1, { "sector4k.img", NULL },                           1 },
-    { "odd-geometry",        1, { "odd-geometry.img", NULL },                       1 },
+    { "linear-1pv",          1, { "linear-1pv.img", NULL },                         1, 0, 0 },
+    { "linear-1pv-multiseg", 1, { "linear-1pv-multiseg.img", NULL },                3, 0, 0 },
+    { "linear-2pv",          2, { "linear-2pv-a.img", "linear-2pv-b.img" },         1, 1, 0 },
+    { "striped-2pv",         2, { "striped-2pv-a.img", "striped-2pv-b.img" },       1, 1, 0 },
+    { "sector4k",            1, { "sector4k.img", NULL },                           1, 0, 0 },
+    { "odd-geometry",        1, { "odd-geometry.img", NULL },                       1, 0, 0 },
+    { "thin-pool",           1, { "thin-pool.img", NULL },                          2, 0, 0 },
+    { "snapshot",            1, { "snapshot.img", NULL },                           2, 0, 0 },
+    { "raid1-mirror",        2, { "raid1-mirror-a.img", "raid1-mirror-b.img" },     3, 0, 1 },
+    { "mixed-vg",            2, { "mixed-vg-a.img", "mixed-vg-b.img" },             4, 0, 0 },
 };
 
 static int find_lv_index(const lvmcore_volume_group *vg, const char *lv_name) {
@@ -234,6 +251,9 @@ static void verify_mappable_case(const char *images_dir,
     static const uint64_t kWindowXferSizes[] = { 513u, 4097u, 65537u };
     char line[512];
     int case_hashes = 0;
+    char whole_lv_names[8][64];
+    char whole_lv_hex[8][80];
+    size_t whole_lv_count = 0;
 
     while (fgets(line, sizeof(line), hf)) {
         char vg_lv[128];
@@ -264,8 +284,8 @@ static void verify_mappable_case(const char *images_dir,
             for (size_t xi = 0; xi < sizeof(kWindowXferSizes) / sizeof(kWindowXferSizes[0]); xi++) {
                 char got_hex[65] = {0};
                 if (!all_xfer_ok ||
-                    !map_stream_sha256(vg, &recs[slot], (size_t)lv_idx,
-                                       off, len, kWindowXferSizes[xi], got_hex) ||
+                    !stream_lv_sha256(vg, &recs[slot], (size_t)lv_idx,
+                                      off, len, kWindowXferSizes[xi], got_hex) ||
                     strcmp(got_hex, expect_hex) != 0) {
                     printf("  MISMATCH %s/%s off=%" PRIu64 " len=%" PRIu64 " xfer=%" PRIu64
                            "\n    expect=%s\n    got   =%s\n",
@@ -289,13 +309,13 @@ static void verify_mappable_case(const char *images_dir,
             char got_4097[65] = {0};
             int ok = (lv_idx >= 0 && full_size > 0);
             if (ok) {
-                ok = map_stream_sha256(vg, &recs[slot], (size_t)lv_idx,
-                                       0, full_size, 65537u, got_65537) &&
+                ok = stream_lv_sha256(vg, &recs[slot], (size_t)lv_idx,
+                                      0, full_size, 65537u, got_65537) &&
                      strcmp(got_65537, expect_hex) == 0;
             }
             if (ok && full_size <= 48u * 1024u * 1024u) {
-                ok = map_stream_sha256(vg, &recs[slot], (size_t)lv_idx,
-                                       0, full_size, 4097u, got_4097) &&
+                ok = stream_lv_sha256(vg, &recs[slot], (size_t)lv_idx,
+                                      0, full_size, 4097u, got_4097) &&
                      strcmp(got_4097, expect_hex) == 0;
             }
             if (!ok) {
@@ -308,6 +328,11 @@ static void verify_mappable_case(const char *images_dir,
             if (ok) {
                 case_hashes++;
                 g_hashes_verified++;
+                if (whole_lv_count < 8u) {
+                    snprintf(whole_lv_names[whole_lv_count], 64, "%.63s", lv_name);
+                    snprintf(whole_lv_hex[whole_lv_count], 80, "%.64s", expect_hex);
+                    whole_lv_count++;
+                }
             }
         }
     }
@@ -317,8 +342,7 @@ static void verify_mappable_case(const char *images_dir,
              tc->case_name, tc->expected_lvs, case_hashes);
     CHECK(label, case_hashes == (int)(tc->expected_lvs * 5u));
 
-    /* For 2-PV cases, removing PV1 must immediately fail-closed wl_map_next (-1). */
-    if (tc->pv_count == 2 && vg->lv_count > 0) {
+    if (tc->test_pv_remove_fail && vg->lv_count > 0) {
         wl_vg_pv_removed(recs, WL_VG_MAX, pv_uuids[1]);
         wl_map_iter it;
         uint64_t lv_sz = wl_lv_byte_size(vg, 0);
@@ -341,21 +365,56 @@ static void verify_mappable_case(const char *images_dir,
         CHECK(label, rc == -1);
     }
 
+    if (tc->test_degraded_raid) {
+        /* Removing PV0 must allow degraded failover read on PV1 for all 3 raid1/mirror LVs,
+         * while writes fail closed without diverging legs. */
+        wl_vg_pv_removed(recs, WL_VG_MAX, pv_uuids[0]);
+        wl_pv_io_ops ro_ops = make_ro_pv_ops(&recs[slot]);
+        for (size_t k = 0; k < whole_lv_count; k++) {
+            int lv_idx = find_lv_index(vg, whole_lv_names[k]);
+            uint64_t full_size = (lv_idx >= 0) ? wl_lv_byte_size(vg, (size_t)lv_idx) : 0;
+            char got_deg[65] = {0};
+            uint8_t dummy[512] = {0};
+            int deg_ok = (lv_idx >= 0) &&
+                         (wl_vg_lv_pv_complete(&recs[slot], (size_t)lv_idx) == 1) &&
+                         (wl_vg_lv_raid_all_legs_present(&recs[slot], (size_t)lv_idx) == 0) &&
+                         stream_lv_sha256(vg, &recs[slot], (size_t)lv_idx, 0, full_size, 65537u, got_deg) &&
+                         (strcmp(got_deg, whole_lv_hex[k]) == 0) &&
+                         (wl_complex_lv_write(vg, &recs[slot], (size_t)lv_idx, &ro_ops,
+                                              g_meta_scratch, sizeof(g_meta_scratch),
+                                              g_chunk_buf, g_aux_buf, sizeof(g_chunk_buf),
+                                              0, dummy, 512) != LVMCORE_OK);
+            snprintf(label, sizeof(label), "%.63s/%.63s: degraded read failover matches oracle & write fails closed",
+                     tc->case_name, whole_lv_names[k]);
+            CHECK(label, deg_ok);
+        }
+        /* Removing PV1 as well must fail reads closed. */
+        wl_vg_pv_removed(recs, WL_VG_MAX, pv_uuids[1]);
+        int lv0 = find_lv_index(vg, "lvraid1");
+        uint8_t buf[512];
+        CHECK("raid1-mirror/lvraid1: both PVs removed fails read closed",
+              lv0 >= 0 &&
+              wl_vg_lv_pv_complete(&recs[slot], (size_t)lv0) == 0 &&
+              wl_complex_lv_read(vg, &recs[slot], (size_t)lv0, &ro_ops,
+                                 g_meta_scratch, sizeof(g_meta_scratch),
+                                 g_aux_buf, sizeof(g_aux_buf),
+                                 0, buf, 512) != LVMCORE_OK);
+    }
+
 cleanup:
     for (size_t p = 0; p < tc->pv_count; p++) {
         if (files[p]) fclose(files[p]);
     }
 }
 
-static void verify_mixed_vg_fail_closed(const char *images_dir) {
+static void verify_mixed_vg_per_lv_gating(const char *images_dir) {
     FILE *fa = NULL, *fb = NULL;
     uint64_t sa = 0, sb = 0;
     char pa[1024], pb[1024];
     snprintf(pa, sizeof(pa), "%s/mixed-vg-a.img", images_dir);
     snprintf(pb, sizeof(pb), "%s/mixed-vg-b.img", images_dir);
-    CHECK("mixed-vg: open both PVs",
-          file_open_sized(pa, &fa, &sa) && file_open_sized(pb, &fb, &sb));
-    if (!fa || !fb) {
+    if (!file_open_sized(pa, &fa, &sa) || !file_open_sized(pb, &fb, &sb)) {
+        CHECK("mixed-vg gating: open both PVs", 0);
         if (fa) fclose(fa);
         if (fb) fclose(fb);
         return;
@@ -372,40 +431,34 @@ static void verify_mixed_vg_fail_closed(const char *images_dir) {
         lvmcore_arena_init(&tmp, g_arena_tmp, sizeof(g_arena_tmp));
         lvmcore_pv_label lbl;
         lvmcore_err err = {0};
-        CHECK("mixed-vg: read PV label", lvmcore_read_pv_label(&src, &tmp, &lbl, &err) == LVMCORE_OK);
+        lvmcore_read_pv_label(&src, &tmp, &lbl, &err);
         memcpy(pv_uuids[p], lbl.pv_uuid, sizeof(pv_uuids[p]));
 
         lvmcore_arena arena;
         lvmcore_arena_init(&arena, g_arena_pv[p], sizeof(g_arena_pv[p]));
         memset(&vgs[p], 0, sizeof(vgs[p]));
-        CHECK("mixed-vg: read VG",
-              lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vgs[p], &err) == LVMCORE_OK);
+        lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vgs[p], &err);
     }
 
     wl_vg_record recs[WL_VG_MAX];
     wl_vg_registry_init(recs, WL_VG_MAX);
     size_t slot = 99;
     size_t newly[WL_VG_MAX_LVS];
-    size_t newly_count = 99;
-
-    CHECK("mixed-vg: PV0 arrival pending with 0 eligible LVs",
-          wl_vg_arrival(recs, WL_VG_MAX, &slot, &vgs[0], pv_uuids[0], files[0],
-                        NULL, NULL, newly, WL_VG_MAX_LVS, &newly_count) == WL_ARR_PENDING &&
-          newly_count == 0);
-    CHECK("mixed-vg: PV1 arrival completes VG with 0 eligible LVs",
-          wl_vg_arrival(recs, WL_VG_MAX, &slot, &vgs[1], pv_uuids[1], files[1],
-                        NULL, NULL, newly, WL_VG_MAX_LVS, &newly_count) == WL_ARR_COMPLETED &&
-          newly_count == 0);
+    size_t newly_count = 0;
+    wl_vg_arrival(recs, WL_VG_MAX, &slot, &vgs[0], pv_uuids[0], files[0], NULL, NULL, newly, WL_VG_MAX_LVS, &newly_count);
+    wl_vg_arrival(recs, WL_VG_MAX, &slot, &vgs[1], pv_uuids[1], files[1], NULL, NULL, newly, WL_VG_MAX_LVS, &newly_count);
 
     const lvmcore_volume_group *vg = recs[slot].view;
     static const char *kRefusedNames[] = {
-        "lvplain", "lvthin", "lvraid", "snapshot0", "tpool"
+        "lvcache", "tpool", "snapshot0",
+        "lvol0_pmspare", "tpool_tmeta", "tpool_tdata",
+        "lvraid_rmeta_0", "lvraid_rimage_0", "lvraid_rmeta_1", "lvraid_rimage_1",
+        "lvcache_corig", "cpool", "cpool_cdata", "cpool_cmeta"
     };
     for (size_t k = 0; k < sizeof(kRefusedNames) / sizeof(kRefusedNames[0]); k++) {
         int idx = find_lv_index(vg, kRefusedNames[k]);
         char name[128];
-        snprintf(name, sizeof(name), "mixed-vg/%s: present, ineligible, wl_map_begin fails closed",
-                 kRefusedNames[k]);
+        snprintf(name, sizeof(name), "mixed-vg/%s: ineligible & wl_map_begin fails closed", kRefusedNames[k]);
         int refused = 0;
         if (idx >= 0) {
             wl_map_iter it;
@@ -420,20 +473,23 @@ static void verify_mixed_vg_fail_closed(const char *images_dir) {
         CHECK(name, refused);
     }
 
-    /* Every LV in mixed-vg (including hidden subvolumes) must fail child eligibility & map. */
-    int all_blocked = 1;
-    for (size_t i = 0; i < vg->lv_count; i++) {
-        wl_map_iter it;
-        wl_map_begin(&it, vg, &recs[slot], i, 0, 4096);
-        uint32_t pv_idx = 0;
-        uint64_t pv_b = 0, p_len = 0;
-        if (wl_vg_lv_child_eligible(&vg->lvs[i]) != 0 ||
-            wl_map_next(&it, &pv_idx, &pv_b, &p_len) != -1) {
-            all_blocked = 0;
+    /* Supported complex LVs MUST be child-eligible, complex, and refuse direct raw wl_map_begin. */
+    static const char *kSupportedComplex[] = { "lvplain", "lvsnap", "lvthin", "lvraid" };
+    for (size_t k = 0; k < sizeof(kSupportedComplex) / sizeof(kSupportedComplex[0]); k++) {
+        int idx = find_lv_index(vg, kSupportedComplex[k]);
+        char name[128];
+        snprintf(name, sizeof(name), "mixed-vg/%s: eligible complex LV (blocks raw bypass)", kSupportedComplex[k]);
+        int ok = 0;
+        if (idx >= 0) {
+            wl_map_iter it;
+            wl_map_begin(&it, vg, &recs[slot], (size_t)idx, 0, 4096);
+            ok = (wl_vg_lv_child_eligible(&vg->lvs[idx]) == 1) &&
+                 (wl_vg_lv_pv_complete(&recs[slot], (size_t)idx) == 1) &&
+                 (wl_vg_lv_is_complex(vg, (size_t)idx) == 1) &&
+                 (it.err != 0);
         }
+        CHECK(name, ok);
     }
-    CHECK("mixed-vg: every LV (all 13) ineligible and rejected by wl_map_begin/next",
-          vg->lv_count == 13u && all_blocked);
 
     fclose(fa);
     fclose(fb);
@@ -478,7 +534,6 @@ int main(int argc, char **argv) {
     const char *images_dir = argv[1];
     const char *expected_dir = argv[2];
 
-    /* Sanity check test_sha256 against NIST FIPS 180-4 empty + "abc" vectors. */
     {
         test_sha256_ctx ctx;
         char hex[65];
@@ -497,13 +552,13 @@ int main(int argc, char **argv) {
         verify_mappable_case(images_dir, expected_dir, &kMappableCases[i]);
     }
 
-    CHECK("corpus total: all 40/40 oracle hashes across 8 mappable LVs matched",
-          g_hashes_verified == 40);
+    CHECK("corpus total: all 95/95 oracle hashes across 19 mappable LVs matched",
+          g_hashes_verified == 95);
 
-    verify_mixed_vg_fail_closed(images_dir);
+    verify_mixed_vg_per_lv_gating(images_dir);
     verify_luks_fail_closed(images_dir);
 
-    printf("\ntest_driver_corpus_map: %d passed, %d failed (%d/40 corpus hashes verified)\n",
+    printf("\ntest_driver_corpus_map: %d passed, %d failed (%d/95 corpus hashes verified)\n",
            g_passes, g_fails, g_hashes_verified);
     return g_fails == 0 ? 0 : 1;
 }

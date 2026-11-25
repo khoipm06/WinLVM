@@ -1010,6 +1010,71 @@ int main(void) {
               lv_mf && lv_mf->mappable == 0);
     }
 
+    /* ---- 20. type = "linear" default stripe_count=1 & mirror leg start_extent bounds ---- */
+    {
+        const char *lin_mir_meta =
+            "vglinmir {\n"
+            "id = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n"
+            "seqno = 2\n"
+            "status = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n"
+            "extent_size = 8192\n"
+            "physical_volumes {\n"
+            "  pv0 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP0\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+            "  pv1 { id = \"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP1\" status = [\"ALLOCATABLE\"] pe_start = 2048 pe_count = 100 }\n"
+            "}\n"
+            "logical_volumes {\n"
+            "  lv_lin {\n"
+            "    id = \"11111111111111111111111111111111\"\n"
+            "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"linear\" stripes = [\"pv0\", 0] }\n"
+            "  }\n"
+            "  m_i0 {\n"
+            "    id = \"22222222222222222222222222222222\"\n"
+            "    status = [\"READ\", \"WRITE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 5 type = \"striped\" stripe_count = 1 stripes = [\"pv0\", 10] }\n"
+            "  }\n"
+            "  m_i1 {\n"
+            "    id = \"33333333333333333333333333333333\"\n"
+            "    status = [\"READ\", \"WRITE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 5 type = \"striped\" stripe_count = 1 stripes = [\"pv1\", 10] }\n"
+            "  }\n"
+            "  lv_mir_ok {\n"
+            "    id = \"44444444444444444444444444444444\"\n"
+            "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"mirror\" mirror_count = 2 region_size = 4096 mirrors = [\"m_i0\", 1, \"m_i1\", 1] }\n"
+            "  }\n"
+            "  lv_mir_oob {\n"
+            "    id = \"55555555555555555555555555555555\"\n"
+            "    status = [\"READ\", \"WRITE\", \"VISIBLE\"]\n"
+            "    segment_count = 1\n"
+            "    segment1 { start_extent = 0 extent_count = 4 type = \"mirror\" mirror_count = 2 region_size = 4096 mirrors = [\"m_i0\", 3, \"m_i1\", 0] }\n"
+            "  }\n"
+            "}\n"
+            "}\n";
+
+        lvmcore_arena arena;
+        lvmcore_arena_init(&arena, arena_buf, sizeof(arena_buf));
+        lvmcore_volume_group vg;
+        lvmcore_err err = {0};
+        lvmcore_status st = lvmcore_parse_vg_text(lin_mir_meta, strlen(lin_mir_meta), &arena, &vg, &err);
+        CHECK("linear-without-stripe_count + mirror-offset VG parses", st == LVMCORE_OK);
+        const lvmcore_logical_volume *lv_lin = lvmcore_vg_find_lv(&vg, "lv_lin");
+        const lvmcore_logical_volume *lv_mok = lvmcore_vg_find_lv(&vg, "lv_mir_ok");
+        const lvmcore_logical_volume *lv_moob = lvmcore_vg_find_lv(&vg, "lv_mir_oob");
+        CHECK("type=\"linear\" omitting stripe_count defaults stripe_count=1 and stays mappable",
+              lv_lin && lv_lin->mappable == 1 && lv_lin->segment_count == 1 &&
+              lv_lin->segments[0].stripe_count == 1);
+        CHECK("mirror leg start_extent + extent_count == leg_extents stays mappable",
+              lv_mok && lv_mok->mappable == 1);
+        CHECK("mirror leg start_extent + extent_count > leg_extents rejected",
+              lv_moob && lv_moob->mappable == 0 &&
+              strcmp(lv_moob->unsupported_reason, "raid1/mirror leg smaller than LV") == 0);
+    }
+
     printf("\n%d passed, %d failed (lvmcore hardening tests)\n", passes, fails);
     return fails ? 1 : 0;
 }
