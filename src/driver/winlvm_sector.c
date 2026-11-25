@@ -328,31 +328,50 @@ BOOLEAN WinLvmGetDiskPartitions(PDEVICE_OBJECT disk_pdo, PFILE_OBJECT disk_file,
 NTSTATUS WinLvmProbePartitionList(ULONG device_num, const ULONG *parts,
                                   size_t count, BOOLEAN explicit_probe) {
     NTSTATUS any_ok = STATUS_NOT_FOUND;
+    /* Retry up to 5 times (50ms each) when partmgr/volmgr has not yet published
+     * the partition symlink right after cold disk arrival. */
+    const ULONG max_attempts = (KeGetCurrentIrql() == PASSIVE_LEVEL) ? 6u : 1u;
     for (size_t i = 0; i < count; i++) {
-        WCHAR buf[64];
-        UNICODE_STRING u;
-        if (NT_SUCCESS(RtlStringCchPrintfW(
-                buf, sizeof(buf) / sizeof(WCHAR),
-                L"\\??\\Harddisk%uPartition%u",
-                (unsigned)device_num, (unsigned)parts[i]))) {
-            RtlInitUnicodeString(&u, buf);
-            NTSTATUS st = WinLvmProbeDevicePathEx(&u, FALSE, explicit_probe);
-            if (NT_SUCCESS(st)) {
-                any_ok = STATUS_SUCCESS;
-                continue;
+        for (ULONG attempt = 0; attempt < max_attempts; attempt++) {
+            if (attempt > 0) {
+                if (WinLvmIsProbeStopping()) return any_ok;
+                LARGE_INTEGER interval;
+                interval.QuadPart = -500000LL; /* 50ms relative (100ns units) */
+                KeDelayExecutionThread(KernelMode, FALSE, &interval);
+            }
+
+            WCHAR buf[64];
+            UNICODE_STRING u;
+            NTSTATUS st = STATUS_OBJECT_NAME_NOT_FOUND;
+            if (NT_SUCCESS(RtlStringCchPrintfW(
+                    buf, sizeof(buf) / sizeof(WCHAR),
+                    L"\\??\\Harddisk%uPartition%u",
+                    (unsigned)device_num, (unsigned)parts[i]))) {
+                RtlInitUnicodeString(&u, buf);
+                st = WinLvmProbeDevicePathEx(&u, FALSE, explicit_probe);
+                if (NT_SUCCESS(st)) {
+                    any_ok = STATUS_SUCCESS;
+                    break;
+                }
+            }
+            if (st == STATUS_OBJECT_NAME_NOT_FOUND ||
+                st == STATUS_OBJECT_PATH_NOT_FOUND) {
+                if (NT_SUCCESS(RtlStringCchPrintfW(
+                        buf, sizeof(buf) / sizeof(WCHAR),
+                        L"\\Device\\Harddisk%u\\Partition%u",
+                        (unsigned)device_num, (unsigned)parts[i]))) {
+                    RtlInitUnicodeString(&u, buf);
+                    st = WinLvmProbeDevicePathEx(&u, FALSE, explicit_probe);
+                    if (NT_SUCCESS(st)) {
+                        any_ok = STATUS_SUCCESS;
+                        break;
+                    }
+                }
             }
             if (st != STATUS_OBJECT_NAME_NOT_FOUND &&
                 st != STATUS_OBJECT_PATH_NOT_FOUND) {
-                continue;
+                break;
             }
-        }
-        if (NT_SUCCESS(RtlStringCchPrintfW(
-                buf, sizeof(buf) / sizeof(WCHAR),
-                L"\\Device\\Harddisk%u\\Partition%u",
-                (unsigned)device_num, (unsigned)parts[i]))) {
-            RtlInitUnicodeString(&u, buf);
-            NTSTATUS st = WinLvmProbeDevicePathEx(&u, FALSE, explicit_probe);
-            if (NT_SUCCESS(st)) any_ok = STATUS_SUCCESS;
         }
     }
     return any_ok;
