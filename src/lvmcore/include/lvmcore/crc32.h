@@ -22,6 +22,20 @@ uint32_t lvmcore_crc32(const void *data, size_t len);
 /* Incremental: seed with LVMCORE_CRC32_INIT or previous return. */
 uint32_t lvmcore_crc32_update(uint32_t crc, const void *data, size_t len);
 
+/*
+ * Castagnoli CRC-32C (polynomial 0x82f63b78 reflected) matching Linux
+ * device-mapper persistent-data (`dm_bm_checksum`: crc32c(~0u, buf, len) ^ xor_val,
+ * with NO final bitwise inversion before the XOR constant).
+ */
+#define LVMCORE_CRC32C_INIT                0xffffffffu
+#define LVMCORE_THIN_SUPERBLOCK_CSUM_XOR   160774u
+#define LVMCORE_THIN_BTREE_CSUM_XOR        121107u
+#define LVMCORE_THIN_BITMAP_CSUM_XOR       240779u
+#define LVMCORE_THIN_INDEX_CSUM_XOR        160478u
+
+uint32_t lvmcore_crc32c_update(uint32_t crc, const void *data, size_t len);
+uint32_t lvmcore_crc32c_dm(const void *data, size_t len, uint32_t xor_val);
+
 #ifdef __cplusplus
 }
 #endif

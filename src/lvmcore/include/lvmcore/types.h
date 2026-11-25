@@ -150,9 +150,19 @@ typedef struct lvmcore_mda_header {
 
 /* Segment type classification. */
 typedef enum lvmcore_seg_type {
-    LVMCORE_SEG_STRIPED = 0, /* stripe_count == 1 represents linear */
-    LVMCORE_SEG_OTHER   = 1  /* thin, raid, snapshot, etc. */
+    LVMCORE_SEG_STRIPED   = 0, /* stripe_count == 1 represents linear */
+    LVMCORE_SEG_OTHER     = 1, /* unsupported / unknown (cache, raid5, vdo, etc.) */
+    LVMCORE_SEG_THIN_POOL = 2, /* thin-pool container */
+    LVMCORE_SEG_THIN      = 3, /* thin logical volume */
+    LVMCORE_SEG_SNAPSHOT  = 4, /* classic dm-snapshot */
+    LVMCORE_SEG_RAID1     = 5, /* dm-raid raid1 */
+    LVMCORE_SEG_MIRROR    = 6  /* dm-mirror */
 } lvmcore_seg_type;
+
+/* Generic bounded string item for tags and flags arrays. */
+typedef struct lvmcore_tag {
+    char name[64];
+} lvmcore_tag;
 
 /* One stripe in a segment: target key ("pv0") + start extent on target. */
 typedef struct lvmcore_stripe {
@@ -160,26 +170,50 @@ typedef struct lvmcore_stripe {
     uint64_t start_extent;
 } lvmcore_stripe;
 
+/* One leg in a raid1 or mirror segment. */
+typedef struct lvmcore_raid_leg {
+    char     meta_lv[64];  /* raid1: "<lv>_rmeta_N" (empty for mirror) */
+    char     image_lv[64]; /* raid1: "<lv>_rimage_N"; mirror: "<lv>_mimage_N" */
+    uint64_t start_extent; /* mirror image start extent (typically 0) */
+} lvmcore_raid_leg;
+
 /* One segment within a logical volume. */
 typedef struct lvmcore_segment {
-    uint64_t         start_extent;
-    uint64_t         extent_count;
-    lvmcore_seg_type type;
-    char             seg_type_name[32];
-    uint64_t         stripe_count;
-    uint64_t         stripe_size_sectors;
-    size_t           stripe_count_used;
-    lvmcore_stripe  *stripes;
-    char             origin[64];
-    int              stripe_overflow;
+    uint64_t          start_extent;
+    uint64_t          extent_count;
+    lvmcore_seg_type  type;
+    char              seg_type_name[32];
+    uint64_t          stripe_count;
+    uint64_t          stripe_size_sectors;
+    size_t            stripe_count_used;
+    lvmcore_stripe   *stripes;
+    char              origin[64];
+    int               stripe_overflow;
+    /* Structured fields for thin-pool, thin, snapshot, raid1, and mirror. */
+    char              pool_metadata[64];
+    char              pool_data[64];
+    char              cow_store[64];
+    char              mirror_log[64];
+    char              discards[24];
+    uint64_t          chunk_size_sectors;
+    uint64_t          transaction_id;
+    uint64_t          device_id;
+    uint64_t          region_size_sectors;
+    uint64_t          device_count;
+    int               has_transaction_id;
+    int               has_device_id;
+    int               has_zero_new_blocks;
+    int               zero_new_blocks;
+    size_t            raid_leg_count;
+    lvmcore_raid_leg *raid_legs;
     /*
-     * Raw pass-through for non-striped segment types (thin, raid, snapshot):
+     * Raw pass-through for LVMCORE_SEG_OTHER segment types (cache, raid5, etc.):
      * verbatim "key = value" lines from the on-disk text, arena-owned,
      * appended in on-disk order. Re-emitted unchanged by the serializer so
      * LVM2 (vgcfgrestore) accepts segments the canonical model cannot map.
      */
-    char            *raw_body;
-    size_t           raw_body_len;
+    char             *raw_body;
+    size_t            raw_body_len;
 } lvmcore_segment;
 
 /* One logical volume record. */
@@ -187,10 +221,19 @@ typedef struct lvmcore_logical_volume {
     char             name[64];
     char             id[33]; /* raw 32 characters + NUL */
     int              visible;
+    int              status_visible; /* raw on-disk VISIBLE flag for lossless serialization */
     int              read_only; /* 1 if LV status lacks "WRITE", 0 if "WRITE" is present */
     int              mappable;
     int              internal;
+    int              is_thin_pool;
+    int              is_snapshot_origin;
+    int              is_snapshot_cow;
+    char             snapshot_wrapper[64]; /* e.g. "snapshot0" when classic LVM2 wrapper targets this LV */
     char             unsupported_reason[64];
+    size_t           flag_count;
+    lvmcore_tag     *flags;
+    size_t           tag_count;
+    lvmcore_tag     *tags;
     size_t           segment_count;
     uint64_t         declared_segment_count;
     lvmcore_segment *segments;
@@ -199,13 +242,18 @@ typedef struct lvmcore_logical_volume {
 
 /* One physical volume record in a volume group. */
 typedef struct lvmcore_physical_volume {
-    char     key[64]; /* e.g. "pv0" */
-    char     id[33];  /* raw 32 characters + NUL */
-    char     device[128];
-    uint64_t pe_start; /* sectors */
-    uint64_t pe_count;
-    uint64_t dev_size_sectors;
-    int      missing; /* 1 if PV status/flags contains "MISSING", 0 otherwise */
+    char         key[64]; /* e.g. "pv0" */
+    char         id[33];  /* raw 32 characters + NUL */
+    char         device[128];
+    uint64_t     pe_start; /* sectors */
+    uint64_t     pe_count;
+    uint64_t     dev_size_sectors;
+    int          missing;         /* 1 if PV status/flags contains "MISSING", 0 otherwise */
+    int          not_allocatable; /* 1 if status explicitly lacks "ALLOCATABLE" */
+    size_t       flag_count;
+    lvmcore_tag *flags;
+    size_t       tag_count;
+    lvmcore_tag *tags;
 } lvmcore_physical_volume;
 
 /* Volume group flags. */
@@ -219,8 +267,17 @@ typedef struct lvmcore_volume_group {
     char                     system_id[64];
     uint64_t                 seqno;
     uint64_t                 extent_size_sectors;
+    uint64_t                 max_lv;
+    uint64_t                 max_pv;
+    uint64_t                 metadata_copies;
     uint32_t                 flags;
     int                      read_only; /* 1 if VG status lacks "WRITE", 0 if "WRITE" is present */
+    int                      exported;
+    int                      not_resizeable;
+    size_t                   vg_flag_count;
+    lvmcore_tag             *vg_flags;
+    size_t                   tag_count;
+    lvmcore_tag             *tags;
     size_t                   pv_count;
     lvmcore_physical_volume *pvs;
     size_t                   lv_count;

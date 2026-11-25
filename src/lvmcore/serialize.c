@@ -147,6 +147,21 @@ static void tw_put_uuid(text_writer *tw, const char *id_nodash) {
 /* VG body serializers                                                */
 /* ------------------------------------------------------------------ */
 
+LVMCORE_NOINLINE static void ser_tag_array(text_writer *tw,
+                                           const char *indent_key,
+                                           const lvmcore_tag *items,
+                                           size_t count) {
+    tw_puts(tw, indent_key);
+    tw_puts(tw, " = [");
+    for (size_t i = 0; i < count; i++) {
+        if (i > 0) tw_puts(tw, ", ");
+        tw_putc(tw, '"');
+        tw_puts_escaped(tw, items[i].name);
+        tw_putc(tw, '"');
+    }
+    tw_puts(tw, "]\n");
+}
+
 /* Full PV block writer — declared separately to keep frames small. */
 LVMCORE_NOINLINE static void ser_pv_full(text_writer *tw,
                                          const lvmcore_physical_volume *pv,
@@ -162,12 +177,19 @@ LVMCORE_NOINLINE static void ser_pv_full(text_writer *tw,
         tw_puts_escaped(tw, pv->device);
         tw_puts(tw, "\"\n");
     }
-    if (pv->missing) {
+    if (!pv->not_allocatable && pv->missing) {
         tw_puts(tw, "\n\t\t\tstatus = [\"ALLOCATABLE\", \"MISSING\"]\n");
-    } else {
+    } else if (!pv->not_allocatable) {
         tw_puts(tw, "\n\t\t\tstatus = [\"ALLOCATABLE\"]\n");
+    } else if (pv->missing) {
+        tw_puts(tw, "\n\t\t\tstatus = [\"MISSING\"]\n");
+    } else {
+        tw_puts(tw, "\n\t\t\tstatus = []\n");
     }
-    tw_puts(tw, "\t\t\tflags = []\n");
+    ser_tag_array(tw, "\t\t\tflags", pv->flags, pv->flag_count);
+    if (pv->tag_count > 0 && pv->tags) {
+        ser_tag_array(tw, "\t\t\ttags", pv->tags, pv->tag_count);
+    }
     tw_puts(tw, "\t\t\tdev_size = ");
     tw_put_u64(tw, pv->dev_size_sectors);
     tw_putc(tw, '\n');
@@ -194,8 +216,88 @@ LVMCORE_NOINLINE static void ser_segment_block(text_writer *tw,
     tw_put_u64(tw, seg->extent_count);
     tw_putc(tw, '\n');
     tw_puts(tw, "\n\t\t\t\ttype = \"");
-    tw_puts(tw, seg->seg_type_name);
+    if (seg->seg_type_name[0]) {
+        tw_puts(tw, seg->seg_type_name);
+    } else if (seg->type == LVMCORE_SEG_STRIPED) {
+        tw_puts(tw, "striped");
+    } else if (seg->type == LVMCORE_SEG_THIN_POOL) {
+        tw_puts(tw, "thin-pool");
+    } else if (seg->type == LVMCORE_SEG_THIN) {
+        tw_puts(tw, "thin");
+    } else if (seg->type == LVMCORE_SEG_SNAPSHOT) {
+        tw_puts(tw, "snapshot");
+    } else if (seg->type == LVMCORE_SEG_RAID1) {
+        tw_puts(tw, "raid1");
+    } else if (seg->type == LVMCORE_SEG_MIRROR) {
+        tw_puts(tw, "mirror");
+    }
     tw_puts(tw, "\"\n");
+
+    if (seg->type == LVMCORE_SEG_THIN_POOL) {
+        if (seg->pool_metadata[0]) tw_line_str(tw, "\t\t\t\tmetadata", seg->pool_metadata);
+        if (seg->pool_data[0]) tw_line_str(tw, "\t\t\t\tpool", seg->pool_data);
+        if (seg->has_transaction_id) tw_line_u64(tw, "\t\t\t\ttransaction_id", seg->transaction_id);
+        if (seg->chunk_size_sectors > 0) tw_line_u64(tw, "\t\t\t\tchunk_size", seg->chunk_size_sectors);
+        if (seg->discards[0]) tw_line_str(tw, "\t\t\t\tdiscards", seg->discards);
+        if (seg->has_zero_new_blocks) tw_line_u64(tw, "\t\t\t\tzero_new_blocks", seg->zero_new_blocks ? 1u : 0u);
+        tw_puts(tw, "\t\t\t}\n");
+        return;
+    }
+
+    if (seg->type == LVMCORE_SEG_THIN) {
+        if (seg->pool_data[0]) tw_line_str(tw, "\t\t\t\tthin_pool", seg->pool_data);
+        if (seg->has_transaction_id) tw_line_u64(tw, "\t\t\t\ttransaction_id", seg->transaction_id);
+        if (seg->has_device_id) tw_line_u64(tw, "\t\t\t\tdevice_id", seg->device_id);
+        if (seg->origin[0]) tw_line_str(tw, "\t\t\t\torigin", seg->origin);
+        tw_puts(tw, "\t\t\t}\n");
+        return;
+    }
+
+    if (seg->type == LVMCORE_SEG_SNAPSHOT) {
+        if (seg->chunk_size_sectors > 0) tw_line_u64(tw, "\t\t\t\tchunk_size", seg->chunk_size_sectors);
+        if (seg->origin[0]) tw_line_str(tw, "\t\t\t\torigin", seg->origin);
+        if (seg->cow_store[0]) tw_line_str(tw, "\t\t\t\tcow_store", seg->cow_store);
+        tw_puts(tw, "\t\t\t}\n");
+        return;
+    }
+
+    if (seg->type == LVMCORE_SEG_RAID1) {
+        uint64_t dc = seg->device_count ? seg->device_count : (uint64_t)seg->raid_leg_count;
+        tw_line_u64(tw, "\t\t\t\tdevice_count", dc);
+        if (seg->region_size_sectors > 0) tw_line_u64(tw, "\t\t\t\tregion_size", seg->region_size_sectors);
+        tw_puts(tw, "\n\t\t\t\traids = [\n");
+        for (size_t i = 0; i < seg->raid_leg_count; i++) {
+            tw_puts(tw, "\t\t\t\t\t\"");
+            tw_puts_escaped(tw, seg->raid_legs[i].meta_lv);
+            tw_puts(tw, "\", \"");
+            tw_puts_escaped(tw, seg->raid_legs[i].image_lv);
+            tw_putc(tw, '"');
+            if (i + 1 < seg->raid_leg_count) tw_putc(tw, ',');
+            tw_putc(tw, '\n');
+        }
+        tw_puts(tw, "\t\t\t\t]\n");
+        tw_puts(tw, "\t\t\t}\n");
+        return;
+    }
+
+    if (seg->type == LVMCORE_SEG_MIRROR) {
+        uint64_t mc = seg->device_count ? seg->device_count : (uint64_t)seg->raid_leg_count;
+        tw_line_u64(tw, "\t\t\t\tmirror_count", mc);
+        if (seg->mirror_log[0]) tw_line_str(tw, "\t\t\t\tmirror_log", seg->mirror_log);
+        if (seg->region_size_sectors > 0) tw_line_u64(tw, "\t\t\t\tregion_size", seg->region_size_sectors);
+        tw_puts(tw, "\n\t\t\t\tmirrors = [\n");
+        for (size_t i = 0; i < seg->raid_leg_count; i++) {
+            tw_puts(tw, "\t\t\t\t\t\"");
+            tw_puts_escaped(tw, seg->raid_legs[i].image_lv);
+            tw_puts(tw, "\", ");
+            tw_put_u64(tw, seg->raid_legs[i].start_extent);
+            if (i + 1 < seg->raid_leg_count) tw_putc(tw, ',');
+            tw_putc(tw, '\n');
+        }
+        tw_puts(tw, "\t\t\t\t]\n");
+        tw_puts(tw, "\t\t\t}\n");
+        return;
+    }
 
     if (seg->type == LVMCORE_SEG_OTHER && seg->raw_body_len > 0 && seg->raw_body) {
         /* Unmapped segment types: re-emit verbatim keys captured at parse. */
@@ -240,16 +342,20 @@ LVMCORE_NOINLINE static void ser_lv_block(text_writer *tw,
     tw_puts(tw, "\t\t\tid = \"");
     tw_put_uuid(tw, lv->id);
     tw_puts(tw, "\"\n");
-    if (lv->visible && !lv->read_only) {
+    int emit_visible = lv->is_snapshot_cow ? lv->status_visible : lv->visible;
+    if (emit_visible && !lv->read_only) {
         tw_puts(tw, "\t\t\tstatus = [\"READ\", \"WRITE\", \"VISIBLE\"]\n");
-    } else if (lv->visible && lv->read_only) {
+    } else if (emit_visible && lv->read_only) {
         tw_puts(tw, "\t\t\tstatus = [\"READ\", \"VISIBLE\"]\n");
-    } else if (!lv->visible && !lv->read_only) {
+    } else if (!emit_visible && !lv->read_only) {
         tw_puts(tw, "\t\t\tstatus = [\"READ\", \"WRITE\"]\n");
     } else {
         tw_puts(tw, "\t\t\tstatus = [\"READ\"]\n");
     }
-    tw_puts(tw, "\t\t\tflags = []\n");
+    ser_tag_array(tw, "\t\t\tflags", lv->flags, lv->flag_count);
+    if (lv->tag_count > 0 && lv->tags) {
+        ser_tag_array(tw, "\t\t\ttags", lv->tags, lv->tag_count);
+    }
     tw_puts(tw, "\t\t\tcreation_time = 0\n");
     tw_puts(tw, "\t\t\tcreation_host = \"winlvm\"\n");
     tw_puts(tw, "\t\t\tsegment_count = ");
@@ -271,18 +377,34 @@ LVMCORE_NOINLINE static void ser_vg_root(text_writer *tw,
     tw_puts(tw, "\"\n");
     tw_line_u64(tw, "\tseqno", vg->seqno);
     tw_line_str(tw, "\tformat", "lvm2");
-    if (vg->read_only) {
-        tw_puts(tw, "\tstatus = [\"RESIZEABLE\", \"READ\"]\n");
-    } else {
-        tw_puts(tw, "\tstatus = [\"RESIZEABLE\", \"READ\", \"WRITE\"]\n");
+    tw_puts(tw, "\tstatus = [");
+    int need_comma = 0;
+    if (!vg->not_resizeable) {
+        tw_puts(tw, "\"RESIZEABLE\"");
+        need_comma = 1;
     }
-    tw_puts(tw, "\tflags = []\n");
+    if (need_comma) tw_puts(tw, ", ");
+    tw_puts(tw, "\"READ\"");
+    if (!vg->read_only) {
+        tw_puts(tw, ", \"WRITE\"");
+    }
+    if (vg->exported) {
+        tw_puts(tw, ", \"EXPORTED\"");
+    }
+    tw_puts(tw, "]\n");
+    ser_tag_array(tw, "\tflags", vg->vg_flags, vg->vg_flag_count);
+    if (vg->tag_count > 0 && vg->tags) {
+        ser_tag_array(tw, "\ttags", vg->tags, vg->tag_count);
+    }
     if (vg->system_id[0]) {
         tw_line_str(tw, "\tsystem_id", vg->system_id);
     }
     tw_line_u64(tw, "\textent_size", vg->extent_size_sectors);
-    tw_line_u64(tw, "\tmax_lv", 0);
-    tw_line_u64(tw, "\tmax_pv", 0);
+    tw_line_u64(tw, "\tmax_lv", vg->max_lv);
+    tw_line_u64(tw, "\tmax_pv", vg->max_pv);
+    if (vg->metadata_copies > 0) {
+        tw_line_u64(tw, "\tmetadata_copies", vg->metadata_copies);
+    }
 
     /* physical_volumes section */
     tw_puts(tw, "\n\tphysical_volumes {\n");

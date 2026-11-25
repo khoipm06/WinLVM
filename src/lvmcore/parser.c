@@ -79,6 +79,33 @@ static void wl_strcpy(char *dst, size_t dst_cap, const char *src) {
     dst[i] = '\0';
 }
 
+static void wl_memswap(void *a, void *b, size_t n) {
+    uint8_t *pa = (uint8_t *)a;
+    uint8_t *pb = (uint8_t *)b;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t t = pa[i];
+        pa[i] = pb[i];
+        pb[i] = t;
+    }
+}
+
+static int wl_ends_with(const char *s, const char *suffix) {
+    size_t sl = wl_strlen(s);
+    size_t xl = wl_strlen(suffix);
+    if (sl < xl) return 0;
+    return wl_memcmp(s + sl - xl, suffix, xl) == 0;
+}
+
+static int wl_is_snapshot_wrapper_name(const char *name) {
+    if (!name) return 0;
+    size_t len = wl_strlen(name);
+    if (len < 9 || wl_memcmp(name, "snapshot", 8) != 0) return 0;
+    for (size_t i = 8; i < len; i++) {
+        if (name[i] < '0' || name[i] > '9') return 0;
+    }
+    return 1;
+}
+
 static void wl_strip_dashes(char *s) {
     if (!s) return;
     char *d = s;
@@ -635,9 +662,13 @@ static void p_skip_value(parser *ps) {
     }
 }
 
-#define WL_STAT_VISIBLE (1u << 0)
-#define WL_STAT_WRITE   (1u << 1)
-#define WL_STAT_MISSING (1u << 2)
+#define WL_STAT_VISIBLE     (1u << 0)
+#define WL_STAT_WRITE       (1u << 1)
+#define WL_STAT_MISSING     (1u << 2)
+#define WL_STAT_ALLOCATABLE (1u << 3)
+#define WL_STAT_EXPORTED    (1u << 4)
+#define WL_STAT_RESIZEABLE  (1u << 5)
+#define WL_STAT_NONEMPTY    (1u << 6)
 
 LVMCORE_NOINLINE static uint32_t parse_status_list(parser *ps) {
     uint32_t mask = 0;
@@ -659,14 +690,60 @@ LVMCORE_NOINLINE static uint32_t parse_status_list(parser *ps) {
         }
         char s[32];
         if (p_string(ps, s, sizeof(s))) {
+            mask |= WL_STAT_NONEMPTY;
             if (wl_streq(s, "VISIBLE")) mask |= WL_STAT_VISIBLE;
             else if (wl_streq(s, "WRITE")) mask |= WL_STAT_WRITE;
             else if (wl_streq(s, "MISSING")) mask |= WL_STAT_MISSING;
+            else if (wl_streq(s, "ALLOCATABLE")) mask |= WL_STAT_ALLOCATABLE;
+            else if (wl_streq(s, "EXPORTED")) mask |= WL_STAT_EXPORTED;
+            else if (wl_streq(s, "RESIZEABLE")) mask |= WL_STAT_RESIZEABLE;
         } else {
             ps->pos++;
         }
     }
     return mask;
+}
+
+LVMCORE_NOINLINE static void parse_tag_list(parser *ps, lvmcore_arena *arena,
+                                            lvmcore_tag **out_tags,
+                                            size_t *out_count) {
+    p_skip(ps);
+    if (ps->pos >= ps->len || ps->p[ps->pos] != '[') {
+        p_skip_value(ps);
+        return;
+    }
+    ps->pos++;
+    arena_vec vec;
+    if (!arena_vec_init(&vec, arena, 4, sizeof(lvmcore_tag))) {
+        ps->pos--;
+        p_skip_value(ps);
+        return;
+    }
+    for (;;) {
+        p_skip(ps);
+        if (ps->pos >= ps->len || ps->p[ps->pos] == ']') {
+            if (ps->pos < ps->len) ps->pos++;
+            break;
+        }
+        if (ps->p[ps->pos] == ',') {
+            ps->pos++;
+            continue;
+        }
+        if (ps->p[ps->pos] == '"') {
+            lvmcore_tag *item = (lvmcore_tag *)arena_vec_push_empty(&vec, arena);
+            if (!item) {
+                char discard[64];
+                p_string(ps, discard, sizeof(discard));
+            } else if (!p_string(ps, item->name, sizeof(item->name))) {
+                vec.count--;
+                break;
+            }
+        } else {
+            ps->pos++;
+        }
+    }
+    *out_tags = (lvmcore_tag *)vec.data;
+    *out_count = vec.count;
 }
 
 LVMCORE_NOINLINE static void parse_stripes(parser *ps, lvmcore_segment *seg, lvmcore_arena *arena) {
@@ -695,18 +772,26 @@ LVMCORE_NOINLINE static void parse_stripes(parser *ps, lvmcore_segment *seg, lvm
             continue;
         }
         if (c == '"') {
-            char target[64];
-            if (!p_string(ps, target, sizeof(target))) break;
+            lvmcore_stripe *st = (lvmcore_stripe *)arena_vec_push_empty(&stripes_vec, arena);
+            if (!st) {
+                char discard[64];
+                uint64_t dummy = 0;
+                seg->stripe_overflow = 1;
+                if (!p_string(ps, discard, sizeof(discard))) break;
+                p_skip(ps);
+                if (ps->pos < ps->len && ps->p[ps->pos] == ',') ps->pos++;
+                if (!p_int(ps, &dummy)) break;
+                continue;
+            }
+            if (!p_string(ps, st->pv_key, sizeof(st->pv_key))) {
+                stripes_vec.count--;
+                break;
+            }
             p_skip(ps);
             if (ps->pos < ps->len && ps->p[ps->pos] == ',') ps->pos++;
-            uint64_t start_ext = 0;
-            if (!p_int(ps, &start_ext)) break;
-
-            lvmcore_stripe st;
-            wl_strcpy(st.pv_key, sizeof(st.pv_key), target);
-            st.start_extent = start_ext;
-            if (!arena_vec_push(&stripes_vec, arena, &st)) {
-                seg->stripe_overflow = 1;
+            if (!p_int(ps, &st->start_extent)) {
+                stripes_vec.count--;
+                break;
             }
         } else {
             ps->pos++;
@@ -715,6 +800,123 @@ LVMCORE_NOINLINE static void parse_stripes(parser *ps, lvmcore_segment *seg, lvm
 
     seg->stripes = (lvmcore_stripe *)stripes_vec.data;
     seg->stripe_count_used = stripes_vec.count;
+}
+
+LVMCORE_NOINLINE static void parse_raids(parser *ps, lvmcore_segment *seg, lvmcore_arena *arena) {
+    p_skip(ps);
+    if (ps->pos >= ps->len || ps->p[ps->pos] != '[') {
+        p_skip_value(ps);
+        return;
+    }
+    ps->pos++;
+
+    arena_vec vec;
+    if (!arena_vec_init(&vec, arena, 4, sizeof(lvmcore_raid_leg))) {
+        seg->stripe_overflow = 1;
+        ps->pos--;
+        p_skip_value(ps);
+        return;
+    }
+
+    for (;;) {
+        p_skip(ps);
+        if (ps->pos >= ps->len) break;
+        char c = ps->p[ps->pos];
+        if (c == ']') {
+            ps->pos++;
+            break;
+        }
+        if (c == ',') {
+            ps->pos++;
+            continue;
+        }
+        if (c == '"') {
+            lvmcore_raid_leg *leg = (lvmcore_raid_leg *)arena_vec_push_empty(&vec, arena);
+            if (!leg) {
+                char discard[64];
+                seg->stripe_overflow = 1;
+                if (!p_string(ps, discard, sizeof(discard))) break;
+                p_skip(ps);
+                if (ps->pos < ps->len && ps->p[ps->pos] == ',') ps->pos++;
+                if (!p_string(ps, discard, sizeof(discard))) break;
+                continue;
+            }
+            if (!p_string(ps, leg->meta_lv, sizeof(leg->meta_lv))) {
+                vec.count--;
+                break;
+            }
+            p_skip(ps);
+            if (ps->pos < ps->len && ps->p[ps->pos] == ',') ps->pos++;
+            if (!p_string(ps, leg->image_lv, sizeof(leg->image_lv))) {
+                vec.count--;
+                break;
+            }
+        } else {
+            ps->pos++;
+        }
+    }
+
+    seg->raid_legs = (lvmcore_raid_leg *)vec.data;
+    seg->raid_leg_count = vec.count;
+}
+
+LVMCORE_NOINLINE static void parse_mirrors(parser *ps, lvmcore_segment *seg, lvmcore_arena *arena) {
+    p_skip(ps);
+    if (ps->pos >= ps->len || ps->p[ps->pos] != '[') {
+        p_skip_value(ps);
+        return;
+    }
+    ps->pos++;
+
+    arena_vec vec;
+    if (!arena_vec_init(&vec, arena, 4, sizeof(lvmcore_raid_leg))) {
+        seg->stripe_overflow = 1;
+        ps->pos--;
+        p_skip_value(ps);
+        return;
+    }
+
+    for (;;) {
+        p_skip(ps);
+        if (ps->pos >= ps->len) break;
+        char c = ps->p[ps->pos];
+        if (c == ']') {
+            ps->pos++;
+            break;
+        }
+        if (c == ',') {
+            ps->pos++;
+            continue;
+        }
+        if (c == '"') {
+            lvmcore_raid_leg *leg = (lvmcore_raid_leg *)arena_vec_push_empty(&vec, arena);
+            if (!leg) {
+                char discard[64];
+                uint64_t dummy = 0;
+                seg->stripe_overflow = 1;
+                if (!p_string(ps, discard, sizeof(discard))) break;
+                p_skip(ps);
+                if (ps->pos < ps->len && ps->p[ps->pos] == ',') ps->pos++;
+                if (!p_int(ps, &dummy)) break;
+                continue;
+            }
+            if (!p_string(ps, leg->image_lv, sizeof(leg->image_lv))) {
+                vec.count--;
+                break;
+            }
+            p_skip(ps);
+            if (ps->pos < ps->len && ps->p[ps->pos] == ',') ps->pos++;
+            if (!p_int(ps, &leg->start_extent)) {
+                vec.count--;
+                break;
+            }
+        } else {
+            ps->pos++;
+        }
+    }
+
+    seg->raid_legs = (lvmcore_raid_leg *)vec.data;
+    seg->raid_leg_count = vec.count;
 }
 
 static void seg_append_raw(parser *ps, lvmcore_segment *seg, lvmcore_arena *arena,
@@ -739,12 +941,13 @@ LVMCORE_NOINLINE static void parse_segment(parser *ps, lvmcore_segment *seg, lvm
     p_skip(ps);
     if (ps->pos >= ps->len || ps->p[ps->pos] != '{') return;
     ps->pos++;
+    bool has_stripe_count = false;
 
     for (;;) {
         p_skip(ps);
         if (ps->pos >= ps->len || ps->p[ps->pos] == '}') {
             if (ps->pos < ps->len) ps->pos++;
-            return;
+            break;
         }
         char key[64];
         size_t key_start = ps->pos;
@@ -756,34 +959,89 @@ LVMCORE_NOINLINE static void parse_segment(parser *ps, lvmcore_segment *seg, lvm
         if (ps->pos < ps->len && ps->p[ps->pos] == '=') {
             ps->pos++;
             p_skip(ps);
+            size_t val_start = ps->pos;
             if (wl_streq(key, "start_extent")) {
                 p_int(ps, &seg->start_extent);
             } else if (wl_streq(key, "extent_count")) {
                 p_int(ps, &seg->extent_count);
             } else if (wl_streq(key, "stripe_count")) {
                 p_int(ps, &seg->stripe_count);
+                has_stripe_count = true;
             } else if (wl_streq(key, "stripe_size")) {
                 p_int(ps, &seg->stripe_size_sectors);
             } else if (wl_streq(key, "origin")) {
-                size_t val_start = ps->pos;
                 p_string(ps, seg->origin, sizeof(seg->origin));
-                /* Also raw-capture: SEG_OTHER (snapshot) serializer re-emits origin from raw body. */
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "metadata")) {
+                p_string(ps, seg->pool_metadata, sizeof(seg->pool_metadata));
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "pool") || wl_streq(key, "thin_pool")) {
+                p_string(ps, seg->pool_data, sizeof(seg->pool_data));
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "cow_store") || wl_streq(key, "cow")) {
+                p_string(ps, seg->cow_store, sizeof(seg->cow_store));
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "mirror_log")) {
+                p_string(ps, seg->mirror_log, sizeof(seg->mirror_log));
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "discards")) {
+                if (!p_string(ps, seg->discards, sizeof(seg->discards))) {
+                    p_ident(ps, seg->discards, sizeof(seg->discards));
+                }
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "chunk_size")) {
+                p_int(ps, &seg->chunk_size_sectors);
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "transaction_id")) {
+                if (p_int(ps, &seg->transaction_id)) seg->has_transaction_id = 1;
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "device_id")) {
+                if (p_int(ps, &seg->device_id)) seg->has_device_id = 1;
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "zero_new_blocks")) {
+                uint64_t zv = 0;
+                if (p_int(ps, &zv)) {
+                    seg->zero_new_blocks = (zv != 0) ? 1 : 0;
+                    seg->has_zero_new_blocks = 1;
+                }
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "region_size")) {
+                p_int(ps, &seg->region_size_sectors);
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "device_count") || wl_streq(key, "raid_count") ||
+                       wl_streq(key, "mirror_count") || wl_streq(key, "area_count")) {
+                p_int(ps, &seg->device_count);
                 seg_append_raw(ps, seg, arena, key_start, val_start);
             } else if (wl_streq(key, "type")) {
-                char t[32];
-                if (p_string(ps, t, sizeof(t)) || p_ident(ps, t, sizeof(t))) {
-                    wl_strcpy(seg->seg_type_name, sizeof(seg->seg_type_name), t);
-                    if (wl_streq(t, "striped") || wl_streq(t, "linear")) {
+                if (p_string(ps, seg->seg_type_name, sizeof(seg->seg_type_name)) ||
+                    p_ident(ps, seg->seg_type_name, sizeof(seg->seg_type_name))) {
+                    if (wl_streq(seg->seg_type_name, "striped") ||
+                        wl_streq(seg->seg_type_name, "linear")) {
                         seg->type = LVMCORE_SEG_STRIPED;
+                    } else if (wl_streq(seg->seg_type_name, "thin-pool")) {
+                        seg->type = LVMCORE_SEG_THIN_POOL;
+                    } else if (wl_streq(seg->seg_type_name, "thin")) {
+                        seg->type = LVMCORE_SEG_THIN;
+                    } else if (wl_streq(seg->seg_type_name, "snapshot")) {
+                        seg->type = LVMCORE_SEG_SNAPSHOT;
+                    } else if (wl_streq(seg->seg_type_name, "raid1")) {
+                        seg->type = LVMCORE_SEG_RAID1;
+                    } else if (wl_streq(seg->seg_type_name, "mirror")) {
+                        seg->type = LVMCORE_SEG_MIRROR;
                     } else {
                         seg->type = LVMCORE_SEG_OTHER;
                     }
                 }
             } else if (wl_streq(key, "stripes")) {
                 parse_stripes(ps, seg, arena);
+            } else if (wl_streq(key, "raids")) {
+                parse_raids(ps, seg, arena);
+                seg_append_raw(ps, seg, arena, key_start, val_start);
+            } else if (wl_streq(key, "mirrors")) {
+                parse_mirrors(ps, seg, arena);
+                seg_append_raw(ps, seg, arena, key_start, val_start);
             } else {
                 /* Unmapped key: capture raw "key = value" span for SEG_OTHER re-emit. */
-                size_t val_start = ps->pos;
                 p_skip_value(ps);
                 seg_append_raw(ps, seg, arena, key_start, val_start);
             }
@@ -792,6 +1050,9 @@ LVMCORE_NOINLINE static void parse_segment(parser *ps, lvmcore_segment *seg, lvm
         } else {
             ps->pos++;
         }
+    }
+    if (seg->type == LVMCORE_SEG_STRIPED && !has_stripe_count) {
+        seg->stripe_count = 1;
     }
 }
 
@@ -834,8 +1095,15 @@ LVMCORE_NOINLINE static void parse_lv_body(parser *ps, lvmcore_logical_volume *l
                 }
             } else if (wl_streq(key, "status")) {
                 uint32_t st_mask = parse_status_list(ps);
-                if (st_mask & WL_STAT_VISIBLE) lv->visible = 1;
+                if (st_mask & WL_STAT_VISIBLE) {
+                    lv->visible = 1;
+                    lv->status_visible = 1;
+                }
                 if (st_mask & WL_STAT_WRITE) has_write = true;
+            } else if (wl_streq(key, "flags")) {
+                parse_tag_list(ps, arena, &lv->flags, &lv->flag_count);
+            } else if (wl_streq(key, "tags")) {
+                parse_tag_list(ps, arena, &lv->tags, &lv->tag_count);
             } else {
                 p_skip_value(ps);
             }
@@ -845,7 +1113,7 @@ LVMCORE_NOINLINE static void parse_lv_body(parser *ps, lvmcore_logical_volume *l
                 lvmcore_segment *seg = (lvmcore_segment *)arena_vec_push_empty(&seg_vec, arena);
                 if (seg) {
                     seg->type = LVMCORE_SEG_OTHER; /* fail-closed default */
-                    seg->stripe_count = 1;
+                    seg->stripe_count = 0;
                     parse_segment(ps, seg, arena);
                 } else {
                     lv->segment_overflow = 1;
@@ -863,19 +1131,17 @@ LVMCORE_NOINLINE static void parse_lv_body(parser *ps, lvmcore_logical_volume *l
     lv->segments = (lvmcore_segment *)seg_vec.data;
     lv->segment_count = seg_vec.count;
 
-    /* Sort segments by start_extent (insertion sort; non-recursive) */
+    /* Sort segments by start_extent using in-place swaps (zero stack copy). */
     for (size_t i = 1; i < lv->segment_count; i++) {
-        lvmcore_segment tmp = lv->segments[i];
         size_t j = i;
-        while (j > 0 && lv->segments[j - 1].start_extent > tmp.start_extent) {
-            lv->segments[j] = lv->segments[j - 1];
+        while (j > 0 && lv->segments[j - 1].start_extent > lv->segments[j].start_extent) {
+            wl_memswap(&lv->segments[j - 1], &lv->segments[j], sizeof(lvmcore_segment));
             j--;
         }
-        lv->segments[j] = tmp;
     }
 }
 
-LVMCORE_NOINLINE static void parse_pv_body(parser *ps, lvmcore_physical_volume *pv) {
+LVMCORE_NOINLINE static void parse_pv_body(parser *ps, lvmcore_physical_volume *pv, lvmcore_arena *arena) {
     p_skip(ps);
     if (ps->pos >= ps->len || ps->p[ps->pos] != '{') return;
     ps->pos++;
@@ -884,7 +1150,7 @@ LVMCORE_NOINLINE static void parse_pv_body(parser *ps, lvmcore_physical_volume *
         p_skip(ps);
         if (ps->pos >= ps->len || ps->p[ps->pos] == '}') {
             if (ps->pos < ps->len) ps->pos++;
-            return;
+            break;
         }
         char key[64];
         if (!p_ident(ps, key, sizeof(key))) {
@@ -903,10 +1169,19 @@ LVMCORE_NOINLINE static void parse_pv_body(parser *ps, lvmcore_physical_volume *
                 }
             } else if (wl_streq(key, "device")) {
                 p_string(ps, pv->device, sizeof(pv->device));
-            } else if (wl_streq(key, "status") || wl_streq(key, "flags")) {
-                /* LVM2 may emit MISSING in status (legacy) or flags (current). */
+            } else if (wl_streq(key, "status")) {
                 uint32_t st_mask = parse_status_list(ps);
                 if (st_mask & WL_STAT_MISSING) pv->missing = 1;
+                if ((st_mask & WL_STAT_NONEMPTY) && !(st_mask & WL_STAT_ALLOCATABLE)) {
+                    pv->not_allocatable = 1;
+                }
+            } else if (wl_streq(key, "flags")) {
+                parse_tag_list(ps, arena, &pv->flags, &pv->flag_count);
+                for (size_t fi = 0; fi < pv->flag_count; fi++) {
+                    if (wl_streq(pv->flags[fi].name, "MISSING")) pv->missing = 1;
+                }
+            } else if (wl_streq(key, "tags")) {
+                parse_tag_list(ps, arena, &pv->tags, &pv->tag_count);
             } else if (wl_streq(key, "pe_start")) {
                 p_int(ps, &pv->pe_start);
             } else if (wl_streq(key, "pe_count")) {
@@ -944,7 +1219,7 @@ LVMCORE_NOINLINE static void parse_pvs_section(parser *ps, arena_vec *pvs_vec,
             lvmcore_physical_volume *pv = (lvmcore_physical_volume *)arena_vec_push_empty(pvs_vec, arena);
             if (pv) {
                 wl_strcpy(pv->key, sizeof(pv->key), pvkey);
-                parse_pv_body(ps, pv);
+                parse_pv_body(ps, pv, arena);
             } else {
                 vg_out->pv_overflow = 1;
                 p_skip_section(ps);
@@ -977,7 +1252,7 @@ LVMCORE_NOINLINE static void parse_lvs_section(parser *ps, arena_vec *lvs_vec,
                 wl_strcpy(lv->name, sizeof(lv->name), lvname);
                 parse_lv_body(ps, lv, arena);
 
-                /* Initial check for mappability */
+                /* Initial eligibility check; second pass resolves sub-LV references. */
                 lv->mappable = 1;
                 if (!lv->visible) {
                     lv->internal = 1;
@@ -993,7 +1268,7 @@ LVMCORE_NOINLINE static void parse_lvs_section(parser *ps, arena_vec *lvs_vec,
                     wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "too many segments");
                 }
                 for (size_t k = 0; k < lv->segment_count && lv->mappable; k++) {
-                    if (lv->segments[k].type != LVMCORE_SEG_STRIPED) {
+                    if (lv->segments[k].type == LVMCORE_SEG_OTHER) {
                         lv->mappable = 0;
                         wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), "unsupported segment type");
                     } else if (lv->segments[k].stripe_overflow) {
@@ -1016,6 +1291,83 @@ static void mark_lv_unmappable(lvmcore_logical_volume *lv, const char *reason) {
     wl_strcpy(lv->unsupported_reason, sizeof(lv->unsupported_reason), reason);
 }
 
+static lvmcore_logical_volume *vg_find_lv_mut(lvmcore_volume_group *vg, const char *name) {
+    if (!vg || !vg->lvs || !name || !name[0]) return NULL;
+    for (size_t i = 0; i < vg->lv_count; i++) {
+        if (wl_streq(vg->lvs[i].name, name)) return &vg->lvs[i];
+    }
+    return NULL;
+}
+
+LVMCORE_NOINLINE static const char *validate_linear_striped_lv(
+        const lvmcore_volume_group *vg,
+        const lvmcore_logical_volume *lv,
+        int require_present_pvs) {
+    if (!lv || lv->segment_count == 0 || !lv->segments) {
+        return "no segments";
+    }
+    if (lv->declared_segment_count > 0 &&
+        (uint64_t)lv->segment_count != lv->declared_segment_count) {
+        return "segment count mismatch";
+    }
+
+    uint64_t expected_next_extent = 0;
+    for (size_t i = 0; i < lv->segment_count; i++) {
+        const lvmcore_segment *seg = &lv->segments[i];
+
+        if (seg->extent_count == 0) {
+            return "segment has zero extent count";
+        }
+        if (seg->start_extent != expected_next_extent) {
+            return seg->start_extent < expected_next_extent
+                       ? "overlapping segments"
+                       : "non-contiguous segments";
+        }
+        if (UINT64_MAX - expected_next_extent < seg->extent_count) {
+            return "segment extent range overflow";
+        }
+        expected_next_extent += seg->extent_count;
+
+        if (seg->type != LVMCORE_SEG_STRIPED) {
+            return "unsupported segment type";
+        }
+        if (seg->stripe_overflow) {
+            return "too many stripes";
+        }
+        if (seg->stripe_count < 1) {
+            return "invalid stripe count";
+        }
+        if (!seg->stripes || (uint64_t)seg->stripe_count_used != seg->stripe_count) {
+            return "stripe count mismatch";
+        }
+        if (seg->stripe_count > 1) {
+            if (seg->stripe_size_sectors == 0 ||
+                (seg->stripe_size_sectors & (seg->stripe_size_sectors - 1u)) != 0) {
+                return "invalid stripe size";
+            }
+            if ((seg->extent_count % seg->stripe_count) != 0) {
+                return "extent count not divisible by stripe count";
+            }
+        }
+
+        uint64_t per_stripe_extents = seg->extent_count / seg->stripe_count;
+        for (size_t s = 0; s < seg->stripe_count_used; s++) {
+            const lvmcore_physical_volume *pv = lvmcore_vg_find_pv(vg, seg->stripes[s].pv_key);
+            if (!pv) {
+                return "stripe references unknown physical volume";
+            }
+            if (require_present_pvs && pv->missing) {
+                return "stripe references missing physical volume";
+            }
+            if (seg->stripes[s].start_extent > pv->pe_count ||
+                per_stripe_extents > pv->pe_count - seg->stripes[s].start_extent) {
+                return "stripe exceeds physical volume extent bounds";
+            }
+        }
+    }
+    return NULL;
+}
+
 LVMCORE_NOINLINE static void validate_lv_segments(const lvmcore_volume_group *vg,
                                                   lvmcore_logical_volume *lv) {
     if (!lv->mappable) return;
@@ -1030,93 +1382,234 @@ LVMCORE_NOINLINE static void validate_lv_segments(const lvmcore_volume_group *vg
         return;
     }
 
-    uint64_t expected_next_extent = 0;
-    for (size_t i = 0; i < lv->segment_count; i++) {
-        const lvmcore_segment *seg = &lv->segments[i];
-
-        if (seg->extent_count == 0) {
-            mark_lv_unmappable(lv, "segment has zero extent count");
+    /* Classic LVM2 COW LV exposed as user snapshot via snapshot_wrapper. */
+    if (lv->is_snapshot_cow && lv->snapshot_wrapper[0]) {
+        const lvmcore_logical_volume *wrap = lvmcore_vg_find_lv(vg, lv->snapshot_wrapper);
+        if (!wrap || wrap->segment_count == 0 || wrap->segments[0].type != LVMCORE_SEG_SNAPSHOT) {
+            mark_lv_unmappable(lv, "invalid snapshot wrapper");
             return;
         }
-        if (seg->start_extent != expected_next_extent) {
-            mark_lv_unmappable(lv,
-                               seg->start_extent < expected_next_extent
-                                   ? "overlapping segments"
-                                   : "non-contiguous segments");
+        const lvmcore_segment *wseg = &wrap->segments[0];
+        if (wseg->chunk_size_sectors == 0 ||
+            (wseg->chunk_size_sectors & (wseg->chunk_size_sectors - 1u)) != 0) {
+            mark_lv_unmappable(lv, "invalid snapshot chunk size");
             return;
         }
-        if (UINT64_MAX - expected_next_extent < seg->extent_count) {
-            mark_lv_unmappable(lv, "segment extent range overflow");
+        const lvmcore_logical_volume *orig = lvmcore_vg_find_lv(vg, wseg->origin);
+        if (!orig) {
+            mark_lv_unmappable(lv, "snapshot origin not found");
             return;
         }
-        expected_next_extent += seg->extent_count;
-
-        if (seg->type != LVMCORE_SEG_STRIPED) {
-            mark_lv_unmappable(lv, "unsupported segment type");
+        const char *oerr = validate_linear_striped_lv(vg, orig, 1);
+        if (oerr) {
+            mark_lv_unmappable(lv, oerr);
             return;
         }
-        if (seg->stripe_overflow) {
-            mark_lv_unmappable(lv, "too many stripes");
-            return;
+        const char *cerr = validate_linear_striped_lv(vg, lv, 1);
+        if (cerr) {
+            mark_lv_unmappable(lv, cerr);
         }
-        if (seg->stripe_count < 1) {
-            mark_lv_unmappable(lv, "invalid stripe count");
-            return;
-        }
-        if (!seg->stripes || (uint64_t)seg->stripe_count_used != seg->stripe_count) {
-            mark_lv_unmappable(lv, "stripe count mismatch");
-            return;
-        }
-        if (seg->stripe_count > 1) {
-            if (seg->stripe_size_sectors == 0 ||
-                (seg->stripe_size_sectors & (seg->stripe_size_sectors - 1u)) != 0) {
-                mark_lv_unmappable(lv, "invalid stripe size");
-                return;
-            }
-            if ((seg->extent_count % seg->stripe_count) != 0) {
-                mark_lv_unmappable(lv, "extent count not divisible by stripe count");
-                return;
-            }
-        }
-
-        uint64_t per_stripe_extents = seg->extent_count / seg->stripe_count;
-        for (size_t s = 0; s < seg->stripe_count_used; s++) {
-            const lvmcore_physical_volume *pv = lvmcore_vg_find_pv(vg, seg->stripes[s].pv_key);
-            if (!pv) {
-                mark_lv_unmappable(lv, "stripe references unknown physical volume");
-                return;
-            }
-            if (pv->missing) {
-                mark_lv_unmappable(lv, "stripe references missing physical volume");
-                return;
-            }
-            if (seg->stripes[s].start_extent > pv->pe_count ||
-                per_stripe_extents > pv->pe_count - seg->stripes[s].start_extent) {
-                mark_lv_unmappable(lv, "stripe exceeds physical volume extent bounds");
-                return;
-            }
-        }
+        return;
     }
+
+    lvmcore_seg_type first_type = lv->segments[0].type;
+
+    if (first_type == LVMCORE_SEG_STRIPED) {
+        const char *err = validate_linear_striped_lv(vg, lv, 1);
+        if (err) mark_lv_unmappable(lv, err);
+        return;
+    }
+
+    if (first_type == LVMCORE_SEG_THIN) {
+        uint64_t expected_next = 0;
+        for (size_t i = 0; i < lv->segment_count; i++) {
+            const lvmcore_segment *seg = &lv->segments[i];
+            if (seg->type != LVMCORE_SEG_THIN || seg->extent_count == 0 ||
+                seg->start_extent != expected_next || !seg->has_device_id ||
+                !seg->pool_data[0]) {
+                mark_lv_unmappable(lv, "invalid thin segment");
+                return;
+            }
+            if (UINT64_MAX - expected_next < seg->extent_count) {
+                mark_lv_unmappable(lv, "segment extent range overflow");
+                return;
+            }
+            expected_next += seg->extent_count;
+
+            const lvmcore_logical_volume *pool = lvmcore_vg_find_lv(vg, seg->pool_data);
+            if (!pool || pool->segment_count == 0 ||
+                pool->segments[0].type != LVMCORE_SEG_THIN_POOL) {
+                mark_lv_unmappable(lv, "thin pool not found");
+                return;
+            }
+            const lvmcore_segment *pseg = &pool->segments[0];
+            if (pseg->chunk_size_sectors == 0 ||
+                (pseg->chunk_size_sectors & (pseg->chunk_size_sectors - 1u)) != 0) {
+                mark_lv_unmappable(lv, "invalid thin pool chunk size");
+                return;
+            }
+            const lvmcore_logical_volume *tmeta = lvmcore_vg_find_lv(vg, pseg->pool_metadata);
+            const lvmcore_logical_volume *tdata = lvmcore_vg_find_lv(vg, pseg->pool_data);
+            const char *merr = validate_linear_striped_lv(vg, tmeta, 1);
+            if (merr) {
+                mark_lv_unmappable(lv, merr);
+                return;
+            }
+            const char *derr = validate_linear_striped_lv(vg, tdata, 1);
+            if (derr) {
+                mark_lv_unmappable(lv, derr);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (first_type == LVMCORE_SEG_SNAPSHOT) {
+        if (lv->segment_count != 1) {
+            mark_lv_unmappable(lv, "multi-segment snapshot unsupported");
+            return;
+        }
+        const lvmcore_segment *seg = &lv->segments[0];
+        if (seg->extent_count == 0 || seg->chunk_size_sectors == 0 ||
+            (seg->chunk_size_sectors & (seg->chunk_size_sectors - 1u)) != 0) {
+            mark_lv_unmappable(lv, "invalid snapshot geometry");
+            return;
+        }
+        const lvmcore_logical_volume *orig = lvmcore_vg_find_lv(vg, seg->origin);
+        const lvmcore_logical_volume *cow = lvmcore_vg_find_lv(vg, seg->cow_store);
+        const char *oerr = validate_linear_striped_lv(vg, orig, 1);
+        if (oerr) {
+            mark_lv_unmappable(lv, oerr);
+            return;
+        }
+        const char *cerr = validate_linear_striped_lv(vg, cow, 1);
+        if (cerr) {
+            mark_lv_unmappable(lv, cerr);
+        }
+        return;
+    }
+
+    if (first_type == LVMCORE_SEG_RAID1 || first_type == LVMCORE_SEG_MIRROR) {
+        uint64_t expected_next = 0;
+        for (size_t i = 0; i < lv->segment_count; i++) {
+            const lvmcore_segment *seg = &lv->segments[i];
+            if (seg->type != first_type || seg->extent_count == 0 ||
+                seg->start_extent != expected_next || seg->raid_leg_count == 0 ||
+                !seg->raid_legs) {
+                mark_lv_unmappable(lv, "invalid raid1/mirror segment");
+                return;
+            }
+            if (UINT64_MAX - expected_next < seg->extent_count) {
+                mark_lv_unmappable(lv, "segment extent range overflow");
+                return;
+            }
+            expected_next += seg->extent_count;
+
+            size_t healthy_legs = 0;
+            for (size_t l = 0; l < seg->raid_leg_count; l++) {
+                const lvmcore_logical_volume *img =
+                    lvmcore_vg_find_lv(vg, seg->raid_legs[l].image_lv);
+                if (!img) continue;
+                uint64_t img_exts = lvmcore_lv_extent_count(img);
+                if (img_exts == UINT64_MAX ||
+                    seg->raid_legs[l].start_extent > img_exts ||
+                    img_exts - seg->raid_legs[l].start_extent < seg->extent_count) {
+                    mark_lv_unmappable(lv, "raid1/mirror leg smaller than LV");
+                    return;
+                }
+                if (validate_linear_striped_lv(vg, img, 1) == NULL) {
+                    healthy_legs++;
+                }
+            }
+            if (healthy_legs == 0) {
+                mark_lv_unmappable(lv, "no healthy raid1/mirror leg available");
+                return;
+            }
+        }
+        return;
+    }
+
+    mark_lv_unmappable(lv, "unsupported segment type");
 }
 
 LVMCORE_NOINLINE static void parse_vg_second_pass(lvmcore_volume_group *vg_out) {
-    /* Check snapshot origins and internal volume targets */
-    for (size_t a = 0; a < vg_out->lv_count; a++) {
-        for (size_t b = 0; b < vg_out->lv_count; b++) {
-            for (size_t s = 0; s < vg_out->lvs[b].segment_count; s++) {
-                const lvmcore_segment *seg = &vg_out->lvs[b].segments[s];
-                if (seg->origin[0] && wl_streq(seg->origin, vg_out->lvs[a].name)) {
-                    mark_lv_unmappable(&vg_out->lvs[a],
-                                       "logical volume is the origin of a snapshot");
+    /* Pass 1: Resolve sub-LV references, thin-pool containers, and snapshot relationships. */
+    for (size_t b = 0; b < vg_out->lv_count; b++) {
+        lvmcore_logical_volume *lv = &vg_out->lvs[b];
+        if (wl_ends_with(lv->name, "_pmspare")) {
+            lv->internal = 1;
+            mark_lv_unmappable(lv, "hidden internal LV");
+        }
+        for (size_t s = 0; s < lv->segment_count; s++) {
+            const lvmcore_segment *seg = &lv->segments[s];
+
+            if (seg->type == LVMCORE_SEG_THIN_POOL) {
+                lv->is_thin_pool = 1;
+                mark_lv_unmappable(lv, "thin-pool container LV");
+                lvmcore_logical_volume *tm = vg_find_lv_mut(vg_out, seg->pool_metadata);
+                lvmcore_logical_volume *td = vg_find_lv_mut(vg_out, seg->pool_data);
+                if (tm) { tm->internal = 1; mark_lv_unmappable(tm, "hidden internal LV"); }
+                if (td) { td->internal = 1; mark_lv_unmappable(td, "hidden internal LV"); }
+            } else if (seg->type == LVMCORE_SEG_SNAPSHOT) {
+                lvmcore_logical_volume *orig = vg_find_lv_mut(vg_out, seg->origin);
+                lvmcore_logical_volume *cow = vg_find_lv_mut(vg_out, seg->cow_store);
+                if (orig) {
+                    orig->is_snapshot_origin = 1;
                 }
-                if (seg->stripes) {
-                    for (size_t st = 0; st < seg->stripe_count_used; st++) {
-                        if (wl_streq(seg->stripes[st].pv_key, vg_out->lvs[a].name)) {
-                            vg_out->lvs[a].internal = 1;
-                            if (vg_out->lvs[b].mappable) {
-                                mark_lv_unmappable(&vg_out->lvs[b],
-                                                   "segment maps onto logical volume, not a physical volume");
-                            }
+                if (wl_is_snapshot_wrapper_name(lv->name) && cow &&
+                    !wl_ends_with(cow->name, "_cow")) {
+                    /* Classic LVM2 wrapper: snapshot0 is internal, cow_store LV is user-visible. */
+                    lv->internal = 1;
+                    mark_lv_unmappable(lv, "internal snapshot wrapper");
+                    cow->is_snapshot_cow = 1;
+                    wl_strcpy(cow->snapshot_wrapper, sizeof(cow->snapshot_wrapper), lv->name);
+                    cow->visible = 1;
+                    cow->internal = 0;
+                    cow->mappable = 1;
+                    cow->unsupported_reason[0] = '\0';
+                } else {
+                    if (cow) {
+                        cow->internal = 1;
+                        mark_lv_unmappable(cow, "hidden internal LV");
+                    }
+                }
+            } else if (seg->type == LVMCORE_SEG_RAID1 || seg->type == LVMCORE_SEG_MIRROR) {
+                for (size_t l = 0; l < seg->raid_leg_count; l++) {
+                    lvmcore_logical_volume *mlv = vg_find_lv_mut(vg_out, seg->raid_legs[l].meta_lv);
+                    lvmcore_logical_volume *ilv = vg_find_lv_mut(vg_out, seg->raid_legs[l].image_lv);
+                    if (mlv) { mlv->internal = 1; mark_lv_unmappable(mlv, "hidden internal LV"); }
+                    if (ilv) { ilv->internal = 1; mark_lv_unmappable(ilv, "hidden internal LV"); }
+                }
+                if (seg->mirror_log[0]) {
+                    lvmcore_logical_volume *loglv = vg_find_lv_mut(vg_out, seg->mirror_log);
+                    if (loglv) { loglv->internal = 1; mark_lv_unmappable(loglv, "hidden internal LV"); }
+                }
+            } else if (seg->type == LVMCORE_SEG_OTHER) {
+                /* Mark any sub-LVs referenced by unsupported segment types (e.g., raid5, cache) internal. */
+                for (size_t l = 0; l < seg->raid_leg_count; l++) {
+                    lvmcore_logical_volume *mlv = vg_find_lv_mut(vg_out, seg->raid_legs[l].meta_lv);
+                    lvmcore_logical_volume *ilv = vg_find_lv_mut(vg_out, seg->raid_legs[l].image_lv);
+                    if (mlv) { mlv->internal = 1; mark_lv_unmappable(mlv, "hidden internal LV"); }
+                    if (ilv) { ilv->internal = 1; mark_lv_unmappable(ilv, "hidden internal LV"); }
+                }
+                if (seg->pool_metadata[0]) {
+                    lvmcore_logical_volume *mlv = vg_find_lv_mut(vg_out, seg->pool_metadata);
+                    if (mlv) { mlv->internal = 1; mark_lv_unmappable(mlv, "hidden internal LV"); }
+                }
+                if (seg->pool_data[0]) {
+                    lvmcore_logical_volume *dlv = vg_find_lv_mut(vg_out, seg->pool_data);
+                    if (dlv) { dlv->internal = 1; mark_lv_unmappable(dlv, "hidden internal LV"); }
+                }
+            }
+
+            if (seg->stripes) {
+                for (size_t st = 0; st < seg->stripe_count_used; st++) {
+                    lvmcore_logical_volume *target = vg_find_lv_mut(vg_out, seg->stripes[st].pv_key);
+                    if (target) {
+                        target->internal = 1;
+                        if (lv->mappable) {
+                            mark_lv_unmappable(lv,
+                                               "segment maps onto logical volume, not a physical volume");
                         }
                     }
                 }
@@ -1135,7 +1628,7 @@ LVMCORE_NOINLINE static void parse_vg_second_pass(lvmcore_volume_group *vg_out) 
         }
     }
 
-    /* Validate segment contiguity, stripe geometry, and PV extent bounds. */
+    /* Validate segment contiguity, geometry, and backing PV/sub-LV integrity. */
     for (size_t a = 0; a < vg_out->lv_count; a++) {
         validate_lv_segments(vg_out, &vg_out->lvs[a]);
     }
@@ -1220,12 +1713,26 @@ lvmcore_status lvmcore_parse_vg_text(const char *text,
                     } else if (wl_streq(child, "status")) {
                         uint32_t st_mask = parse_status_list(&ps);
                         if (st_mask & WL_STAT_WRITE) has_write = true;
+                        if (st_mask & WL_STAT_EXPORTED) vg_out->exported = 1;
+                        if ((st_mask & WL_STAT_NONEMPTY) && !(st_mask & WL_STAT_RESIZEABLE)) {
+                            vg_out->not_resizeable = 1;
+                        }
+                    } else if (wl_streq(child, "flags")) {
+                        parse_tag_list(&ps, arena, &vg_out->vg_flags, &vg_out->vg_flag_count);
+                    } else if (wl_streq(child, "tags")) {
+                        parse_tag_list(&ps, arena, &vg_out->tags, &vg_out->tag_count);
                     } else if (wl_streq(child, "seqno")) {
                         p_int(&ps, &seqno);
                     } else if (wl_streq(child, "extent_size")) {
                         if (p_int(&ps, &extent_size)) {
                             has_extent = true;
                         }
+                    } else if (wl_streq(child, "max_lv")) {
+                        p_int(&ps, &vg_out->max_lv);
+                    } else if (wl_streq(child, "max_pv")) {
+                        p_int(&ps, &vg_out->max_pv);
+                    } else if (wl_streq(child, "metadata_copies")) {
+                        p_int(&ps, &vg_out->metadata_copies);
                     } else {
                         p_skip_value(&ps);
                     }
