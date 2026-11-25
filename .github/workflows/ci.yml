@@ -5,9 +5,33 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build-and-test:
+  linux:
+    name: Build & Test (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ninja-build zstd
+        zstd --version
+
+    - name: Configure CMake
+      run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build
+
+    - name: Test
+      run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: Build & Test (Windows MSVC)
     runs-on: windows-latest
 
     steps:
@@ -17,20 +41,23 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
 
     - name: Install zstd
+      shell: pwsh
       run: |
         choco install zstandard -y
-        # Add to PATH immediately for this step just in case
         echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
+        $env:PATH = "C:\Program Files\zstd;$env:PATH"
+        zstd --version
 
     - name: Configure CMake
       run: >
         cmake -B build
         -G Ninja
         -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER=cl
         -DCMAKE_CXX_COMPILER=cl
 
     - name: Build
-      run: cmake --build build --config Release
+      run: cmake --build build
 
     - name: Test
-      run: ctest --test-dir build --output-on-failure -C Release
+      run: ctest --test-dir build --output-on-failure

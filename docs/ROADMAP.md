@@ -1,489 +1,199 @@
 # winlvm Roadmap
 
-**Date:** 2026-07-26
----
 
-## 0. Context
+## 1. Engineering Principles
 
-The original project answered "can I _read_ my Linux LVM disks from Windows?"
-It got partway: a real user-mode metadata scanner for single-PV linear LVs, and
-a kernel driver that cannot work (`FEASIBILITY.md` §2).
-
-The goal is now larger:
-
-1. **Full-featured LVM2 on Windows** — read _and_ write, not a read-only viewer.
-2. **Boot Windows from an LVM2 logical volume.**
-3. **With the PV inside a LUKS2 container.**
-
-The existing tree is **reference material, not a foundation**. The kernel driver
-is architecturally wrong for anything bootable, and roughly a third of the
-project's documented status is unverifiable narrative. We restart the
-implementation, keeping only ideas and hard-won safety discipline.
-
-**The north star, stated as one sentence:** a Windows machine that boots from
-NTFS on an LVM2 logical volume inside a LUKS2 container, where a Linux machine
-can read and write the same volumes without either OS corrupting the other.
-
----
-
-## 1. Non-negotiable principles
-
-These exist because the previous iteration violated them and produced a
-codebase whose status nobody can trust.
-
-1. **No claim without an artifact.** Every "it works" statement must point at a
-   committed log, hash, or CI run. If it isn't committed, it didn't happen.
-   This is the rule the previous iteration broke, and on a boot stack the cost
-   of self-deception is an unbootable machine.
-2. **Ground truth is Linux.** Correctness is defined as byte-for-byte agreement
-   with `dmsetup table` / `lvs -o+seg_pe_ranges` / `cryptsetup`. Never as
-   agreement with our own fixtures.
-3. **Fail closed.** Unknown segment type, bad CRC, ambiguous `seqno`, foreign
-   `system_id`, overflowed offset → refuse. The old code got this right; keep it.
-4. **The kernel parses the minimum.** Full LVM2 text metadata parsing lives in
-   user mode. The kernel needs only enough to self-assemble at boot.
-5. **Never fabricate success.** No simulated handles, no `busy = false`
-   placeholders. A missing driver is an error, not a mock.
-6. **Read-only until proven, then write.** But _plan_ for write from day one —
-   retrofitting a write path into a read-only design is how the current driver
-   became unfixable.
-7. **PnP + INF from the first commit of driver code.** Not a later retrofit.
+1. **Ground truth is Linux.** Format and mapping correctness are validated
+   against real Linux-created disk images and captured outputs from `dmsetup`,
+   `lvs`, `pvs`, `vgs`, `vgcfgbackup`, `pvck`, `vgck`, and `cryptsetup`.
+2. **Fail closed.** Unknown segment types, CRC mismatches, ambiguous `seqno`
+   states, foreign `system_id`, read-only metadata flags, missing PVs, and
+   overflowed offsets are refused safely rather than guessed.
+3. **Minimal, bounded kernel parser.** The kernel driver uses the freestanding
+   C11 `lvmcore` library (zero dynamic allocations, non-recursive, <= 512-byte
+   stack frames). Metadata mutation and CLI orchestration live in user mode
+   (`lvmfmt`, `lvm.exe`, `winlvm_svc.exe`).
+4. **Explicit error reporting.** Unavailable driver handles and unsupported
+   subcommands return explicit errors.
+5. **Native PnP and INF installation.** The driver is a root-enumerated WDM
+   software bus (`ROOT\winlvm`) that exposes raw volume PDOs to Windows Mount
+   Manager and forwards I/O directly to retained lower device objects via
+   `IoCallDriver` (never `ZwCreateFile`).
+6. **Decoupled cryptography.** `winlvm.sys` performs no cryptographic
+   operations. LUKS2 decryption lives in a separate block provider (`WinLUKS`),
+   composing cleanly for both `LVM-on-LUKS` and `LUKS-on-LVM`.
 
 ---
 
-## 2. Decisions required before Phase 1
+## 2. Architecture Decisions
 
-These are blocking. Answer them and record the answers here.
-
-| #   | Decision                                                                                                                                                                | Why it blocks                                                                                                                          | Default if undecided                                                                                                                                                                                |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | **Project license.** winmd, Quibble, and VeraCrypt-DCS are all LGPL. Deriving from winmd source means shipping LGPLv3-compatible.                                       | Determines whether Phase 2 can transcribe winmd or must clean-room it — a multi-month difference.                                      | **LGPLv3**, derive freely from winmd. Fastest path, honest lineage.                                                                                                                                 |
-| D2  | **Kernel language: C or C++?** winmd is C; WinBtrfs is C++.                                                                                                             | Affects everything downstream.                                                                                                         | **C++** (as the current tree uses) with C-compatible driver entry points.                                                                                                                           |
-| D3  | **Boot LV constrained to a single PV?**                                                                                                                                 | Multi-PV boot volumes are a support minefield (`FEASIBILITY.md` §4 Phase 3).                                                           | **Yes, single PV for the boot LV.** Multi-PV allowed for data LVs.                                                                                                                                  |
-| D4  | **LUKS2 boot container KDF, and what crosses `ExitBootServices`.** Argon2id at 1 GiB / 4 threads is hostile to a UEFI DXE driver and infeasible in a boot-start driver. | Determines whether pre-boot unlock is viable, _and_ whether you can use VeraCrypt's re-derive-in-kernel model or must transport a key. | Require `--pbkdf pbkdf2` (or heavily reduced Argon2id) for the **boot** container only; transport the unwrapped volume key and burn it immediately. Document as a container requirement, not a bug. |
+| # | Decision | Resolution |
+| --- | --- | --- |
+| D1 | **Project license** | **LGPLv3-or-later** ([`LICENSE`](../LICENSE), [`NOTICE`](../NOTICE)). |
+| D2 | **Kernel driver language** | **C11** (`src/driver/*.c` + freestanding `src/lvmcore/*.c`). |
+| D3 | **LUKS2 separation** | **Decoupled.** `winlvm.sys` contains zero cryptography and consumes cleartext block devices exposed via PnP disk/volume interfaces or `IOCTL_WINLVM_PROBE_DEVICE` (`lvm vgscan`). |
+| D4 | **Boot LV topology** | **Single PV for future boot LVs.** Multi-PV linear and striped LVs are supported for data volumes; restricting boot LVs to a single PV avoids multi-disk early-boot assembly hazards. |
+| D5 | **LUKS2 boot container KDF** | **PBKDF2 or reduced-memory Argon2id for future boot containers.** Stock Argon2id (1 GiB / 4 threads) is impractical in pre-boot UEFI DXE and early boot-start drivers; pre-boot handoff design must account for this constraint. |
 
 ---
 
-## 3. Target repository layout
+## 3. Repository Structure
 
-```
+### Implemented Tree
+
+```text
 winlvm/
+  corpus/               Linux-generated LVM2/LUKS2 .img.zst fixtures, oracles, manifest, generate.sh
   docs/
-    FEASIBILITY.md          this assessment
-    ROADMAP.md              this file
-    format-lvm2.md          our own notes on the on-disk format
-    format-luks2.md         our own notes on LUKS2
-    boot-chain.md           the boot design, once Phase 6 starts
-  corpus/
-    generate.sh             Linux-side: builds the ground-truth images
-    expected/               oracle outputs, committed
+    ROADMAP.md          This document
   src/
-    lvmfmt/                 LVM2 on-disk format: parse + serialize. Platform-agnostic.
-    luksfmt/                LUKS2 header, KDF, AF, digest. Platform-agnostic.
-    crypto/                 XTS, AES, Argon2, PBKDF2. Shared user/kernel/UEFI.
-    cli/                    lvm.exe & friends
-    svc/                    activation broker (real IPC)
-    driver/                 winlvm.sys — the volume manager
-    dumpfilter/             dump_winlvm.sys
-    uefi/                   WinLvmDxe.efi
-  tests/
-    unit/                   real framework (Catch2/GoogleTest), not bare assert()
-    corpus/                 tests that run against corpus/ images
+    winlvm_ioctl.h      Shared user/kernel control-plane ABI
+    winlvm_types.h      Shared fixed-width ABI primitives
+    lvmcore/            Freestanding C11 LVM2 parser, arena, CRC-32, serializer
+    lvmfmt/             Portable C++20 LVM2 format, mapping, allocator, two-phase MDA commit engine
+    driver/             WDM kernel driver (winlvm.sys, 14 C11 modules, winlvm.inf, winlvm-vol.inf)
+    tools/lvm/          lvm / lvm.exe CLI control plane
+    tools/lvmdump/      lvmdump / lvmdump.exe standalone metadata & DM-table dumper
+    service/            winlvm_svc / winlvm_svc.exe SCM named-pipe broker
+  tests/                Unit, parser, hardening, serialization, VG state-machine, CLI,
+                        IOCTL, control-plane, corpus oracle tests, and Windows VM harnesses
 ```
 
-`src/lvmfmt`, `src/luksfmt`, and `src/crypto` must build for **three targets**:
-Win32 user mode, kernel mode, and UEFI. Design them with no CRT dependencies
-beyond what all three provide. Getting this boundary right early is what makes
-Phases 5–7 tractable instead of a rewrite.
+### Planned Future Boot Components
+
+```text
+  src/
+    dumpfilter/         dump_winlvm.sys — crash-dump and hibernation filter
+    uefi/               WinLvmDxe.efi — UEFI DXE block-device producer
+```
 
 ---
 
-## 4. Phases
+## 4. Implemented Foundation
 
-Each phase has a hard exit criterion. Do not start the next phase until the
-current one's artifact is committed. Gate references are to `FEASIBILITY.md` §8.
+### Ground-Truth Corpus (`corpus/`)
 
----
+- 9 test cases (12 `.img.zst` images) generated on Linux (`lvm2`, `cryptsetup`,
+  `e2fsprogs`), with committed `dmsetup table`, `lvs`, `pvs`, `vgs`,
+  `vgcfgbackup`, `lv-hashes.txt`, per-LV ext4 filesystem oracles, `luksDump.txt`,
+  and `corpus-manifest.json`.
+- Covers single-PV linear, discontiguous multi-segment linear, multi-PV spanning
+  linear, 2-PV 64 KiB striped, 4Kn sector geometry, odd geometry (2 MiB extents,
+  shifted `pe_start`, dual MDAs, wrapped circular MDA ring buffers), mixed VG
+  with unsupported segment types (`thin`, `raid1`, `snapshot`), and two LUKS2
+  opaque-container cases (`luks2-default`, `luks2-pbkdf2`).
 
-### Phase 0 — Ground truth _(Stage 0)_ — ✅ **DONE 2026-07-27** / ⚠️ **corpus must be regenerated**
+### Format Libraries (`src/lvmcore/`, `src/lvmfmt/`)
 
-Generated on Fedora 44, LVM 2.03.38, cryptsetup 2.8.4. All 9 cases passed, 12
-images, zero failures. Corpus in [`../corpus/`](../corpus/), generator in
-`corpus/generate.sh`, provenance in `corpus/expected/PROVENANCE.txt`.
+- Full LVM2 label (`LABELONE`), `pv_header`, `pv_header_extension` v2
+  (`PV_EXT_USED`), multi-MDA `mda_header`, and circular ring-buffer support.
+- Weak CRC-32 (`0xedb88320`, init `0xf597a6cf`, no final XOR) and checked
+  64-bit arithmetic throughout.
+- Exact `dmsetup table` parity across all supported corpus LVs (`linear` and
+  `striped`), with unsupported segment types parsed and refused per LV.
+- Two-phase circular MDA metadata commits (`raw_locns[1]` precommit ->
+  `raw_locns[0]` commit with rollback) across all active MDAs of all member PVs,
+  honoring `RAW_LOCN_IGNORED`.
 
-**2026-07-28 — `generate.sh` significantly enhanced.** The script now writes
-a full **ext4 filesystem** with known files onto every LV (replacing the old raw
-sector stamp approach). The corpus is not functionally usable for driver read
-testing until it is regenerated with this new script on the Linux VM.
+### WDM Kernel Driver (`src/driver/winlvm.sys`)
 
-What changed in `generate.sh`:
+- Modular 14-file C11 WDM software-bus driver (`winlvm.c`, `winlvm_pnp.c`,
+  `winlvm_probe.c`, `winlvm_control.c`, `winlvm_child.c`, `winlvm_gate.c`,
+  `winlvm_power.c`, `winlvm_dispatch_io.c`, `winlvm_subirp.c`, `winlvm_sector.c`,
+  `winlvm_mount.c`, `winlvm_storage.c`, `winlvm_vg.c`, `winlvm_map.c`) linked
+  with `src/lvmcore/{crc32,arena,parser}.c`.
+- Split INF packaging: `winlvm.inf` (`ROOT\winlvm`, `Class=System`) and
+  `winlvm-vol.inf` (`WinLvm\Volume` / `WinLvmVolume`, `Class=Volume`, null
+  service for raw PDOs).
+- Automatic PV discovery on `GUID_DEVINTERFACE_DISK` and
+  `GUID_DEVINTERFACE_VOLUME`, automatic GPT/MBR partition scanning on whole
+  disks via `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` (covering Linux LVM partitions
+  without Windows volume interfaces), and explicit non-PnP probing via
+  `IOCTL_WINLVM_PROBE_DEVICE` (enabling `LVM-on-LUKS` stacking with `WinLUKS`).
+- Read, write, flush, and shutdown I/O paths with aligned single-member
+  pass-through, partial-MDL multi-piece sub-IRP fan-out, 512e/4Kn sector
+  alignment and bounce buffers, and cancel-safe quiesce gating (`IO_CSQ`).
+- Enforces read-only protection (`STATUS_MEDIA_WRITE_PROTECTED`) on foreign
+  `system_id`, `READ`-only VG/LV metadata, and read-only backing PVs.
+- ACL-hardened `\Device\WinLvmControl` (`IoCreateDeviceSecure`,
+  `SDDL_DEVOBJ_SYS_ALL_ADM_ALL`) supporting inventory, refresh, VG quiesce /
+  resume, dynamic LV activate / deactivate / resize update, ring log drain, and
+  explicit device probing.
 
-- **Removed**: `stamp()` and `check_stamp()` (raw sector-level magic bytes).
-- **Added**: `write_example_data()` — creates ext4 on each LV, writes
-  `hello.txt`, `pattern-1k.bin`, `pattern-4k.bin`, `random-1m.bin` (1 MiB
-  deterministic pseudo-random), and `subdir/nested/deep.txt`.
-- **Added**: `capture_fs_oracles()` — mounts read-only, records a file listing,
-  SHA-256 checksums, and byte-exact copies of small files into
-  `expected/<case>/fs-<lv>/`.
-- **Added**: `corpus-manifest.json` at the corpus root — a single
-  machine-readable file describing every image, VG, and filesystem contents.
-  Agents and test harnesses read this as their entry point.
-- **Modified**: `verify_luks_roundtrip()` — now verifies the ext4 filesystem
-  and `hello.txt` instead of raw stamps.
-- **LV size adjustments**: `lvC` 4M→8M, `lvodd` 10M→16M, `lvplain` 8M→16M.
-- **`lv-hashes.txt`** now reflects ext4 filesystem content (the data that
-  actually ships) rather than the old stamp pattern.
+### User-Mode Tooling (`src/tools/lvm/`, `src/tools/lvmdump/`, `src/service/`)
 
-**Action required:** re-run `sudo ./generate.sh` on the Linux VM and copy the
-output to `corpus/`. See [`../corpus/README.md`](../corpus/README.md).
-
-Confirmed present in the captured oracles (first run):
-
-- `linear-1pv-multiseg`: `lvA` has **3 segments at non-monotonic PV offsets**
-  (2048 → 34816 → 75776) — the discontiguous case a naive `start + length`
-  mapper gets wrong.
-- `striped-2pv`: `striped 2 128 7:6 2048 7:7 2048` — stripe count and 64 KiB
-  chunk size.
-- `linear-2pv`: a genuine cross-device seam at sector 253952.
-- `odd-geometry`: `#PMda 2` — the second metadata area really exists, plus 2 MiB
-  extents.
-- `mixed-vg`: thin-pool, thin LV, raid1 (with `rimage` sub-LVs) **and** snapshot
-  — all four rejection cases in one VG beside a plain linear LV.
-- Both LUKS cases verified by closing and **re-opening the container from
-  scratch**, not merely by writing to it once.
-
-**Exit:** the corpus and oracle files are committed, and a script regenerates
-them reproducibly. **Kill criterion if you won't build this** — see Stage 0.
-
----
-
-### Phase 1 — `lvmfmt`: format library _(Stage 1)_ — ✅ **DONE 2026-07-27** / ⚠️ **re-verify after corpus regeneration**
-
-Implemented in `src/lvmfmt/`: `bytes.h` (checked arithmetic), `crc32`
-(LVM's non-standard variant), `config` (text metadata grammar), `label`
-(LABELONE, PV header, mda_header, ring buffer), `metadata` (object model),
-`mapping` (extent → device-mapper table). Plus `lvmdump` and a test suite with
-two tiers (metadata text, and real images).
-
-**Status: 22/22 tests pass against the regenerated corpus.** 8 logical volumes
-across 7 corpus cases produce device-mapper tables that match Linux's
-`dmsetup table` byte-for-byte, including the 3-segment discontiguous LV, the
-2-PV spanning LV, the 64 KiB striped LV, 2 MiB extents, and 4Kn. Four LVs are
-correctly refused (thin, raid1, snapshot, snapshot origin).
-
-CI configured in `.github/workflows/ci.yml`: MSVC build + corpus test on
-`windows-latest`.
-
-**Bug fixed this session:** the image-tier tests failed not on a bad extraction
-but on a single byte — LVM's on-disk `commit_size` includes the text's trailing
-NUL terminator, which `vgcfgbackup` files (used by the metadata-text tier) omit.
-`src/lvmfmt/config.cpp`'s `skip_trivia` now treats `\0` as whitespace so the
-parser doesn't see the terminator as an expected-identifier failure. The CRC
-check in `label.cpp` had been silently correct all along — the ring-buffer
-extraction was fine; only the parser choked.
-
-**Note (2026-07-28):** The corpus has changed (ext4 data now on LVs; `lv-hashes.txt`
-will differ). The dmsetup-table and metadata-tier tests are **unaffected** — only
-LV content changed. Re-run the test suite after regenerating the corpus to confirm
-the image-tier tests (Tier 2) still pass.
-
-_Original scope, retained:_
-
-Fresh implementation of the LVM2 on-disk format, informed by (not copied from)
-`src/lvmcore/metadata_parser.cpp` and `scanner.cpp`.
-
-- Label (`LABELONE`) at sector 1, `pv_header`, data-area and metadata-area
-  descriptors.
-- `mda_header` at offset 4096, four `raw_locn` slots, the **weak CRC-32**
-  (poly `0xedb88320`, init `0xf597a6cf`, **no final XOR**).
-- Wrapped ring-buffer metadata text read, `seqno` selection, checksum validation.
-- Full text-metadata parser producing a complete VG model — **including segment
-  types we do not support**, parsed and labelled rather than rejected at parse
-  time. Rejection is a policy decision made _above_ the parser.
-- Extent→byte translation with checked arithmetic **inside the library**, not
-  delegated to a caller.
-
-Supported for mapping in this phase: `linear`, `striped` (any stripe count).
-Parsed-and-rejected: `mirror`, `raid*`, `thin*`, `cache*`, `snapshot`,
-`writecache`, `integrity`, `vdo`.
-
-**Exit:** for every corpus image, our computed extent map matches the committed
-`dmsetup table` oracle exactly, and LV range hashes match, verified in CI.
+- `lvm.exe` CLI covering PV, VG, and LV inspection, creation, resizing,
+  migration (`pvmove`), backup/restore (`vgcfgbackup`/`vgcfgrestore`), integrity
+  checking (`pvck`/`vgck`), export/import, and online driver activation/probing.
+- `lvmdump.exe` diagnostic inspection utility.
+- `winlvm_svc.exe` SCM service over an ACL-restricted named pipe
+  (`\\.\pipe\winlvm-svc`) forwarding `Inventory` and `Refresh` requests to the
+  driver control plane.
 
 ---
 
-### Phase 2 — `winlvm.sys`: the volume manager, read-only _(Stage 2)_ — 🟡 **in progress**
+## 5. Remaining Milestones
 
-**The single most important phase.** Transcribe winmd's architecture
-(`FEASIBILITY.md` §5.1), substituting LVM2 for md RAID.
+### Milestone A — Extended Driver Reliability & Verification
 
-**2026-09-11 architecture correction (as built, Oracle-audited):** the driver
-uses a root-enumerated bus devnode from the INF (`ROOT\winlvm`,
-`devcon install`), with `WinLvmAddDevice` creating the bus FDO — NOT
-`IoReportDetectedDevice` and NOT a control device. LV children are **raw PDOs**
-owned by the bus (no function driver; `RawDeviceOK=TRUE` in
-QUERY_CAPABILITIES; `winlvm-vol.inf` installs a null service), matching how
-the code is written. The bus INF is `Class=System`; the volume INF is
-`Class=Volume` — separate files, like winbtrfs's btrfs/btrfs-vol split.
+Single- and multi-PV `linear` and `striped` I/O under Driver Verifier
+(`0x0000093B`) and `LVM-on-LUKS` stacking with `WinLUKS` are implemented and
+verified. Remaining work for this milestone covers extended endurance and
+fault-injection coverage:
 
-- WDM driver: root bus devnode (`ROOT\winlvm` INF) → bus FDO via AddDevice →
-  one raw PDO per mappable LV, reported via BusRelations.
-- `winlvm.inf` (bus, Class=System) + `winlvm-vol.inf` (children, Class=Volume,
-  raw/null-service install — an `AddService=winlvm` on children caused
-  bus-on-bus recursion and the 2026-09-11 install crash-loop).
-- Discovery by `IoRegisterPlugPlayNotification` on `GUID_DEVINTERFACE_DISK`
-  (registered at bus `IRP_MN_START_DEVICE`) with
-  `PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES`; work-item deferred;
-  `IoGetDeviceObjectPointer` + `IoBuildSynchronousFsdRequest` to probe the PV
-  label. **Never `ZwCreateFile`.**
-- Mount manager: register `GUID_DEVINTERFACE_VOLUME` on the child PDOs, answer
-  `IOCTL_MOUNTDEV_QUERY_DEVICE_NAME` (a `\Device\...` name — the interface
-  symlink is not a valid answer) and `IOCTL_MOUNTDEV_QUERY_UNIQUE_ID` (LV
-  UUID). Strip stale drive letters from absorbed PVs.
-- Read path: pass-through via `IoCopyCurrentIrpStackLocationToNext` for
-  single-member I/O; sub-IRP fan-out with partial MDLs for spanning I/O.
-- Writes rejected with `STATUS_MEDIA_WRITE_PROTECTED` for now.
+- Execute multi-day read/write I/O soak workloads (such as extended `diskspd`
+  runs) followed by Linux `fsck`/`vgck`/`pvck` verification.
+- Expand power-loss fault-injection testing for user-mode two-phase MDA
+  metadata commits.
+- Validate `LUKS-on-LVM` stacking permutations alongside `LVM-on-LUKS` against
+  `corpus/images/luks2-default.img.zst` and `corpus/images/luks2-pbkdf2.img.zst`
+  with `WinLUKS`.
 
-**2026-09-12 module split:** the source tree follows winmd's
-single-responsibility file layout — `winlvm.c` (DriverEntry + dispatch wiring
-+ the PnP/device-control kind discriminators), `winlvm_bus.c` (bus FDO:
-AddDevice, disk-interface notify, probe worker, BusRelations),
-`winlvm_child.c` (LV PDO PnP: QUERY_ID/CAPS/START/REMOVE),
-`winlvm_power.c` (power), `winlvm_io.c` (read/write/flush/shutdown +
-PV byte source), `winlvm_mount.c` (MOUNTDEV/geometry IOCTLs), and the
-freestanding `lvm_read.c` parser. Pure code movement from the former
-monolithic `winlvm.c` — dispatch wiring verified identical, no behavior
-change.
+### Milestone B — Boot-Start Driver & Crash-Dump Filter
 
-**Exit:** on a clean VM, installing the bus INF (via `devcon install` — the
-INF has no `[DefaultInstall]`, so right-click→Install cannot work; devcon is
-the accepted equivalent, it performs the same PnP root-devnode install)
-causes a Linux-created LV to appear in Disk Management **with a drive letter**.
-**Evidence anchor (2026-09-11 amendment):** corpus LVs are ext4, which Windows
-cannot mount, so the committed evidence is: volume visible + drive letter +
-raw-volume read hash matching `corpus/expected/<case>/lv-hashes.txt`
-(byte-exact LV image compare). An NTFS-formatted test LV for a real mount test
-is optional follow-up. Screenshot + hash comparison committed. No `sc create`
-anywhere.
+- Convert `winlvm.sys` for `SERVICE_BOOT_START` (`StartType = 0`), Critical
+  Device Database (CDD) registration, and load-order sequencing (`System Bus
+  Extender` / storage miniport coordination) without early-boot probe deadlocks.
+- Implement `dump_winlvm.sys` registered under
+  `HKLM\SYSTEM\CurrentControlSet\Control\CrashControl\DumpFilters` with all
+  scratch buffers and MDLs preallocated at init time for `HIGH_LEVEL` IRQL
+  crash-dump and hibernation paths.
+
+### Milestone C — Pre-Boot UEFI Support (`WinLvmDxe.efi`)
+
+- Publish `EFI_BLOCK_IO_PROTOCOL` for a synthetic GPT/NTFS disk backed by an
+  LVM2 logical volume (composing with a pre-boot LUKS2 block hook when
+  encrypted) and chainload stock Microsoft `\EFI\Microsoft\Boot\bootmgfw.efi`
+  to preserve the Secure Boot chain of trust.
+- Ensure synthetic GPT disk/partition GUIDs align with BCD `osdevice` identity.
+- Define and audit any pre-boot key handoff mechanism across `ExitBootServices`
+  (fixed low-memory `EfiMemoryMappedIO` handoff with immediate zeroization on
+  kernel pickup).
+
+### Milestone D — Production Signing & Servicing Resilience
+
+- Obtain Microsoft Partner Center attestation signing for `winlvm.sys` and
+  `dump_winlvm.sys` (EV certificate) so the drivers load under retail Secure
+  Boot without test-signing mode.
+- Sign `WinLvmDxe.efi` via the Microsoft third-party UEFI CA program (no custom
+  PK/KEK/db enrollment).
+- Build and rehearse rescue media and documented recovery procedures for
+  Windows feature-update BCD/boot-chain resets.
 
 ---
 
-### Phase 3 — Write path _(Stage 3)_ — ✅ code complete / ⚠️ **Stage 3 NOT met**
+## 6. Explicitly Out of Scope
 
-Data writes only. **No LVM2 metadata mutation yet.**
+These features are intentionally excluded from WinLVM and must continue to fail
+closed cleanly when encountered on disk:
 
-- `IRP_MJ_WRITE` mirroring the read path.
-- `IRP_MJ_FLUSH_BUFFERS` correctly propagated to all members — this is what
-  protects NTFS's own consistency guarantees.
-- `IRP_MJ_SHUTDOWN` handling.
-- Honor LVM2 `system_id`: refuse read-write activation of a VG owned by another
-  host. Refuse if the VG looks like it is active on Linux.
-
-**2026-09-11 status correction (Oracle audit):** code landed (`winlvm_io.c`)
-but the exit criterion — 72 h `diskspd` stress + Driver Verifier run with
-committed logs — has **never** been executed (the driver only first
-successfully installed 2026-09-11). Do not treat this phase as done until
-those artifacts exist in `tests/evidence/`.
-
-**Exit:** 72 hours of `diskspd` read/write stress with zero corruption, verified
-against Linux afterwards; clean surprise-removal behavior; and a **clean Driver
-Verifier run** (standard + DDI compliance). All logs committed.
-
----
-
-### Phase 4 — User-mode tooling and the activation broker
-
-Now that the driver is real, rebuild the CLI against it.
-
-- `lvm.exe` + the multi-call `pvs`/`vgs`/`lvs`/`lvdisplay`/... family.
-- `winlvm-svc`: a **real** activation broker with actual IPC — unlike the current
-  `lvm2d.cpp`, which is an empty `Sleep(500)` loop the CLI never contacts.
-- Reuse `src/lvmcore/device_enum.cpp` largely as-is; it is the one component
-  portable nearly unchanged.
-- JSON output for tests, deterministic and golden-tested.
-
-**Exit:** CLI output matches Linux `pvs`/`vgs`/`lvs` field-for-field for the
-corpus, in CI.
-
----
-
-### Phase 5 — WinLUKS: Standalone LUKS2 Storage Decryption _(Stage 4)_ — 🟡 **in progress (partial)**
-
-**2026-09-26 Architectural Amendment (Spec Kit SDD):**
-As specified in [`specs/001-decoupled-lvm-luks/spec.md`](../specs/001-decoupled-lvm-luks/spec.md),
-LUKS2 block device decryption and LVM2 volume management are **completely decoupled** into two standalone components:
-1. **WinLVM (`winlvm.sys`)**: Pure LVM2 volume manager (Phase 2 & Phase 3). Contains **zero** cryptography. Operates on cleartext block devices.
-2. **WinLUKS (`winluks.sys` / `luks.exe`)**: Standalone LUKS2 decryptor. Contains **zero** LVM logic. Operates as an independent block filter / virtual disk provider exposing `GUID_DEVINTERFACE_DISK`.
-
-This separation allows WinLVM to reach production stability and pass Stage 2 & Stage 3 verification immediately, without being blocked by cryptographic implementation risks.
-
-**Scope of WinLUKS Phase 5 (User Mode First):**
-Build `luksfmt` + `crypto` as portable libraries, validated in user mode before entering the kernel:
-- LUKS2 binary header (4096 bytes, magic `LUKS\xba\xbe`, version 2, big-endian), JSON area, secondary header at `SKUL\xba\xbe`.
-- JSON objects: `keyslots`, `segments`, `digests`, `tokens`, `config`.
-- KDF: Argon2id/Argon2i/PBKDF2. AF splitter (`luks1` type, stripe count, hash).
-- Master-key digest verification before any data is touched.
-- Sector crypto: **`aes-xts-plain64`** — XTS with 64-bit sector tweak.
-- Standalone CLI `luks.exe` and user-mode mounter (via Dokany / WinFsp).
-
-**Exit:** Standalone `luks.exe` unlocks stock `cryptsetup` containers with matching plaintext hashes in both directions.
-
----
-
-### Phase 6 — WinLUKS Kernel Driver & Stacking Architecture
-
-Instead of folding crypto directly into `winlvm.sys` (which created an unmaintainable testing matrix), WinLUKS ships as an independent storage filter / virtual disk provider (`winluks.sys`):
-- Exposes decrypted block devices with standard `GUID_DEVINTERFACE_DISK`.
-- **Stacking: LVM on LUKS:** WinLUKS unlocks physical partition -> exposes cleartext Disk PDO -> WinLVM discovers PV -> mounts LVs.
-- **Stacking: LUKS on LVM:** WinLVM exposes LV PDO -> WinLUKS attaches to LV PDO -> mounts decrypted volume.
-- AES-NI accelerated sector crypto with zero non-paged memory leaks.
-
-**Exit:** Stacking verified against `corpus/luks-linear-1pv` and `luks-striped-2pv`. Bit-exact parity with Linux `cryptsetup` + `dmsetup`.
-
----
-
-### Phase 7 — Decoupled Boot Architecture _(Stage 5)_
-
-
-The ambitious part. See `FEASIBILITY.md` §4 for the full analysis.
-
-**7a — `WinLvmDxe.efi`.** A UEFI DXE driver that unlocks LUKS2, maps the LV, and
-publishes `EFI_BLOCK_IO_PROTOCOL` presenting a synthetic disk containing a GPT
-with the NTFS partition. Then chainloads stock
-`\EFI\Microsoft\Boot\bootmgfw.efi`. — `winload.efi` reads NTFS natively and consumes `EFI_BLOCK_IO_PROTOCOL`
-without caring what produces it. VeraCrypt-DCS is the model.
-
-Keeping the stock Microsoft boot chain means `bootmgfw`, `winload`, and
-`ntoskrnl` all stay Microsoft-signed, so **Secure Boot's chain of trust survives
-intact** — only `WinLvmDxe.efi` and `winlvm.sys` need enrollment/signing.
-
-Watch: the BCD `osdevice` element identifies the OS volume by _disk signature
-GUID + partition signature GUID_ on GPT. The synthetic GPT must match.
-
-**7b — Key handoff.** Follow VeraCrypt's mechanism: allocate real RAM at a fixed
-low physical address via
-`AllocatePages(AllocateAddress, EfiMemoryMappedIO, ...)` — typing it MMIO keeps
-Windows' memory manager from claiming it while letting the driver
-`MmMapIoSpace()` it. The driver signature-scans the known addresses, copies into
-kernel heap, and **burns the physical page immediately**.
-
-Decide what crosses: the unwrapped volume key (fast boot, key briefly at a
-predictable address) or the passphrase (better hygiene, but requires the KDF in
-kernel at boot — infeasible for default Argon2id at 1 GiB). Default to
-transporting the volume key with immediate burn; see D4.
-
-This is the most security-sensitive component in the project and deserves its own
-design document and its own review.
-
-Confirmed by source review: `LOADER_PARAMETER_EXTENSION` has **no** channel for
-passing arbitrary data to a named boot-start driver, so the out-of-band memory
-region is the only viable mechanism — not a design preference.
-
-**7c — Boot-start conversion.** `StartType = 0`, Critical Device Database
-entries so kernel-mode PnP starts the driver without user-mode PnP, correct load
-group ordering. Note winmd is `SERVICE_SYSTEM_START` and gives you nothing here
-— this part is your own work.
-
-**7d — `dump_winlvm.sys`.** Crash dump / hibernate filter registered in
-`HKLM\SYSTEM\CurrentControlSet\Control\CrashControl\DumpFilters`, the
-`dumpfve.sys` role. **Not optional** — without it, hibernation and crash dumps
-fail.
-
-Design rule, taken from `dump_veracrypt.sys`: the dump path can run at
-`HIGH_LEVEL` IRQL where most memory-manager DDIs are illegal. **Everything must
-be preallocated at init** — pre-build an MDL over a private nonpaged scratch
-buffer and, at write time, only swap PFNs into the caller's MDL. This cannot be
-retrofitted; design 7d under this constraint from its first line.
-
-**Exit:** a VM boots Windows to desktop from NTFS-on-LV-on-LUKS, survives 20
-consecutive reboots, and hibernates and resumes successfully. Video or log
-evidence committed.
-
----
-
-### Phase 8 — Bare metal _(Stage 6)_
-
-- EV code-signing certificate; Microsoft **attestation** signing via Partner
-  Center for `winlvm.sys` and `dump_winlvm.sys`.
-- `WinLvmDxe.efi` signed under the **Microsoft third-party UEFI CA** program —
-  the route VeraCrypt has used since 1.26.29 and `shim` uses. This needs **no**
-  custom PK/KEK/db enrollment; the stock OEM Secure Boot keys suffice, though
-  some firmware requires enabling the "Microsoft 3rd-party UEFI certificate"
-  option. Do **not** pursue VeraCrypt's older custom-key path — it is marked
-  _"LEGACY — DO NOT USE ON MODERN SYSTEMS"_ and is broken against the 2023 CA
-  transition.
-- Because `bootmgfw`/`winload`/`ntoskrnl` stay Microsoft-signed in this design,
-  the goal here is **Secure Boot fully enabled**, not disabled.
-- **Tested rescue media**, and a documented recovery procedure for the case
-  where a Windows feature update breaks the boot chain.
-
-**Exit:** driver loads with Secure Boot **on**; a deliberately-broken boot chain
-is recovered using only the committed rescue procedure. **Do not move a personal
-machine onto this stack before that recovery rehearsal passes.**
-
----
-
-### Phase 9 — LVM2 metadata mutation
-
-`lvcreate`, `lvremove`, `lvresize`, `vgcreate`, `pvcreate`, `vgextend`,
-`vgreduce`.
-
-Deliberately last, because it is the only phase that can destroy a VG that Linux
-also uses. The two-slot `raw_locn` precommit/commit protocol must be implemented
-exactly: on precommit the new location goes to slot 1 while the committed one
-stays in slot 0; on commit the new location moves to slot 0 and slot 1 is
-zeroed. Get `seqno` handling wrong and Linux may pick the wrong metadata copy.
-
-**Exit:** every mutation is round-tripped through Linux `vgck`/`pvck` with no
-warnings, across power-loss injection testing.
-
----
-
-## 5. Explicitly out of scope
-
-Not "later" — **out**, unless the project's scale changes fundamentally.
-
-- **Thin provisioning (`dm-thin`), `dm-cache`, `dm-era`.** These are persistent
-  B-tree metadata engines, not mapping tables. Each is a project comparable in
-  size to everything in Phases 0–8 combined.
-- **RAID levels (`dm-raid`), mirrors, `pvmove`.** winmd already does md RAID; if
-  you want RAID under LVM, compose rather than reimplement.
-- **Snapshots.**
+- **Thin provisioning (`dm-thin`), `dm-cache`, `dm-era`, `dm-vdo`,
+  `dm-writecache`, `dm-integrity`** — persistent B-tree/stateful block engines
+  outside linear/striped mapping scope.
+- **LVM RAID (`dm-raid`) and mirrors** — compose with dedicated RAID volume
+  managers instead.
+- **LVM snapshots.**
 - **Clustered LVM / `lvmlockd`.**
-- **Concurrent read-write access from Linux and Windows simultaneously.**
-- **Btrfs.** WinBtrfs's job. We expose a block device; what mounts on it is not
-  our concern.
-
-All of these must be **parsed, recognized, and refused with a clear message** —
-never silently mishandled.
-
----
-
-## 6. Immediate next actions
-
-1. **Regenerate the corpus on the Linux VM.** `generate.sh` was significantly
-   updated on 2026-07-28 — ext4 filesystem data, `fs-<lv>/` oracle directories,
-   and `corpus-manifest.json` are now produced. The existing images are missing
-   all of this. Run `sudo ./generate.sh` on the Linux VM and commit the output.
-2. **Re-run the test suite** after the corpus is regenerated to confirm the
-   image-tier tests (Tier 2) still pass against the new image content.
-3. **Answer D1–D4 in §2 and record them here.** These block Phase 2. D1
-   (license) in particular decides whether Phase 2 can transcribe winmd or must
-   clean-room it — a multi-month difference. D2–D4 are recorded as defaults.
-4. **Start Phase 2 (`winlvm.sys`)** — the winmd-shaped WDM volume manager,
-   read-only first. Stage 2 is the project's make-or-break phase. The
-   filesystem data in the corpus is the **read verification anchor**: once
-   the driver can read `hello.txt` from each LV and compare it against
-   `expected/<case>/fs-<lv>/files/hello.txt`, Stage 2 has meaningful evidence.
-
-**Already done:**
-
-- **Phase 0 complete.** 12 real Linux-created images with oracle files, in
-  `corpus/`. Stage 0 passed.
-- **Phase 1 complete.** `src/lvmfmt/` — LVM2 on-disk format library, 22/22
-  tests pass. `dmsetup table` reproduced byte-for-byte for all corpus cases.
-- **2026-07-28:** `generate.sh` enhanced — ext4 filesystem data on every LV,
-  `fs-<lv>/` oracle directories, `corpus-manifest.json`.
-- Added `.gitignore` negations so verification logs under `corpus/` and
-  `tests/evidence/` can be committed despite the blanket `*.log` rule.
-- Rewrote `README.md` to state the real status.
+- **Concurrent read-write mounting from Linux and Windows simultaneously.**
+- **Filesystem drivers** — WinLVM exposes standard Windows volumes; filesystems
+  (NTFS, WinBtrfs, etc.) mount independently on top.
