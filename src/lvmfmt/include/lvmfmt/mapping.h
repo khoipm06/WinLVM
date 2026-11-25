@@ -25,10 +25,17 @@ struct DmDestination {
 struct DmTarget {
   std::uint64_t start_sector = 0;
   std::uint64_t length_sectors = 0;
-  std::string type;                  // "linear" or "striped"
+  std::string type;                  // "linear", "striped", "thin", "snapshot", "snapshot-origin", "raid1", "mirror"
   std::uint64_t stripe_count = 1;
-  std::uint64_t chunk_sectors = 0;   // striped only
+  std::uint64_t chunk_sectors = 0;   // striped & snapshot
+  std::uint64_t device_id = 0;       // thin
+  std::uint64_t region_size_sectors = 0; // raid1 & mirror
+  std::string pool_lv;               // thin
+  std::string origin_lv;             // snapshot & snapshot-origin
+  std::string cow_lv;                // snapshot
+  std::string mirror_log;            // mirror
   std::vector<DmDestination> destinations;
+  std::vector<std::string> sub_lvs;  // raid1/mirror sub-LV references
 };
 
 // Builds the table for `lv`. Returns nullopt with a reason in `error` if the

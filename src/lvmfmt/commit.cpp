@@ -78,16 +78,21 @@ std::string format_uuid_canonical(const std::string& id) {
   return id;
 }
 
-void write_status_array(std::ostringstream& ss,
-                        const std::vector<std::string>& status,
-                        const std::vector<std::string>& fallback) {
-  const auto& list = status.empty() ? fallback : status;
-  ss << "status = [";
+void write_string_array(std::ostringstream& ss,
+                        const char* key,
+                        const std::vector<std::string>& list) {
+  ss << key << " = [";
   for (std::size_t i = 0; i < list.size(); ++i) {
     if (i > 0) ss << ", ";
     ss << "\"" << escape_lvm_string(list[i]) << "\"";
   }
   ss << "]\n";
+}
+
+void write_status_array(std::ostringstream& ss,
+                        const std::vector<std::string>& status,
+                        const std::vector<std::string>& fallback) {
+  write_string_array(ss, "status", status.empty() ? fallback : status);
 }
 
 bool validate_vg_serializable(const VolumeGroup& vg, std::string& error) {
@@ -105,11 +110,6 @@ bool validate_vg_serializable(const VolumeGroup& vg, std::string& error) {
   }
 
   for (const auto& lv : vg.lvs) {
-    if (lv.internal) {
-      error = "refusing to serialize VG '" + vg.name + "': contains internal LV '" + lv.name +
-              "' from an unsupported volume layout";
-      return false;
-    }
     if (!lv.supported) {
       error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name + "' is unsupported (" +
               (lv.unsupported_reason.empty() ? "unknown layout" : lv.unsupported_reason) + ")";
@@ -120,28 +120,53 @@ bool validate_vg_serializable(const VolumeGroup& vg, std::string& error) {
       return false;
     }
     for (const auto& seg : lv.segments) {
-      if (seg.type != "linear" && seg.type != "striped") {
+      if (seg.type == "linear" || seg.type == "striped") {
+        const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
+        if (seg.stripes.empty() || seg.stripes.size() != sc) {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has inconsistent stripe list";
+          return false;
+        }
+        if (sc > 1 && (seg.stripe_size_sectors == 0 || (seg.extent_count % sc) != 0)) {
+          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                  "' has invalid striped segment geometry";
+          return false;
+        }
+        for (const auto& stripe : seg.stripes) {
+          if (!vg.find_pv(stripe.target)) {
+            error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
+                    "' maps onto non-PV target '" + stripe.target + "'";
+            return false;
+          }
+        }
+      } else if (seg.type == "thin-pool") {
+        if (seg.metadata_lv.empty() || seg.pool_lv.empty() || seg.chunk_size_sectors == 0) {
+          error = "refusing to serialize VG '" + vg.name + "': thin-pool LV '" + lv.name +
+                  "' missing metadata, pool, or chunk_size";
+          return false;
+        }
+      } else if (seg.type == "thin") {
+        if (seg.pool_lv.empty() || !seg.has_device_id) {
+          error = "refusing to serialize VG '" + vg.name + "': thin LV '" + lv.name +
+                  "' missing thin_pool or device_id";
+          return false;
+        }
+      } else if (seg.type == "snapshot") {
+        if (seg.origin.empty() || seg.cow_store.empty() || seg.chunk_size_sectors == 0) {
+          error = "refusing to serialize VG '" + vg.name + "': snapshot LV '" + lv.name +
+                  "' missing origin, cow_store, or chunk_size";
+          return false;
+        }
+      } else if (seg.type == "raid1" || seg.type == "mirror") {
+        if (seg.raid_legs.empty()) {
+          error = "refusing to serialize VG '" + vg.name + "': " + seg.type + " LV '" + lv.name +
+                  "' has no legs";
+          return false;
+        }
+      } else {
         error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
                 "' uses unsupported segment type '" + seg.type + "'";
         return false;
-      }
-      const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
-      if (seg.stripes.empty() || seg.stripes.size() != sc) {
-        error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
-                "' has inconsistent stripe list";
-        return false;
-      }
-      if (sc > 1 && (seg.stripe_size_sectors == 0 || (seg.extent_count % sc) != 0)) {
-        error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
-                "' has invalid striped segment geometry";
-        return false;
-      }
-      for (const auto& stripe : seg.stripes) {
-        if (!vg.find_pv(stripe.target)) {
-          error = "refusing to serialize VG '" + vg.name + "': LV '" + lv.name +
-                  "' maps onto non-PV target '" + stripe.target + "'";
-          return false;
-        }
       }
     }
   }
@@ -239,7 +264,10 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
   ss << "seqno = " << vg.seqno << "\n";
   ss << "format = \"lvm2\"\n";
   write_status_array(ss, vg.status, kDefaultVgStatus);
-  ss << "flags = []\n";
+  write_string_array(ss, "flags", vg.flags);
+  if (!vg.tags.empty()) {
+    write_string_array(ss, "tags", vg.tags);
+  }
   if (!vg.system_id.empty()) {
     ss << "system_id = \"" << escape_lvm_string(vg.system_id) << "\"\n";
   }
@@ -255,7 +283,10 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
     const std::string dev_hint = pv.device.empty() ? "/dev/unknown" : pv.device;
     ss << "device = \"" << escape_lvm_string(dev_hint) << "\"\n";
     write_status_array(ss, pv.status, kDefaultPvStatus);
-    ss << "flags = []\n";
+    write_string_array(ss, "flags", pv.flags);
+    if (!pv.tags.empty()) {
+      write_string_array(ss, "tags", pv.tags);
+    }
     ss << "dev_size = " << pv.dev_size_sectors << "\n";
     ss << "pe_start = " << pv.pe_start_sectors << "\n";
     ss << "pe_count = " << pv.pe_count << "\n";
@@ -269,30 +300,83 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
       ss << "\n" << lv.name << " {\n";
       ss << "id = \"" << escape_lvm_string(format_uuid_canonical(lv.id)) << "\"\n";
       write_status_array(ss, lv.status, kDefaultLvStatus);
-      ss << "flags = []\n";
+      write_string_array(ss, "flags", lv.flags);
+      if (!lv.tags.empty()) {
+        write_string_array(ss, "tags", lv.tags);
+      }
       ss << "creation_time = " << now << "\n";
       ss << "creation_host = \"winlvm\"\n";
       ss << "segment_count = " << lv.segments.size() << "\n\n";
 
       std::size_t seg_idx = 1;
       for (const auto& seg : lv.segments) {
-        const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
         ss << "segment" << seg_idx++ << " {\n";
         ss << "start_extent = " << seg.start_extent << "\n";
         ss << "extent_count = " << seg.extent_count << "\n";
-        ss << "type = \"striped\"\n";
-        ss << "stripe_count = " << sc << "\n";
-        if (sc > 1 && seg.stripe_size_sectors > 0) {
-          ss << "stripe_size = " << seg.stripe_size_sectors << "\n";
+        if (seg.type == "thin-pool") {
+          ss << "type = \"thin-pool\"\n";
+          ss << "metadata = \"" << escape_lvm_string(seg.metadata_lv) << "\"\n";
+          ss << "pool = \"" << escape_lvm_string(seg.pool_lv) << "\"\n";
+          if (seg.has_transaction_id) ss << "transaction_id = " << seg.transaction_id << "\n";
+          ss << "chunk_size = " << seg.chunk_size_sectors << "\n";
+          if (!seg.discards.empty()) ss << "discards = \"" << escape_lvm_string(seg.discards) << "\"\n";
+          if (seg.has_zero_new_blocks) ss << "zero_new_blocks = " << (seg.zero_new_blocks ? 1 : 0) << "\n";
+        } else if (seg.type == "thin") {
+          ss << "type = \"thin\"\n";
+          ss << "thin_pool = \"" << escape_lvm_string(seg.pool_lv) << "\"\n";
+          if (seg.has_transaction_id) ss << "transaction_id = " << seg.transaction_id << "\n";
+          ss << "device_id = " << seg.device_id << "\n";
+          if (!seg.origin.empty()) ss << "origin = \"" << escape_lvm_string(seg.origin) << "\"\n";
+        } else if (seg.type == "snapshot") {
+          ss << "type = \"snapshot\"\n";
+          ss << "chunk_size = " << seg.chunk_size_sectors << "\n";
+          ss << "origin = \"" << escape_lvm_string(seg.origin) << "\"\n";
+          ss << "cow_store = \"" << escape_lvm_string(seg.cow_store) << "\"\n";
+        } else if (seg.type == "raid1") {
+          const std::uint64_t dc = seg.device_count ? seg.device_count : seg.raid_legs.size();
+          ss << "type = \"raid1\"\n";
+          ss << "device_count = " << dc << "\n";
+          if (seg.region_size_sectors > 0) ss << "region_size = " << seg.region_size_sectors << "\n";
+          ss << "raids = [\n";
+          for (std::size_t r = 0; r < seg.raid_legs.size(); ++r) {
+            ss << "\"" << escape_lvm_string(seg.raid_legs[r].meta_lv) << "\", \""
+               << escape_lvm_string(seg.raid_legs[r].image_lv) << "\"";
+            if (r + 1 < seg.raid_legs.size()) ss << ",\n";
+            else ss << "\n";
+          }
+          ss << "]\n";
+        } else if (seg.type == "mirror") {
+          const std::uint64_t mc = seg.device_count ? seg.device_count : seg.raid_legs.size();
+          ss << "type = \"mirror\"\n";
+          ss << "mirror_count = " << mc << "\n";
+          if (!seg.mirror_log.empty()) {
+            ss << "mirror_log = \"" << escape_lvm_string(seg.mirror_log) << "\"\n";
+          }
+          if (seg.region_size_sectors > 0) ss << "region_size = " << seg.region_size_sectors << "\n";
+          ss << "mirrors = [\n";
+          for (std::size_t r = 0; r < seg.raid_legs.size(); ++r) {
+            ss << "\"" << escape_lvm_string(seg.raid_legs[r].image_lv) << "\", "
+               << seg.raid_legs[r].start_extent;
+            if (r + 1 < seg.raid_legs.size()) ss << ",\n";
+            else ss << "\n";
+          }
+          ss << "]\n";
+        } else {
+          const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
+          ss << "type = \"striped\"\n";
+          ss << "stripe_count = " << sc << "\n";
+          if (sc > 1 && seg.stripe_size_sectors > 0) {
+            ss << "stripe_size = " << seg.stripe_size_sectors << "\n";
+          }
+          ss << "stripes = [\n";
+          for (std::size_t s = 0; s < seg.stripes.size(); ++s) {
+            ss << "\"" << escape_lvm_string(seg.stripes[s].target) << "\", "
+               << seg.stripes[s].start_extent;
+            if (s + 1 < seg.stripes.size()) ss << ",\n";
+            else ss << "\n";
+          }
+          ss << "]\n";
         }
-        ss << "stripes = [\n";
-        for (std::size_t s = 0; s < seg.stripes.size(); ++s) {
-          ss << "\"" << escape_lvm_string(seg.stripes[s].target) << "\", "
-             << seg.stripes[s].start_extent;
-          if (s + 1 < seg.stripes.size()) ss << ",\n";
-          else ss << "\n";
-        }
-        ss << "]\n";
         ss << "}\n";
       }
       ss << "}\n";
