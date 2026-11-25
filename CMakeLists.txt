@@ -27,6 +27,9 @@ add_library(lvmcore STATIC
   src/lvmcore/arena.c
   src/lvmcore/parser.c
   src/lvmcore/serialize.c
+  src/lvmcore/lvmcore_thin.c
+  src/lvmcore/lvmcore_snap.c
+  src/lvmcore/lvmcore_raid.c
 )
 set_target_properties(lvmcore PROPERTIES
   C_STANDARD 11
@@ -35,6 +38,14 @@ set_target_properties(lvmcore PROPERTIES
 target_include_directories(lvmcore PUBLIC src/lvmcore/include)
 if(NOT MSVC)
   target_compile_options(lvmcore PRIVATE -Wframe-larger-than=512)
+  set_source_files_properties(
+    src/driver/winlvm_vg.c
+    src/driver/winlvm_map.c
+    src/driver/winlvm_thin.c
+    src/driver/winlvm_snap.c
+    src/driver/winlvm_raid.c
+    PROPERTIES COMPILE_OPTIONS "-Wframe-larger-than=512"
+  )
 endif()
 
 # ---------------------------------------------------------------------------
@@ -75,35 +86,47 @@ target_include_directories(lvm PRIVATE src/tools/lvm)
 target_link_libraries(lvm PRIVATE lvmfmt)
 
 # ---------------------------------------------------------------------------
-# Corpus. Ground truth lives in corpus/ as zstd-compressed images; tests need
-# them decompressed. Only the non-LUKS images are unpacked — LUKS containers
-# are opaque until the luksfmt layer exists (roadmap Phase 5).
+# Test Corpus. Disk images are generated deterministically out-of-tree at build
+# time by scripts/gen_test_fixtures.py; only lightweight text/hash oracles live
+# under corpus/expected/.
 # ---------------------------------------------------------------------------
 set(CORPUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/corpus")
-set(CORPUS_OUT "${CMAKE_BINARY_DIR}/corpus-images" CACHE PATH "Directory containing decompressed corpus images")
+set(CORPUS_OUT "${CMAKE_BINARY_DIR}/corpus-images" CACHE PATH "Directory containing generated corpus images")
 
-find_program(ZSTD_EXE zstd)
-file(GLOB CORPUS_ZST "${CORPUS_SRC}/images/*.img.zst")
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+set(CORPUS_IMAGE_NAMES
+  linear-1pv.img
+  linear-1pv-multiseg.img
+  linear-2pv-a.img
+  linear-2pv-b.img
+  striped-2pv-a.img
+  striped-2pv-b.img
+  sector4k.img
+  odd-geometry.img
+  thin-pool.img
+  snapshot.img
+  raid1-mirror-a.img
+  raid1-mirror-b.img
+  mixed-vg-a.img
+  mixed-vg-b.img
+  luks2-default.img
+  luks2-pbkdf2.img
+)
 set(CORPUS_IMAGES "")
-if(ZSTD_EXE)
-  file(MAKE_DIRECTORY "${CORPUS_OUT}")
-  foreach(zst ${CORPUS_ZST})
-    get_filename_component(zname "${zst}" NAME)
-    string(REGEX REPLACE "\\.zst$" "" iname "${zname}")
-    set(out "${CORPUS_OUT}/${iname}")
-    add_custom_command(
-      OUTPUT "${out}"
-      COMMAND "${ZSTD_EXE}" -d -q -f --sparse "${zst}" -o "${out}"
-      DEPENDS "${zst}"
-      COMMENT "Decompressing corpus image ${iname}"
-      VERBATIM)
-    list(APPEND CORPUS_IMAGES "${out}")
-  endforeach()
-  add_custom_target(corpus ALL DEPENDS ${CORPUS_IMAGES})
-elseif(NOT EXISTS "${CORPUS_OUT}/linear-1pv.img")
-  message(WARNING "zstd not found and ${CORPUS_OUT}/linear-1pv.img missing: corpus oracle tests will be skipped.")
-endif()
+foreach(iname ${CORPUS_IMAGE_NAMES})
+  list(APPEND CORPUS_IMAGES "${CORPUS_OUT}/${iname}")
+endforeach()
+
+set(FIXTURE_GEN_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_test_fixtures.py")
+add_custom_command(
+  OUTPUT ${CORPUS_IMAGES}
+  COMMAND "${Python3_EXECUTABLE}" "${FIXTURE_GEN_SCRIPT}" --out-dir "${CORPUS_OUT}"
+  DEPENDS "${FIXTURE_GEN_SCRIPT}"
+  COMMENT "Generating deterministic LVM2/LUKS2 test fixtures into ${CORPUS_OUT}"
+  VERBATIM
+)
+add_custom_target(corpus ALL DEPENDS ${CORPUS_IMAGES})
 
 enable_testing()
 
@@ -114,63 +137,59 @@ add_executable(test_lvmcore_hardening
 target_link_libraries(test_lvmcore_hardening PRIVATE lvmcore)
 add_test(NAME test_lvmcore_hardening COMMAND test_lvmcore_hardening)
 
-# Host logic tests for multi-VG registry, PV arrival state machine, and mapper.
+# Host logic tests for multi-VG registry, PV arrival state machine, mapper, and block engines.
 add_executable(test_winlvm_vg
   tests/lvmcore/test_winlvm_vg.c
   src/driver/winlvm_vg.c
   src/driver/winlvm_map.c
+  src/driver/winlvm_thin.c
+  src/driver/winlvm_snap.c
+  src/driver/winlvm_raid.c
 )
 target_include_directories(test_winlvm_vg PRIVATE src/driver)
 target_link_libraries(test_winlvm_vg PRIVATE lvmcore)
 add_test(NAME test_winlvm_vg COMMAND test_winlvm_vg)
 
-if(ZSTD_EXE OR EXISTS "${CORPUS_OUT}/linear-1pv.img")
-  # -------------------------------------------------------------------------
-  # lvmcore corpus-backed parser, serialization, and differential mapper tests.
-  # -------------------------------------------------------------------------
-  add_executable(test_lvmcore_parser
-    tests/lvmcore/test_lvmcore_parser.c
-  )
-  target_link_libraries(test_lvmcore_parser PRIVATE lvmcore)
-  if(TARGET corpus)
-    add_dependencies(test_lvmcore_parser corpus)
-  endif()
-  add_test(NAME test_lvmcore_parser
-    COMMAND test_lvmcore_parser "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
+# ---------------------------------------------------------------------------
+# lvmcore corpus-backed parser, serialization, and differential mapper tests.
+# ---------------------------------------------------------------------------
+add_executable(test_lvmcore_parser
+  tests/lvmcore/test_lvmcore_parser.c
+)
+target_link_libraries(test_lvmcore_parser PRIVATE lvmcore)
+add_dependencies(test_lvmcore_parser corpus)
+add_test(NAME test_lvmcore_parser
+  COMMAND test_lvmcore_parser "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
 
-  add_executable(test_lvmcore_serialize
-    tests/lvmcore/test_lvmcore_serialize.c
-  )
-  target_link_libraries(test_lvmcore_serialize PRIVATE lvmcore)
-  if(TARGET corpus)
-    add_dependencies(test_lvmcore_serialize corpus)
-  endif()
-  add_test(NAME test_lvmcore_serialize
-    COMMAND test_lvmcore_serialize "${CORPUS_OUT}")
+add_executable(test_lvmcore_serialize
+  tests/lvmcore/test_lvmcore_serialize.c
+)
+target_link_libraries(test_lvmcore_serialize PRIVATE lvmcore)
+add_dependencies(test_lvmcore_serialize corpus)
+add_test(NAME test_lvmcore_serialize
+  COMMAND test_lvmcore_serialize "${CORPUS_OUT}")
 
-  # Differential kernel-mapper suite against decompressed corpus images and SHA-256 oracles.
-  add_executable(test_driver_corpus_map
-    tests/lvmcore/test_driver_corpus_map.c
-    tests/test_sha256.c
-    src/driver/winlvm_vg.c
-    src/driver/winlvm_map.c
-  )
-  target_include_directories(test_driver_corpus_map PRIVATE src/driver tests)
-  target_link_libraries(test_driver_corpus_map PRIVATE lvmcore)
-  if(TARGET corpus)
-    add_dependencies(test_driver_corpus_map corpus)
-  endif()
-  add_test(NAME test_driver_corpus_map
-    COMMAND test_driver_corpus_map "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
+# Differential kernel-mapper suite against generated corpus images and SHA-256 oracles.
+add_executable(test_driver_corpus_map
+  tests/lvmcore/test_driver_corpus_map.c
+  tests/test_sha256.c
+  src/driver/winlvm_vg.c
+  src/driver/winlvm_map.c
+  src/driver/winlvm_thin.c
+  src/driver/winlvm_snap.c
+  src/driver/winlvm_raid.c
+)
+target_include_directories(test_driver_corpus_map PRIVATE src/driver tests)
+target_link_libraries(test_driver_corpus_map PRIVATE lvmcore)
+add_dependencies(test_driver_corpus_map corpus)
+add_test(NAME test_driver_corpus_map
+  COMMAND test_driver_corpus_map "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
 
-  add_executable(lvmcore_dump_vgcfg
-    tests/lvmcore/lvmcore_dump_vgcfg.c
-  )
-  target_link_libraries(lvmcore_dump_vgcfg PRIVATE lvmcore)
-  if(TARGET corpus)
-    add_dependencies(lvmcore_dump_vgcfg corpus)
-  endif()
-endif()
+add_executable(lvmcore_dump_vgcfg
+  tests/lvmcore/lvmcore_dump_vgcfg.c
+)
+target_link_libraries(lvmcore_dump_vgcfg PRIVATE lvmcore)
+add_dependencies(lvmcore_dump_vgcfg corpus)
 
 add_library(winlvm_service_protocol STATIC
   src/service/protocol.cpp

@@ -1,123 +1,19 @@
 {
   "cases": {
     "linear-1pv": {
-      "description": "Baseline single-PV linear LV",
+      "description": "Baseline single-PV linear LV with tags",
       "images": [
-        "linear-1pv.img.zst"
+        "linear-1pv.img"
       ],
-      "lvs": {
-        "lvlin": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "e4b70453ccc0cb3b6509cd6feff6d02255e308276b166c37f5f5a92d0c910ee5"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "071c5a71cc9bcdeec20e357ca07e183446898d23deb5a526ce46ae3d4fc61240"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "48d9cda4262b2d198e1e992d6ddbee4b7e8cf504f1e6cca51f63c350e521dd30"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "360eddde92c4b8a5b13542d19d99c6e6c84a94636d64d679b8b16c1f2012f825"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "2ffff5bde85cab40ee8c87cd24d5fdf0c9927e5f12833776cc5ccd82b0da300a"
-            }
-          ]
-        }
-      },
       "vg_name": "vgbase",
       "extent_size_sectors": 8192,
       "pv_count": 1
     },
     "linear-1pv-multiseg": {
-      "description": "One LV with discontiguous segments on a single PV",
+      "description": "One LV with 3 discontiguous segments on a single PV",
       "images": [
-        "linear-1pv-multiseg.img.zst"
+        "linear-1pv-multiseg.img"
       ],
-      "lvs": {
-        "lvA": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "c583b6fca52c8f526356068a02036d6d1c6b9670a1d8fef9e5903ec44823d7dd"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "0cb7b20d93e29648981a48fd4c3b9f280cde01cde075dbe4445d8414697e4200"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "a45724b94db97f3bae23f474a17a32190272f4ccc805afb86e647e1c22f5e90f"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "3c80646a394cebdace6c8e9cb147b09884d2ba2d110168c5a24f263d53f644c5"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "8b19e6f6283c0fd9da1ebf87a6f9ee73aacd4a6ccf733f8d54df5f40b6f19f67"
-            }
-          ]
-        },
-        "lvB": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "cd47c75c771ed9f3b53d9dd19c6b5f39cbb3179ecdf81079bb30c5e99ae48545"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "42845047985abec3937621ecd324ea08cd49d87fee615f8cac6feb9af0d75f37"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "b0e678f82dc19129d91a42af1058c5e50dff4e4f177164d9ae4aae97c5391b17"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "ba236d5459a8008d67960e6c3dc901ffe1e1b37d7ab6dea0b08d4a4501d12d32"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "df90e95e188c8f02b3eae03343947717b1cf81de27aeb16be3dd32153adfeece"
-            }
-          ]
-        },
-        "lvC": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "d8f501b00e85ef0693f8be4c6f173444e528f097eb12c74cb49ef4df943c0a3e"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "a5b623a4bca73a5ba5af48517b75ec1bff515d814e34dc19b9d4cf84115509fc"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "e28537e7fd1ddaf8ee1b026b58bdfcd8bb8e0149862109c1421fd499a3791455"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "ff05f7e34f9626d0bd65ae581fc556d77a5456d42857fafa4b0982bbfc9965e0"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "f1298628bcfb7c93ca24764aa04ec0ff293b4bca677a5532aa152ac1c8afd16b"
-            }
-          ]
-        }
-      },
       "vg_name": "vgseg",
       "extent_size_sectors": 8192,
       "pv_count": 1
@@ -125,259 +21,92 @@
     "linear-2pv": {
       "description": "LV spanning two PVs",
       "images": [
-        "linear-2pv-a.img.zst",
-        "linear-2pv-b.img.zst"
+        "linear-2pv-a.img",
+        "linear-2pv-b.img"
       ],
-      "lvs": {
-        "lvspan": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "50431206f18adf90c5eaaf98d1ea6ce2a5c633c46e6539ed137354fb99bb4663"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "19168198c9fb6f3954d17ef2fae9068748b489475d3667c4a9d3e1c031a5f551"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "edfcc84208855f42f8a23ace3032d0b527202b745b0855aba658850866260012"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "7c6ccdbe52443d701c5dc6a602ce1d443f0ef58291648243c8a35ffc42da0bb1"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "7a3516d83cc599efd7ab99ae84813875e459b8228599732ac6f94ac2af831ed5"
-            }
-          ]
-        }
-      },
       "vg_name": "vgspan",
       "extent_size_sectors": 8192,
       "pv_count": 2
     },
-    "luks2-default": {
-      "description": "LUKS2 with stock defaults (argon2id, aes-xts-plain64)",
+    "striped-2pv": {
+      "description": "Round-robin 2-PV striping with 64 KiB stripe chunks",
       "images": [
-        "luks2-default.img.zst"
+        "striped-2pv-a.img",
+        "striped-2pv-b.img"
       ],
-      "lvs": {
-        "lvcrypt": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "00d8999cc19e7ead1711219d10074dafe3ff0228e3fa37c597e88ded819ccd5a"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "b130f93e2adfd44beb2f26e0e3613ba1caf152462e9c6f0c5cd8914766db492e"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "8629c708995f44637f83621465949f8f842ec74a2ee45582869ad6f6c314f8b3"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "133f0964f1effc1877754000624867c5ea0e355a9b91ad89210042fffb9cf96f"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "d83b647782e359d2d46005e4c524532d22d5e7e61fe3ebcec49c06fe7e179b55"
-            }
-          ]
-        }
-      },
-      "vg_name": "vgluks",
-      "extent_size_sectors": 8192,
-      "pv_count": 1,
-      "has_luks": true
-    },
-    "luks2-pbkdf2": {
-      "description": "LUKS2 boot-candidate config (PBKDF2)",
-      "images": [
-        "luks2-pbkdf2.img.zst"
-      ],
-      "lvs": {
-        "lvboot": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "ac0452d9dc4b242d845800baeb64106316ac734011210b22a5553a04d93ea560"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "ed0700351f6b670593efeb7391c561b21626bf0f6a1e3853f98f97c01c8fa6e1"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "7d3543d1e27aff9195c330c6ad17557f90610705c0976564955e13e95902adb2"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "ce33a93b4545ecf0987802c76de50cddd2560a78e973fba2e0ca260ff7d4861c"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "c039cdc7a58d17d0b072346a491570e6a17b8c3c537b0c7c3300b311cc73bd42"
-            }
-          ]
-        }
-      },
-      "vg_name": "vgboot",
-      "extent_size_sectors": 8192,
-      "pv_count": 1,
-      "has_luks": true
-    },
-    "mixed-vg": {
-      "description": "Supported and unsupported LV types side by side",
-      "images": [
-        "mixed-vg-a.img.zst",
-        "mixed-vg-b.img.zst"
-      ],
-      "lvs": {
-        "lvplain": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "247ba3dc5d0ae2402221a9c5618b4de97efa7e26c1b0c9fca08bb8613e039843"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "3abcab1be308c5038e1ae8c75723eb36e0fc58fc90c9ecd83438f0ff3ce84c32"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "3b53484f6ede94b9e6a15deda36268af574629861394f99292caaee165089193"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "7aa6f426ba69fb7c4afb6033b58ef080129426f7dd95d7199019217156c236a6"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "82fe038f95da42421e4a3126e26d20349691ce639001a58d2501a02dec57b30a"
-            }
-          ]
-        }
-      },
-      "vg_name": "vgmix",
+      "vg_name": "vgstripe",
       "extent_size_sectors": 8192,
       "pv_count": 2
     },
-    "odd-geometry": {
-      "description": "2 MiB extents, shifted pe_start, two metadata areas",
-      "images": [
-        "odd-geometry.img.zst"
-      ],
-      "lvs": {
-        "lvodd": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "e37d711312ca04f490f513ab16af58b7330bf3fe8aad98c7ec9009a141c3265d"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "5191eb4d9c128eec06c05d2b59805bcf56865d191f88febc79d38738c8ca10fd"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "7af450b5184e665f7b3698099b4c3e9f82ab89c4a9a9f5aa33a5d898b82e007c"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "09491805cd7b7a66db09070895e47a820c14352729aaab08096a6793a69dc11e"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "ffd1d5942d370b614fb3477a8a93f3614acad3c177ed80a0aa6d3adc1710dcbc"
-            }
-          ]
-        }
-      },
-      "vg_name": "vgodd",
-      "extent_size_sectors": 4096,
-      "pv_count": 1
-    },
     "sector4k": {
-      "description": "4Kn PV (4096-byte sectors)",
+      "description": "4Kn-aligned PV (4096-byte logical sectors)",
       "images": [
-        "sector4k.img.zst"
+        "sector4k.img"
       ],
-      "lvs": {
-        "lv4k": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "989650a3746b7bf5ac36c0e6b3ff12f96fb56895319dadf9a76a9fbb90a56cd3"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "af647df5dff5654d77e48b96b39c0334f1e264a2d7440a261a8065046647a43a"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "d0806c9d08415587560b0d8dce203461aa73669df6d5091c0c0122798f5d9b81"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "27d08c5c576c41ddf5a461ae1c205c9296b901b712781fddc5f5457e99816e2e"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "48c46d85defc669068abdf0313e2b570df99437af9b2983061bb59caa0365ae4"
-            }
-          ]
-        }
-      },
       "vg_name": "vg4k",
       "extent_size_sectors": 8192,
       "pv_count": 1
     },
-    "striped-2pv": {
-      "description": "Round-robin striping, 64 KiB stripes, two PVs",
+    "odd-geometry": {
+      "description": "2 MiB extents, dual metadata areas, wrapped MDA ring buffer",
       "images": [
-        "striped-2pv-a.img.zst",
-        "striped-2pv-b.img.zst"
+        "odd-geometry.img"
       ],
-      "lvs": {
-        "lvstr": {
-          "fs_type": "ext4",
-          "files": [
-            {
-              "path": "./hello.txt",
-              "sha256": "55dd14d70e036de4864c0d3ea26738ade6877cc3fa3d747776facffca83b1373"
-            },
-            {
-              "path": "./pattern-1k.bin",
-              "sha256": "20a5dc2dfe23e941770910437172d3eed949c2a0542fa385bd07bfe25d6524b5"
-            },
-            {
-              "path": "./pattern-4k.bin",
-              "sha256": "fa6f96e366c2b56613bbdf58f241dd00006719ceb09636141a7f283af8ebd21a"
-            },
-            {
-              "path": "./random-1m.bin",
-              "sha256": "6141511b208644b5b76d34865635fa788df6d21620e2d2b913da3a2637aa7450"
-            },
-            {
-              "path": "./subdir/nested/deep.txt",
-              "sha256": "f6f8513d4ffc4cced099c579755d61f970748c65b47d50ea03cb12cc004ce6bf"
-            }
-          ]
-        }
-      },
-      "vg_name": "vgstripe",
+      "vg_name": "vgodd",
+      "extent_size_sectors": 4096,
+      "pv_count": 1
+    },
+    "thin-pool": {
+      "description": "dm-thin v2 thin-pool with sparse thin LV and thin snapshot",
+      "images": [
+        "thin-pool.img"
+      ],
+      "vg_name": "vgthin",
+      "extent_size_sectors": 8192,
+      "pv_count": 1
+    },
+    "snapshot": {
+      "description": "Classic LVM2 snapshot-origin and persistent COW snapshot",
+      "images": [
+        "snapshot.img"
+      ],
+      "vg_name": "vgsnap",
+      "extent_size_sectors": 8192,
+      "pv_count": 1
+    },
+    "raid1-mirror": {
+      "description": "2-PV raid1 with DmRd superblocks plus core-log and disk-log mirror LVs",
+      "images": [
+        "raid1-mirror-a.img",
+        "raid1-mirror-b.img"
+      ],
+      "vg_name": "vgraid",
       "extent_size_sectors": 8192,
       "pv_count": 2
+    },
+    "mixed-vg": {
+      "description": "Supported snapshot/thin/raid1 LVs beside unsupported cache LV",
+      "images": [
+        "mixed-vg-a.img",
+        "mixed-vg-b.img"
+      ],
+      "vg_name": "vgmix",
+      "extent_size_sectors": 8192,
+      "pv_count": 2
+    },
+    "luks2-default": {
+      "description": "Opaque LUKS2 container (argon2id)",
+      "images": [
+        "luks2-default.img"
+      ],
+      "has_luks": true
+    },
+    "luks2-pbkdf2": {
+      "description": "Opaque LUKS2 container (pbkdf2)",
+      "images": [
+        "luks2-pbkdf2.img"
+      ],
+      "has_luks": true
     }
   }
 }
