@@ -1,5 +1,0 @@
-Hello from WinLVM corpus generator
-LV: lv4k
-VG: vg4k
-Case: sector4k
-This file is verification data for the WinLVM driver.

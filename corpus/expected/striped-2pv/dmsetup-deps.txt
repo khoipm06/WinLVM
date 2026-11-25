@@ -1,1 +1,0 @@
-vgstripe-lvstr: 2 dependencies	: (8, 80) (8, 64)

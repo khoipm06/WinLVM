@@ -1,2 +1,0 @@
-vgboot-lvboot: 0 32768 linear 252:0 2048
-wl_luks2: 0 229376 crypt aes-xts-plain64 :64:logon:cryptsetup:7cbaa54e-98cb-4547-8fb7-a2a20bbb6aa2-d0 0 8:176 32768

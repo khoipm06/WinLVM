@@ -1,0 +1,4 @@
+vgsnap-lvorig: 0 16384 snapshot-origin 252:1
+vgsnap-lvorig-real: 0 16384 linear 7:11 2048
+vgsnap-lvsnap: 0 16384 snapshot 252:1 252:2 P 8
+vgsnap-lvsnap-cow: 0 8192 linear 7:11 18432

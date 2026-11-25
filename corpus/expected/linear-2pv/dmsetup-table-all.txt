@@ -1,2 +1,0 @@
-vgspan-lvspan: 0 253952 linear 8:32 2048
-vgspan-lvspan: 253952 73728 linear 8:48 2048

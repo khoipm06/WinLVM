@@ -1,3 +1,0 @@
-vgseg-lvA: 1 dependencies	: (8, 16)
-vgseg-lvB: 1 dependencies	: (8, 16)
-vgseg-lvC: 1 dependencies	: (8, 16)

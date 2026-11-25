@@ -1,2 +1,1 @@
-  PV         PV UUID                                VG   PSize     1st PE  PE  Alloc #PMda
-  /dev/sdh   5VhleP-1LJi-EiOg-IjyQ-dt8t-deFC-ZRDXo4 vg4k 130023424 1048576  31     4     1
+/dev/loop6|gpyyAS-4FHL-HPhm-AW0n-78fu-XlBg-AITI3j|2048|31|1

@@ -1,0 +1,3 @@
+vgraid-lvraid1: 0 16384 raid raid1 3 0 region_size 4096 2 252:1 252:2 252:3 252:4
+vgraid-lvmirror: 0 16384 mirror core 1 4096 2 252:5 0 252:6 0
+vgraid-lvmirlog: 0 8192 mirror disk 2 252:7 4096 2 252:8 0 252:9 0

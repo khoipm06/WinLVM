@@ -1,8 +1,0 @@
-.
-./hello.txt
-./pattern-1k.bin
-./pattern-4k.bin
-./random-1m.bin
-./subdir
-./subdir/nested
-./subdir/nested/deep.txt

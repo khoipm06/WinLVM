@@ -1,5 +1,0 @@
-Hello from WinLVM corpus generator
-LV: lvlin
-VG: vgbase
-Case: linear-1pv
-This file is verification data for the WinLVM driver.

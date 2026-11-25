@@ -1,0 +1,2 @@
+lvorig|vgsnap|snapshot-origin|8388608
+lvsnap|vgsnap|snapshot|8388608

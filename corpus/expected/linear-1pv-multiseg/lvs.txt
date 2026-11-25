@@ -1,6 +1,3 @@
-  VG    LV   LV UUID                                LSize    Start SSize Type   #Str Stripe PE Ranges        Devices       
-  vgseg lvA  zpg1Yg-jP7H-Bg3m-bq06-hUu3-M7kD-jYKcZ9 41943040     0     2 linear    1      0 /dev/loop1:0-1   /dev/loop1(0) 
-  vgseg lvA  zpg1Yg-jP7H-Bg3m-bq06-hUu3-M7kD-jYKcZ9 41943040     2     4 linear    1      0 /dev/loop1:4-7   /dev/loop1(4) 
-  vgseg lvA  zpg1Yg-jP7H-Bg3m-bq06-hUu3-M7kD-jYKcZ9 41943040     6     4 linear    1      0 /dev/loop1:10-13 /dev/loop1(10)
-  vgseg lvB  2OceFx-8A9H-TuXk-e5dy-uuQX-40hm-WpY5kx  8388608     0     2 linear    1      0 /dev/loop1:2-3   /dev/loop1(2) 
-  vgseg lvC  Rzog2Q-occY-jz3j-ztrr-Ax8u-XWZC-1C3RMp  8388608     0     2 linear    1      0 /dev/loop1:8-9   /dev/loop1(8) 
+lvA|vgseg|linear|41943040
+lvB|vgseg|linear|8388608
+lvC|vgseg|linear|8388608

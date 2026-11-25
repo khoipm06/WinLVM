@@ -1,0 +1,2 @@
+format=LUKS2
+pbkdf=pbkdf2

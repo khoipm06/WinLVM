@@ -1,2 +1,1 @@
-  VG    VG UUID                                Ext     #Ext Seq System ID #PV #LV
-  vgmix hZyVvj-cb0U-dsZE-wm1Q-SfYC-x3Fn-XlZW2N 4194304   62  11             2   5
+vgmix|q0Naxe-LmNO-hWzv-lb7p-ywW8-2lSN-J9v8fL|8192|15

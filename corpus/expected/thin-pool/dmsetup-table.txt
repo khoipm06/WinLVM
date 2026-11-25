@@ -1,0 +1,5 @@
+vgthin-lvthin: 0 16384 thin 252:3 1
+vgthin-lvthinsnap: 0 16384 thin 252:3 2
+vgthin-tpool-tpool: 0 65536 thin-pool 252:1 252:2 128 0 0
+vgthin-tpool_tmeta: 0 8192 linear 7:10 2048
+vgthin-tpool_tdata: 0 65536 linear 7:10 10240

@@ -1,5 +1,0 @@
-Hello from WinLVM corpus generator
-LV: lvB
-VG: vgseg
-Case: linear-1pv-multiseg
-This file is verification data for the WinLVM driver.

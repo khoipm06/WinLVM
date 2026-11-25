@@ -1,2 +1,1 @@
-  VG   VG UUID                                Ext     #Ext Seq System ID #PV #LV
-  vg4k tGYWAP-X6Go-6Evz-AvM4-dhhr-199N-mm7ELo 4194304   31   2             1   1
+vg4k|wDZPid-ZcQa-oRJe-u1gE-bjAE-dtfL-0OAUcZ|8192|2

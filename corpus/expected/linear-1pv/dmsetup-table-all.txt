@@ -1,1 +1,0 @@
-vgbase-lvlin: 0 32768 linear 8:0 2048

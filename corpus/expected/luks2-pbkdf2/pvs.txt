@@ -1,2 +1,0 @@
-  PV                   PV UUID                                VG     PSize     1st PE  PE  Alloc #PMda
-  /dev/mapper/wl_luks2 kOryoG-v3hv-eEUL-Y3V0-gtMh-eZkh-hkzxJl vgboot 113246208 1048576  27     4     1
