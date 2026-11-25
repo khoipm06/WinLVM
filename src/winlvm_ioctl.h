@@ -165,6 +165,8 @@ typedef struct _WINLVM_INVENTORY_LV_ENTRY {
     ULONGLONG byte_size;
     ULONG logical_sector;
     ULONG flags;
+    WINLVM_WCHAR drive_letter;
+    WINLVM_WCHAR reserved[3];
 } WINLVM_INVENTORY_LV_ENTRY, *PWINLVM_INVENTORY_LV_ENTRY;
 
 typedef struct _WINLVM_INVENTORY {
@@ -189,7 +191,7 @@ WINLVM_ABI_ASSERT(sizeof(WINLVM_LV_REQUEST) == 48, lv_request_size);
 WINLVM_ABI_ASSERT(sizeof(WINLVM_VG_REQUEST) == 72, vg_request_size);
 WINLVM_ABI_ASSERT(sizeof(WINLVM_UPDATE_LV_REQUEST) == 64, update_lv_request_size);
 WINLVM_ABI_ASSERT(sizeof(WINLVM_PROBE_DEVICE_REQUEST) == 520, probe_device_request_size);
-WINLVM_ABI_ASSERT(sizeof(WINLVM_INVENTORY_LV_ENTRY) == 184, inventory_lv_entry_size);
+WINLVM_ABI_ASSERT(sizeof(WINLVM_INVENTORY_LV_ENTRY) == 192, inventory_lv_entry_size);
 WINLVM_ABI_ASSERT(sizeof(WINLVM_INVENTORY) == 16, inventory_size);
 
 #if defined(_MSC_VER) && !defined(__cplusplus)

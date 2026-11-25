@@ -194,7 +194,9 @@ typedef struct _GUID {
 #define IOCTL_MOUNTDEV_QUERY_UNIQUE_ID     CTL_CODE(MOUNTDEV_IOCTL, 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_MOUNTDEV_QUERY_DEVICE_NAME   CTL_CODE(MOUNTDEV_IOCTL, 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME CTL_CODE(MOUNTDEV_IOCTL, 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_MOUNTDEV_QUERY_STABLE_GUID   CTL_CODE(MOUNTDEV_IOCTL, 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MOUNTDEV_LINK_CREATED        CTL_CODE(MOUNTDEV_IOCTL, 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MOUNTDEV_LINK_DELETED        CTL_CODE(MOUNTDEV_IOCTL, 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MOUNTDEV_QUERY_STABLE_GUID   CTL_CODE(MOUNTDEV_IOCTL, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define FSCTL_LOCK_VOLUME                  CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSCTL_UNLOCK_VOLUME                CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -424,6 +426,62 @@ typedef struct _MOUNTDEV_STABLE_GUID {
 } MOUNTDEV_STABLE_GUID, *PMOUNTDEV_STABLE_GUID;
 
 /* -------------------------------------------------------------------------
+ * Power Management Types & Constants
+ * ------------------------------------------------------------------------- */
+#define IRP_MN_WAIT_WAKE       0x00
+#define IRP_MN_POWER_SEQUENCE  0x01
+#define IRP_MN_SET_POWER       0x02
+#define IRP_MN_QUERY_POWER     0x03
+
+#define IO_NO_INCREMENT        0
+
+typedef UCHAR KIRQL;
+#define PASSIVE_LEVEL          0
+#define APC_LEVEL              1
+#define DISPATCH_LEVEL         2
+
+typedef enum _SYSTEM_POWER_STATE {
+    PowerSystemUnspecified = 0,
+    PowerSystemWorking     = 1,
+    PowerSystemSleeping1   = 2,
+    PowerSystemSleeping2   = 3,
+    PowerSystemSleeping3   = 4,
+    PowerSystemHibernate   = 5,
+    PowerSystemShutdown    = 6,
+    PowerSystemMaximum     = 7
+} SYSTEM_POWER_STATE, *PSYSTEM_POWER_STATE;
+
+typedef enum _DEVICE_POWER_STATE {
+    PowerDeviceUnspecified = 0,
+    PowerDeviceD0          = 1,
+    PowerDeviceD1          = 2,
+    PowerDeviceD2          = 3,
+    PowerDeviceD3          = 4,
+    PowerDeviceMaximum     = 5
+} DEVICE_POWER_STATE, *PDEVICE_POWER_STATE;
+
+typedef enum _POWER_STATE_TYPE {
+    SystemPowerState = 0,
+    DevicePowerState = 1
+} POWER_STATE_TYPE, *PPOWER_STATE_TYPE;
+
+typedef union _POWER_STATE {
+    SYSTEM_POWER_STATE SystemState;
+    DEVICE_POWER_STATE DeviceState;
+} POWER_STATE, *PPOWER_STATE;
+
+typedef enum _POWER_ACTION {
+    PowerActionNone = 0,
+    PowerActionReserved,
+    PowerActionSleep,
+    PowerActionHibernate,
+    PowerActionShutdown,
+    PowerActionShutdownReset,
+    PowerActionShutdownOff,
+    PowerActionWarmEject
+} POWER_ACTION, *PPOWER_ACTION;
+
+/* -------------------------------------------------------------------------
  * I/O Manager Structures
  * ------------------------------------------------------------------------- */
 typedef struct _IO_STATUS_BLOCK {
@@ -446,6 +504,12 @@ typedef struct _IO_STACK_LOCATION {
             ULONG IoControlCode;
             PVOID Type3InputBuffer;
         } DeviceIoControl;
+        struct {
+            ULONG            SystemContext;
+            POWER_STATE_TYPE Type;
+            POWER_STATE      State;
+            POWER_ACTION     ShutdownType;
+        } Power;
         struct {
             PVOID FileObject;
         };
@@ -486,6 +550,15 @@ typedef enum {
     WL_EXT_CONTROL = 3,
 } WL_EXT_KIND;
 
+typedef struct _WINLVM_BUS_EXT {
+    WL_EXT_KIND        kind;
+    PDEVICE_OBJECT     fdo;
+    PDEVICE_OBJECT     pdo;
+    PDEVICE_OBJECT     bus_pdo;
+    SYSTEM_POWER_STATE system_power_state;
+    DEVICE_POWER_STATE device_power_state;
+} WINLVM_BUS_EXT, *PWINLVM_BUS_EXT;
+
 typedef struct _WINLVM_LV_EXT {
     WL_EXT_KIND         kind;
     PDEVICE_OBJECT      pdo;
@@ -503,6 +576,9 @@ typedef struct _WINLVM_LV_EXT {
     BOOLEAN             read_only;
     UNICODE_STRING      ifname;
     WCHAR               devname[64];
+    WCHAR               drive_letter;
+    SYSTEM_POWER_STATE  system_power_state;
+    DEVICE_POWER_STATE  device_power_state;
 } WINLVM_LV_EXT, *PWINLVM_LV_EXT;
 
 /* -------------------------------------------------------------------------
@@ -514,6 +590,7 @@ extern "C" {
 
 NTSTATUS WinLvmStorageIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext);
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext);
+NTSTATUS WinLvmPower(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS WinLvmFlush(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS WinLvmShutdown(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 

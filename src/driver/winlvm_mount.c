@@ -15,12 +15,60 @@
 #define IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME CTL_CODE(MOUNTDEV_IOCTL, 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #endif
 
+#ifndef IOCTL_MOUNTDEV_LINK_CREATED
+#define IOCTL_MOUNTDEV_LINK_CREATED CTL_CODE(MOUNTDEV_IOCTL, 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#ifndef IOCTL_MOUNTDEV_LINK_DELETED
+#define IOCTL_MOUNTDEV_LINK_DELETED CTL_CODE(MOUNTDEV_IOCTL, 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
 #ifndef IOCTL_MOUNTDEV_QUERY_STABLE_GUID
-#define IOCTL_MOUNTDEV_QUERY_STABLE_GUID CTL_CODE(MOUNTDEV_IOCTL, 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MOUNTDEV_QUERY_STABLE_GUID CTL_CODE(MOUNTDEV_IOCTL, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 typedef struct _MOUNTDEV_STABLE_GUID {
     GUID StableGuid;
 } MOUNTDEV_STABLE_GUID, *PMOUNTDEV_STABLE_GUID;
 #endif
+
+static WCHAR WinLvmAsciiLowerW_Mount(WCHAR c) {
+    return (c >= L'A' && c <= L'Z') ? (WCHAR)(c + (L'a' - L'A')) : c;
+}
+
+static BOOLEAN WinLvmPrefixEqualI(const WCHAR *s, size_t len, const char *prefix, size_t plen) {
+    if (len < plen) return FALSE;
+    for (size_t i = 0; i < plen; i++) {
+        if (WinLvmAsciiLowerW_Mount(s[i]) != (WCHAR)(unsigned char)prefix[i]) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/*
+ * Parse a MountMgr drive-letter link ("\DosDevices\X:" or "\??\X:", with
+ * optional trailing backslash) into an uppercase ASCII drive letter 'A'..'Z'.
+ * Returns 0 for non-drive-letter links such as "\??\Volume{...}".
+ */
+static WCHAR WinLvmExtractDriveLetter(const WCHAR *name, USHORT byte_len) {
+    if (!name || byte_len == 0 || (byte_len % sizeof(WCHAR)) != 0) return 0;
+    size_t cch = (size_t)(byte_len / sizeof(WCHAR));
+    if (cch > 0 && name[cch - 1] == L'\\') cch--;
+
+    size_t letter_idx = 0;
+    if (cch == 14 && WinLvmPrefixEqualI(name, cch, "\\dosdevices\\", 12)) {
+        letter_idx = 12;
+    } else if (cch == 6 && WinLvmPrefixEqualI(name, cch, "\\??\\", 4)) {
+        letter_idx = 4;
+    } else {
+        return 0;
+    }
+
+    if (name[letter_idx + 1] != L':') return 0;
+    WCHAR ch = name[letter_idx];
+    if (ch >= L'a' && ch <= L'z') ch = (WCHAR)(ch - (L'a' - L'A'));
+    if (ch >= L'A' && ch <= L'Z') return ch;
+    return 0;
+}
 
 static void WinLvmUuidToGuid(const char *uuid, GUID *guid) {
     unsigned char bytes[16];
@@ -110,6 +158,30 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
 
         RtlCopyMemory(uniqueId->UniqueId, lv_uuid, 32);
         Irp->IoStatus.Information = offsetof(MOUNTDEV_UNIQUE_ID, UniqueId) + 32;
+        return STATUS_SUCCESS;
+    }
+
+    if (code == IOCTL_MOUNTDEV_LINK_CREATED || code == IOCTL_MOUNTDEV_LINK_DELETED) {
+        ULONG inLen = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+        if (!sysBuf || inLen < (ULONG)offsetof(MOUNTDEV_NAME, Name)) {
+            Irp->IoStatus.Information = 0;
+            return STATUS_INVALID_PARAMETER;
+        }
+        PMOUNTDEV_NAME mountName = (PMOUNTDEV_NAME)sysBuf;
+        if ((mountName->NameLength % sizeof(WCHAR)) != 0 ||
+            (ULONG)offsetof(MOUNTDEV_NAME, Name) + mountName->NameLength > inLen) {
+            Irp->IoStatus.Information = 0;
+            return STATUS_INVALID_PARAMETER;
+        }
+        WCHAR letter = WinLvmExtractDriveLetter(mountName->Name, mountName->NameLength);
+        if (letter != 0) {
+            if (code == IOCTL_MOUNTDEV_LINK_CREATED) {
+                ext->drive_letter = letter;
+            } else if (ext->drive_letter == letter) {
+                ext->drive_letter = 0;
+            }
+        }
+        Irp->IoStatus.Information = 0;
         return STATUS_SUCCESS;
     }
 

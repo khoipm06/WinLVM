@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -638,13 +639,368 @@ TEST(StorageSurface_IsWritable_EnforcesReadOnlyAndSystemId) {
 }
 
 TEST(ControlPlaneAbi_WireStructSizesMatchSpec) {
-    CHECK_EQ(sizeof(WINLVM_CONTROL_REQUEST), std::size_t{8});
-    CHECK_EQ(sizeof(WINLVM_LV_REQUEST), std::size_t{48});
-    CHECK_EQ(sizeof(WINLVM_VG_REQUEST), std::size_t{72});
-    CHECK_EQ(sizeof(WINLVM_UPDATE_LV_REQUEST), std::size_t{64});
-    CHECK_EQ(sizeof(WINLVM_PROBE_DEVICE_REQUEST), std::size_t{520});
-    CHECK_EQ(sizeof(WINLVM_INVENTORY_LV_ENTRY), std::size_t{184});
-    CHECK_EQ(sizeof(WINLVM_INVENTORY), std::size_t{16});
+    static_assert(sizeof(WINLVM_CONTROL_REQUEST) == std::size_t{8});
+    static_assert(sizeof(WINLVM_LV_REQUEST) == std::size_t{48});
+    static_assert(sizeof(WINLVM_VG_REQUEST) == std::size_t{72});
+    static_assert(sizeof(WINLVM_UPDATE_LV_REQUEST) == std::size_t{64});
+    static_assert(sizeof(WINLVM_PROBE_DEVICE_REQUEST) == std::size_t{520});
+    static_assert(sizeof(WINLVM_INVENTORY_LV_ENTRY) == std::size_t{192});
+    static_assert(offsetof(WINLVM_INVENTORY_LV_ENTRY, drive_letter) == std::size_t{184});
+    static_assert(sizeof(WINLVM_INVENTORY) == std::size_t{16});
+}
+
+namespace {
+
+std::vector<uint8_t> makeMountDevNameBuf(const std::u16string &link) {
+    const size_t nameBytes = link.size() * sizeof(WCHAR);
+    std::vector<uint8_t> buf(offsetof(MOUNTDEV_NAME, Name) + nameBytes, 0);
+    auto *mn = reinterpret_cast<MOUNTDEV_NAME *>(buf.data());
+    mn->NameLength = static_cast<USHORT>(nameBytes);
+    if (nameBytes > 0) {
+        std::memcpy(mn->Name, link.data(), nameBytes);
+    }
+    return buf;
+}
+
+struct MockPowerHarness {
+    KIRQL currentIrql = PASSIVE_LEVEL;
+    int setPowerCalls = 0;
+    PDEVICE_OBJECT lastSetDevice = nullptr;
+    POWER_STATE_TYPE lastSetType = SystemPowerState;
+    POWER_STATE lastSetState{};
+    int startNextCalls = 0;
+    int skipStackCalls = 0;
+    int callDriverCalls = 0;
+    PDEVICE_OBJECT lastCalledDevice = nullptr;
+    NTSTATUS lastForwardedStatus = 0;
+    NTSTATUS callDriverReturn = STATUS_SUCCESS;
+    int completeCalls = 0;
+    NTSTATUS lastCompletedStatus = 0;
+    ULONG_PTR lastCompletedInfo = 0;
+
+    void reset() {
+        *this = MockPowerHarness{};
+    }
+};
+
+MockPowerHarness g_powerMock;
+
+KIRQL KeGetCurrentIrql(void) {
+    return g_powerMock.currentIrql;
+}
+
+POWER_STATE PoSetPowerState(PDEVICE_OBJECT DeviceObject,
+                            POWER_STATE_TYPE Type,
+                            POWER_STATE State) {
+    g_powerMock.setPowerCalls++;
+    g_powerMock.lastSetDevice = DeviceObject;
+    g_powerMock.lastSetType = Type;
+    g_powerMock.lastSetState = State;
+    return State;
+}
+
+void PoStartNextPowerIrp(PIRP Irp) {
+    (void)Irp;
+    g_powerMock.startNextCalls++;
+}
+
+void IoSkipCurrentIrpStackLocation(PIRP Irp) {
+    (void)Irp;
+    g_powerMock.skipStackCalls++;
+}
+
+NTSTATUS PoCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    g_powerMock.callDriverCalls++;
+    g_powerMock.lastCalledDevice = DeviceObject;
+    g_powerMock.lastForwardedStatus = Irp->IoStatus.Status;
+    /* Poison IRP memory to verify zero post-PoCallDriver UAF dereferences. */
+    std::memset(Irp, 0xFE, sizeof(*Irp));
+    return g_powerMock.callDriverReturn;
+}
+
+void IoCompleteRequest(PIRP Irp, CCHAR PriorityBoost) {
+    (void)PriorityBoost;
+    g_powerMock.completeCalls++;
+    g_powerMock.lastCompletedStatus = Irp->IoStatus.Status;
+    g_powerMock.lastCompletedInfo = Irp->IoStatus.Information;
+    /* Poison IRP memory to verify zero post-IoCompleteRequest UAF dereferences. */
+    std::memset(Irp, 0xFE, sizeof(*Irp));
+}
+
+} // namespace
+
+extern "C" {
+#include "../src/driver/winlvm_power.c"
+}
+
+TEST(StorageSurface_MountDevLinkCreatedAndDeleted) {
+    IoctlTestFixture fix;
+    std::vector<uint8_t> outBuf;
+    uint64_t info = 99;
+
+    // Distinct WDK control codes: LINK_CREATED(4), LINK_DELETED(5), QUERY_STABLE_GUID(6).
+    static_assert(IOCTL_MOUNTDEV_LINK_CREATED != IOCTL_MOUNTDEV_LINK_DELETED);
+    static_assert(IOCTL_MOUNTDEV_LINK_DELETED != IOCTL_MOUNTDEV_QUERY_STABLE_GUID);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>(0));
+
+    // Standard \DosDevices\E: assignment
+    auto linkE = makeMountDevNameBuf(u"\\DosDevices\\E:");
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_CREATED, linkE.size(), 0,
+                               linkE.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(info, 0ull);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>('E'));
+
+    // Lowercase prefix and drive letter are normalized to uppercase
+    auto linkLowerF = makeMountDevNameBuf(u"\\dosdevices\\f:");
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_CREATED, linkLowerF.size(), 0,
+                               linkLowerF.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>('F'));
+
+    // \??\G:\ form with trailing backslash
+    auto linkG = makeMountDevNameBuf(u"\\??\\g:\\");
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_CREATED, linkG.size(), 0,
+                               linkG.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>('G'));
+
+    // Volume GUID links must succeed without clobbering the drive letter
+    auto volGuid = makeMountDevNameBuf(u"\\??\\Volume{12345678-1234-1234-1234-123456789abc}");
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_CREATED, volGuid.size(), 0,
+                               volGuid.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>('G'));
+
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_DELETED, volGuid.size(), 0,
+                               volGuid.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>('G'));
+
+    // Deleting a different drive letter does not clear the current one
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_DELETED, linkE.size(), 0,
+                               linkE.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>('G'));
+
+    // Deleting the active drive letter clears it
+    auto linkGNoSlash = makeMountDevNameBuf(u"\\DosDevices\\G:");
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_DELETED, linkGNoSlash.size(), 0,
+                               linkGNoSlash.data(), outBuf, info), STATUS_SUCCESS);
+    CHECK_EQ(fix.ext.drive_letter, static_cast<WCHAR>(0));
+
+    // Malformed buffers fail closed with STATUS_INVALID_PARAMETER
+    uint8_t tiny[1] = {0};
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_CREATED, sizeof(tiny), 0,
+                               tiny, outBuf, info), STATUS_INVALID_PARAMETER);
+
+    MOUNTDEV_NAME truncated{};
+    truncated.NameLength = 28;
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_CREATED, sizeof(truncated), 0,
+                               &truncated, outBuf, info), STATUS_INVALID_PARAMETER);
+
+    MOUNTDEV_NAME oddLen{};
+    oddLen.NameLength = 3;
+    std::vector<uint8_t> oddBuf(16, 0);
+    std::memcpy(oddBuf.data(), &oddLen, sizeof(oddLen));
+    CHECK_EQ(fix.runMountIoctl(IOCTL_MOUNTDEV_LINK_DELETED, oddBuf.size(), 0,
+                               oddBuf.data(), outBuf, info), STATUS_INVALID_PARAMETER);
+}
+
+TEST(PowerDispatch_BusAndChildTransitionsAndZeroUaf) {
+    DEVICE_OBJECT lowerPdo{};
+    DEVICE_OBJECT busFdo{};
+    WINLVM_BUS_EXT busExt{};
+    busExt.kind = WL_EXT_BUS;
+    busExt.fdo = &busFdo;
+    busExt.bus_pdo = &lowerPdo;
+    busExt.system_power_state = PowerSystemWorking;
+    busExt.device_power_state = PowerDeviceD0;
+    busFdo.DeviceExtension = &busExt;
+
+    DEVICE_OBJECT lvPdo{};
+    WINLVM_LV_EXT lvExt{};
+    lvExt.kind = WL_EXT_LV;
+    lvExt.pdo = &lvPdo;
+    lvExt.system_power_state = PowerSystemWorking;
+    lvExt.device_power_state = PowerDeviceD0;
+    lvPdo.DeviceExtension = &lvExt;
+
+    DEVICE_OBJECT ctrlDev{};
+    struct { WL_EXT_KIND kind; } ctrlExt{ WL_EXT_CONTROL };
+    ctrlDev.DeviceExtension = &ctrlExt;
+
+    const SYSTEM_POWER_STATE sysStates[] = {
+        PowerSystemSleeping1, PowerSystemSleeping2, PowerSystemSleeping3,
+        PowerSystemHibernate, PowerSystemShutdown, PowerSystemWorking
+    };
+    const DEVICE_POWER_STATE devStates[] = {
+        PowerDeviceD1, PowerDeviceD2, PowerDeviceD3, PowerDeviceD0
+    };
+
+    // Bus FDO: S-IRPs and D-IRPs track state, call PoSetPowerState, forward via PoCallDriver.
+    for (SYSTEM_POWER_STATE s : sysStates) {
+        g_powerMock.reset();
+        g_powerMock.callDriverReturn = STATUS_PENDING;
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = IRP_MN_SET_POWER;
+        sp.Parameters.Power.Type = SystemPowerState;
+        sp.Parameters.Power.State.SystemState = s;
+        irp.CurrentStackLocation = &sp;
+        irp.IoStatus.Status = STATUS_NOT_SUPPORTED;
+
+        CHECK_EQ(WinLvmPower(&busFdo, &irp), STATUS_PENDING);
+        CHECK_EQ(busExt.system_power_state, s);
+        CHECK_EQ(g_powerMock.setPowerCalls, 1);
+        CHECK_EQ(g_powerMock.lastSetDevice, &busFdo);
+        CHECK_EQ(g_powerMock.lastSetType, SystemPowerState);
+        CHECK_EQ(g_powerMock.lastSetState.SystemState, s);
+        CHECK_EQ(g_powerMock.startNextCalls, 1);
+        CHECK_EQ(g_powerMock.skipStackCalls, 1);
+        CHECK_EQ(g_powerMock.callDriverCalls, 1);
+        CHECK_EQ(g_powerMock.lastCalledDevice, &lowerPdo);
+        CHECK_EQ(g_powerMock.lastForwardedStatus, STATUS_SUCCESS);
+        CHECK_EQ(g_powerMock.completeCalls, 0);
+    }
+
+    for (DEVICE_POWER_STATE d : devStates) {
+        g_powerMock.reset();
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = IRP_MN_SET_POWER;
+        sp.Parameters.Power.Type = DevicePowerState;
+        sp.Parameters.Power.State.DeviceState = d;
+        irp.CurrentStackLocation = &sp;
+
+        CHECK_EQ(WinLvmPower(&busFdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(busExt.device_power_state, d);
+        CHECK_EQ(g_powerMock.setPowerCalls, 1);
+        CHECK_EQ(g_powerMock.lastSetType, DevicePowerState);
+        CHECK_EQ(g_powerMock.lastSetState.DeviceState, d);
+        CHECK_EQ(g_powerMock.callDriverCalls, 1);
+    }
+
+    // Bus FDO: unhandled minors preserve incoming status and forward down.
+    for (UCHAR minor : { (UCHAR)IRP_MN_WAIT_WAKE, (UCHAR)IRP_MN_POWER_SEQUENCE }) {
+        g_powerMock.reset();
+        g_powerMock.callDriverReturn = STATUS_NOT_SUPPORTED;
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = minor;
+        irp.CurrentStackLocation = &sp;
+        irp.IoStatus.Status = STATUS_NOT_SUPPORTED;
+
+        CHECK_EQ(WinLvmPower(&busFdo, &irp), STATUS_NOT_SUPPORTED);
+        CHECK_EQ(g_powerMock.lastForwardedStatus, STATUS_NOT_SUPPORTED);
+        CHECK_EQ(g_powerMock.setPowerCalls, 0);
+        CHECK_EQ(g_powerMock.startNextCalls, 1);
+        CHECK_EQ(g_powerMock.callDriverCalls, 1);
+    }
+
+    // Child LV PDO: QUERY_POWER and SET_POWER complete directly with STATUS_SUCCESS.
+    for (SYSTEM_POWER_STATE s : sysStates) {
+        g_powerMock.reset();
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = IRP_MN_SET_POWER;
+        sp.Parameters.Power.Type = SystemPowerState;
+        sp.Parameters.Power.State.SystemState = s;
+        irp.CurrentStackLocation = &sp;
+        irp.IoStatus.Status = STATUS_NOT_SUPPORTED;
+
+        CHECK_EQ(WinLvmPower(&lvPdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(lvExt.system_power_state, s);
+        CHECK_EQ(g_powerMock.setPowerCalls, 1);
+        CHECK_EQ(g_powerMock.startNextCalls, 1);
+        CHECK_EQ(g_powerMock.completeCalls, 1);
+        CHECK_EQ(g_powerMock.lastCompletedStatus, STATUS_SUCCESS);
+        CHECK_EQ(g_powerMock.callDriverCalls, 0);
+    }
+
+    for (DEVICE_POWER_STATE d : devStates) {
+        g_powerMock.reset();
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = IRP_MN_SET_POWER;
+        sp.Parameters.Power.Type = DevicePowerState;
+        sp.Parameters.Power.State.DeviceState = d;
+        irp.CurrentStackLocation = &sp;
+
+        CHECK_EQ(WinLvmPower(&lvPdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(lvExt.device_power_state, d);
+        CHECK_EQ(g_powerMock.setPowerCalls, 1);
+        CHECK_EQ(g_powerMock.completeCalls, 1);
+        CHECK_EQ(g_powerMock.lastCompletedStatus, STATUS_SUCCESS);
+    }
+
+    {
+        g_powerMock.reset();
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = IRP_MN_QUERY_POWER;
+        sp.Parameters.Power.Type = SystemPowerState;
+        sp.Parameters.Power.State.SystemState = PowerSystemHibernate;
+        irp.CurrentStackLocation = &sp;
+        irp.IoStatus.Status = STATUS_NOT_SUPPORTED;
+
+        CHECK_EQ(WinLvmPower(&lvPdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(g_powerMock.completeCalls, 1);
+        CHECK_EQ(g_powerMock.lastCompletedStatus, STATUS_SUCCESS);
+        CHECK_EQ(g_powerMock.startNextCalls, 1);
+    }
+
+    // DISPATCH_LEVEL IRQL guard: PoSetPowerState is called only for PowerDeviceD0
+    // and skipped for S0-S5 and D1-D3 while state tracking still updates.
+    {
+        g_powerMock.reset();
+        g_powerMock.currentIrql = DISPATCH_LEVEL;
+        IRP irp{};
+        IO_STACK_LOCATION sp{};
+        sp.MinorFunction = IRP_MN_SET_POWER;
+        sp.Parameters.Power.Type = DevicePowerState;
+        sp.Parameters.Power.State.DeviceState = PowerDeviceD3;
+        irp.CurrentStackLocation = &sp;
+
+        CHECK_EQ(WinLvmPower(&lvPdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(lvExt.device_power_state, PowerDeviceD3);
+        CHECK_EQ(g_powerMock.setPowerCalls, 0);
+        CHECK_EQ(g_powerMock.completeCalls, 1);
+
+        g_powerMock.reset();
+        g_powerMock.currentIrql = DISPATCH_LEVEL;
+        sp.Parameters.Power.Type = SystemPowerState;
+        sp.Parameters.Power.State.SystemState = PowerSystemHibernate;
+        irp = IRP{};
+        irp.CurrentStackLocation = &sp;
+        CHECK_EQ(WinLvmPower(&lvPdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(lvExt.system_power_state, PowerSystemHibernate);
+        CHECK_EQ(g_powerMock.setPowerCalls, 0);
+
+        g_powerMock.reset();
+        g_powerMock.currentIrql = DISPATCH_LEVEL;
+        sp.Parameters.Power.Type = DevicePowerState;
+        sp.Parameters.Power.State.DeviceState = PowerDeviceD0;
+        irp = IRP{};
+        irp.CurrentStackLocation = &sp;
+        CHECK_EQ(WinLvmPower(&lvPdo, &irp), STATUS_SUCCESS);
+        CHECK_EQ(lvExt.device_power_state, PowerDeviceD0);
+        CHECK_EQ(g_powerMock.setPowerCalls, 1);
+    }
+
+    // Child LV PDO & Control device: unhandled minors preserve STATUS_NOT_SUPPORTED
+    // even after IoCompleteRequest poisons the IRP buffer.
+    for (PDEVICE_OBJECT dev : { &lvPdo, &ctrlDev }) {
+        for (UCHAR minor : { (UCHAR)IRP_MN_WAIT_WAKE, (UCHAR)IRP_MN_POWER_SEQUENCE }) {
+            g_powerMock.reset();
+            IRP irp{};
+            IO_STACK_LOCATION sp{};
+            sp.MinorFunction = minor;
+            irp.CurrentStackLocation = &sp;
+            irp.IoStatus.Status = STATUS_NOT_SUPPORTED;
+
+            CHECK_EQ(WinLvmPower(dev, &irp), STATUS_NOT_SUPPORTED);
+            CHECK_EQ(g_powerMock.setPowerCalls, 0);
+            CHECK_EQ(g_powerMock.startNextCalls, 1);
+            CHECK_EQ(g_powerMock.completeCalls, 1);
+            CHECK_EQ(g_powerMock.lastCompletedStatus, STATUS_NOT_SUPPORTED);
+            CHECK_EQ(g_powerMock.callDriverCalls, 0);
+        }
+    }
 }
 
 TEST(ControlPlaneAbi_UuidNormalizationAndWireEquality) {
