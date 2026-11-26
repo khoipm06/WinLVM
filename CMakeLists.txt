@@ -253,3 +253,86 @@ if(TARGET corpus)
 endif()
 
 add_test(NAME winlvm_tests COMMAND winlvm_tests)
+
+# ---------------------------------------------------------------------------
+# Installer trailer archive library, host tests, and native Win32 binaries.
+# ---------------------------------------------------------------------------
+add_library(winlvm_installer_archive STATIC
+  src/installer/archive_format.cpp
+)
+target_include_directories(winlvm_installer_archive PUBLIC src/installer)
+
+add_executable(test_installer_archive
+  tests/test_main.cpp
+  tests/test_installer_archive.cpp
+)
+target_include_directories(test_installer_archive PRIVATE tests)
+target_link_libraries(test_installer_archive PRIVATE winlvm_installer_archive)
+target_compile_definitions(test_installer_archive PRIVATE
+  WINLVM_PACK_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/scripts/pack_installer.py"
+)
+add_test(NAME test_installer_archive COMMAND test_installer_archive)
+
+if(WIN32)
+  set(WINLVM_INSTALLER_WIN_LIBS
+    setupapi
+    newdev
+    cfgmgr32
+    advapi32
+    crypt32
+    shell32
+    ole32
+    uuid
+    comctl32
+    user32
+    gdi32
+    ntdll
+  )
+
+  add_executable(winlvm_setup_stub WIN32
+    src/installer/setup_main.cpp
+    src/installer/win_common.cpp
+    src/installer/setup.rc
+  )
+  target_link_libraries(winlvm_setup_stub PRIVATE
+    winlvm_installer_archive
+    ${WINLVM_INSTALLER_WIN_LIBS}
+  )
+  target_compile_definitions(winlvm_setup_stub PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _WIN32_WINNT=0x0A00
+    NTDDI_VERSION=0x0A000000
+  )
+
+  add_executable(winlvm_uninstall WIN32
+    src/installer/uninstall_main.cpp
+    src/installer/win_common.cpp
+    src/installer/uninstall.rc
+  )
+  set_target_properties(winlvm_uninstall PROPERTIES
+    OUTPUT_NAME "winlvm-uninstall"
+  )
+  target_link_libraries(winlvm_uninstall PRIVATE
+    ${WINLVM_INSTALLER_WIN_LIBS}
+  )
+  target_compile_definitions(winlvm_uninstall PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _WIN32_WINNT=0x0A00
+    NTDDI_VERSION=0x0A000000
+  )
+
+  if(MSVC)
+    # Embedded manifest is supplied by setup.rc / uninstall.rc.
+    target_link_options(winlvm_setup_stub PRIVATE /MANIFEST:NO)
+    target_link_options(winlvm_uninstall PRIVATE /MANIFEST:NO)
+  else()
+    target_link_options(winlvm_setup_stub PRIVATE -municode)
+    target_link_options(winlvm_uninstall PRIVATE -municode)
+  endif()
+endif()
