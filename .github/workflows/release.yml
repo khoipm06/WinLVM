@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version label (defaults to git tag or short SHA)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Windows x64 Release Bundle
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Determine release version
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ inputs.version }}" -ne "") {
+            $ver = "${{ inputs.version }}"
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            $ver = "${{ github.ref_name }}"
+          } else {
+            $ver = "v0.0.0-" + ("${{ github.sha }}".Substring(0, 7))
+          }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Install build prerequisites (zstd and WDK if absent)
+        shell: pwsh
+        run: |
+          choco install zstandard -y
+          echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
+          $env:PATH = "C:\Program Files\zstd;$env:PATH"
+          $wdkProps = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\build" -Filter "WindowsDriver.Default.props" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $wdkProps) {
+            choco install windowsdriverkit11 -y
+          }
+
+      - name: Configure and build user-mode targets (MSVC Release x64)
+        run: |
+          cmake -B build -A x64
+          cmake --build build --config Release
+          ctest --test-dir build -C Release --output-on-failure
+
+      - name: Build WDM kernel driver (winlvm.sys)
+        run: msbuild src\driver\winlvm.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Stage payload, generate catalogs, sign, and pack installer
+        shell: pwsh
+        env:
+          SIGN_PFX_B64: ${{ secrets.WINLVM_SIGN_PFX_B64 }}
+          SIGN_PFX_PASS: ${{ secrets.WINLVM_SIGN_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ steps.meta.outputs.version }}"
+          $dist = Join-Path $PWD "dist"
+          $stage = Join-Path $dist "stage"
+          New-Item -ItemType Directory -Force -Path "$stage\bin", "$stage\driver" | Out-Null
+
+          # Copy user-mode binaries and uninstaller.
+          foreach ($bin in @("lvm.exe", "lvmdump.exe", "winlvm_svc.exe", "winlvm_gui.exe")) {
+            $src = Join-Path "build\Release" $bin
+            if (-not (Test-Path $src)) {
+              throw "Required release binary missing: $src"
+            }
+            Copy-Item $src "$stage\bin\"
+          }
+          Copy-Item "build\Release\winlvm-uninstall.exe" "$stage\"
+          Copy-Item "LICENSE", "NOTICE" "$stage\"
+
+          # Locate WDK Inf2Cat and SignTool.
+          $inf2cat = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "Inf2Cat.exe" -Recurse | Where-Object { $_.FullName -match '\\x86\\' -or $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "signtool.exe" -Recurse | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $inf2cat -or -not $signtool) {
+            throw "Inf2Cat.exe or signtool.exe not found under Windows Kits."
+          }
+
+          # Stage bus driver first and generate winlvm.cat before adding vol/
+          # so Inf2Cat does not scan winlvm-vol.inf into winlvm.cat.
+          $drvOut = "src\driver\x64\Release"
+          Copy-Item (Join-Path $drvOut "winlvm.sys") "$stage\driver\"
+          Copy-Item "src\driver\winlvm.inf" "$stage\driver\"
+          & $inf2cat.FullName /driver:"$stage\driver" /os:10_X64
+          if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed for driver/" }
+
+          # Stage raw volume PDO INF separately and generate winlvm-vol.cat.
+          New-Item -ItemType Directory -Force -Path "$stage\driver\vol" | Out-Null
+          Copy-Item "src\driver\winlvm-vol.inf" "$stage\driver\vol\"
+          & $inf2cat.FullName /driver:"$stage\driver\vol" /os:10_X64
+          if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed for driver/vol/" }
+
+          # Sign driver files using configured release certificate or an
+          # ephemeral test-signing certificate exported as driver/winlvm.cer.
+          $pfxPath = Join-Path $env:RUNNER_TEMP "winlvm-sign.pfx"
+          $pfxPass = $env:SIGN_PFX_PASS
+          if ($env:SIGN_PFX_B64) {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGN_PFX_B64))
+          } else {
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=WinLVM Test Signing" -CertStoreLocation "Cert:\CurrentUser\My" -HashAlgorithm SHA256 -KeyLength 2048
+            $pfxPass = "winlvm-ci-ephemeral"
+            $secPass = ConvertTo-SecureString -String $pfxPass -Force -AsPlainText
+            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $secPass | Out-Null
+            Export-Certificate -Cert $cert -FilePath "$stage\driver\winlvm.cer" | Out-Null
+          }
+
+          foreach ($target in @("$stage\driver\winlvm.sys", "$stage\driver\winlvm.cat", "$stage\driver\vol\winlvm-vol.cat")) {
+            & $signtool.FullName sign /fd sha256 /f $pfxPath /p $pfxPass $target
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $target" }
+          }
+
+          # Pack standalone 1-click installer and verify integrity.
+          $setupExe = Join-Path $dist "winlvm-setup-x64.exe"
+          python scripts/pack_installer.py `
+            --strict `
+            --stub "build\Release\winlvm_setup_stub.exe" `
+            --stage-dir $stage `
+            --out $setupExe
+          python scripts/pack_installer.py --verify-only $setupExe
+          & $setupExe --verify-only
+          if ($LASTEXITCODE -ne 0) { throw "winlvm-setup-x64.exe --verify-only failed" }
+
+          # Build portable zip bundle.
+          $zipPath = Join-Path $dist "winlvm-$ver-x64-portable.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zipPath -Force
+
+          # Generate SHA256SUMS.txt.
+          $sums = @()
+          foreach ($art in @("winlvm-setup-x64.exe", "winlvm-$ver-x64-portable.zip")) {
+            $h = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $dist $art)).Hash.ToLowerInvariant()
+            $sums += "$h  $art"
+          }
+          [IO.File]::WriteAllLines((Join-Path $dist "SHA256SUMS.txt"), $sums)
+          Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: winlvm-release-${{ steps.meta.outputs.version }}
+          path: |
+            dist/winlvm-setup-x64.exe
+            dist/winlvm-*-x64-portable.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $files = @(
+            "dist/winlvm-setup-x64.exe",
+            "dist/winlvm-$tag-x64-portable.zip",
+            "dist/SHA256SUMS.txt"
+          )
+          $exists = gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --clobber
+          } else {
+            gh release create $tag @files --title "WinLVM $tag" --generate-notes
+          }

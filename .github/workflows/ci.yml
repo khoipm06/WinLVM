@@ -8,56 +8,189 @@ on:
   workflow_dispatch:
 
 jobs:
-  linux:
-    name: Build & Test (Ubuntu)
+  linux-release:
+    name: Build & Test Release (Ubuntu)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install build dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends ninja-build zstd
-        zstd --version
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zstd python3
+          zstd --version
 
-    - name: Configure CMake
-      run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Configure CMake (Release, -Werror)
+        run: >
+          cmake -B build-release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_FLAGS="-Werror"
+          -DCMAKE_CXX_FLAGS="-Werror"
 
-    - name: Build
-      run: cmake --build build
+      - name: Build
+        run: cmake --build build-release
 
-    - name: Test
-      run: ctest --test-dir build --output-on-failure
+      - name: Test
+        run: ctest --test-dir build-release --output-on-failure
+
+  linux-ubsan:
+    name: Build & Test UBSan (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zstd python3
+
+      - name: Configure CMake (UBSan, -Werror)
+        run: >
+          cmake -B build-ubsan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -Werror"
+          -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -Werror"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
+
+      - name: Build
+        run: cmake --build build-ubsan
+
+      - name: Test
+        run: ctest --test-dir build-ubsan --output-on-failure
+
+  linux-mingw:
+    name: Cross-Compile Windows x64 (MinGW-w64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build mingw-w64 python3
+
+      - name: Configure CMake (MinGW-w64, -Werror, -static)
+        run: >
+          cmake -B build-mingw -G Ninja
+          -DCMAKE_SYSTEM_NAME=Windows
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
+          -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+          -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres
+          -DCMAKE_C_FLAGS="-Werror"
+          -DCMAKE_CXX_FLAGS="-Werror"
+          -DCMAKE_EXE_LINKER_FLAGS="-static"
+
+      - name: Build Windows executables
+        run: |
+          targets="lvm lvmdump winlvm_svc winlvm_setup_stub winlvm_uninstall"
+          if cmake --build build-mingw --target help | grep -q '^winlvm_gui:'; then
+            targets="$targets winlvm_gui"
+          fi
+          cmake --build build-mingw --target $targets
+
+      - name: Verify standalone DLL imports & pack installer smoke test
+        run: |
+          for exe in build-mingw/lvm.exe build-mingw/lvmdump.exe build-mingw/winlvm_svc.exe build-mingw/winlvm_setup_stub.exe build-mingw/winlvm-uninstall.exe; do
+            echo "Checking imports: $exe"
+            if x86_64-w64-mingw32-objdump -p "$exe" | grep -iE 'DLL Name:.*(libstdc|libgcc|libwinpthread)'; then
+              echo "Unexpected MinGW runtime DLL dependency in $exe" >&2
+              exit 1
+            fi
+          done
+          if [ -f build-mingw/winlvm_gui.exe ]; then
+            if x86_64-w64-mingw32-objdump -p build-mingw/winlvm_gui.exe | grep -iE 'DLL Name:.*(libstdc|libgcc|libwinpthread)'; then
+              echo "Unexpected MinGW runtime DLL dependency in winlvm_gui.exe" >&2
+              exit 1
+            fi
+          fi
+
+          stage_dir=$(mktemp -d)
+          trap 'rm -rf "$stage_dir"' EXIT
+          mkdir -p "$stage_dir/bin" "$stage_dir/driver/vol"
+          cp build-mingw/lvm.exe build-mingw/lvmdump.exe build-mingw/winlvm_svc.exe "$stage_dir/bin/"
+          if [ -f build-mingw/winlvm_gui.exe ]; then
+            cp build-mingw/winlvm_gui.exe "$stage_dir/bin/"
+          fi
+          cp build-mingw/winlvm-uninstall.exe "$stage_dir/"
+          cp src/driver/winlvm.inf "$stage_dir/driver/"
+          cp src/driver/winlvm-vol.inf "$stage_dir/driver/vol/"
+          cp LICENSE NOTICE "$stage_dir/"
+          python3 scripts/pack_installer.py \
+            --stub build-mingw/winlvm_setup_stub.exe \
+            --stage-dir "$stage_dir" \
+            --out "$stage_dir/winlvm-setup-x64.exe"
+          python3 scripts/pack_installer.py --verify-only "$stage_dir/winlvm-setup-x64.exe"
 
   windows:
     name: Build & Test (Windows MSVC)
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up MSVC environment
-      uses: ilammy/msvc-dev-cmd@v1
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Install zstd
-      shell: pwsh
-      run: |
-        choco install zstandard -y
-        echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
-        $env:PATH = "C:\Program Files\zstd;$env:PATH"
-        zstd --version
+      - name: Install zstd
+        shell: pwsh
+        run: |
+          choco install zstandard -y
+          echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
+          $env:PATH = "C:\Program Files\zstd;$env:PATH"
+          zstd --version
 
-    - name: Configure CMake
-      run: >
-        cmake -B build
-        -G Ninja
-        -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_C_COMPILER=cl
-        -DCMAKE_CXX_COMPILER=cl
+      - name: Configure CMake (MSVC x64)
+        run: cmake -B build -A x64
 
-    - name: Build
-      run: cmake --build build
+      - name: Build MSVC targets (Release)
+        run: cmake --build build --config Release
 
-    - name: Test
-      run: ctest --test-dir build --output-on-failure
+      - name: Run CTest (Release)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Build WDM kernel driver (when WDK toolset is available)
+        shell: pwsh
+        run: |
+          $wdkProps = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\build" -Filter "WindowsDriver.Default.props" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $wdkProps) {
+            Write-Host "WDK toolset not preinstalled; attempting NuGet Microsoft.Windows.WDK.x64 lookup..."
+            nuget install Microsoft.Windows.WDK.x64 -OutputDirectory wdk_nuget -NonInteractive | Out-Null
+            $wdkProps = Get-ChildItem -Path "wdk_nuget" -Filter "WindowsDriver.Default.props" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($wdkProps) {
+            Write-Host "Found WDK props: $($wdkProps.FullName)"
+            msbuild src\driver\winlvm.vcxproj /p:Configuration=Release /p:Platform=x64
+          } else {
+            Write-Host "::notice::WDK WindowsKernelModeDriver10.0 toolset not installed on runner; skipping winlvm.sys MSBuild step."
+          }
+
+      - name: Smoke-test installer packaging & native --verify-only
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "winlvm-ci-stage"
+          New-Item -ItemType Directory -Force -Path "$stage\bin", "$stage\driver\vol" | Out-Null
+          Copy-Item build\Release\lvm.exe "$stage\bin\"
+          Copy-Item build\Release\lvmdump.exe "$stage\bin\"
+          Copy-Item build\Release\winlvm_svc.exe "$stage\bin\"
+          if (Test-Path build\Release\winlvm_gui.exe) {
+            Copy-Item build\Release\winlvm_gui.exe "$stage\bin\"
+          }
+          Copy-Item build\Release\winlvm-uninstall.exe "$stage\"
+          Copy-Item src\driver\winlvm.inf "$stage\driver\"
+          Copy-Item src\driver\winlvm-vol.inf "$stage\driver\vol\"
+          if (Test-Path src\driver\x64\Release\winlvm.sys) {
+            Copy-Item src\driver\x64\Release\winlvm.sys "$stage\driver\"
+          }
+          Copy-Item LICENSE, NOTICE "$stage\"
+
+          $outExe = Join-Path $env:RUNNER_TEMP "winlvm-setup-x64.exe"
+          python scripts/pack_installer.py --stub build\Release\winlvm_setup_stub.exe --stage-dir $stage --out $outExe
+          python scripts/pack_installer.py --verify-only $outExe
+          & $outExe --verify-only
+          if ($LASTEXITCODE -ne 0) {
+            throw "winlvm-setup-x64.exe --verify-only failed with exit code $LASTEXITCODE"
+          }
