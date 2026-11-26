@@ -61,27 +61,41 @@ MutationError validate_geometry(MutationKind kind, Geometry geometry) {
   return MutationError::Ok;
 }
 
-MutationError mutate(MutationKind kind, std::string_view lv_id, Geometry geometry,
-                     bool backend_available) {
+MutationError execute_mutation(MutationKind kind,
+                               std::string_view lv_id,
+                               Geometry geometry,
+                               const std::function<bool(std::string&)>& executor,
+                               std::string& error_out) {
+  error_out.clear();
   const auto geometry_error = validate_geometry(kind, geometry);
-  if (geometry_error != MutationError::Ok) return geometry_error;
-  if (!backend_available) return MutationError::Unsupported;
+  if (geometry_error != MutationError::Ok) {
+    error_out = "invalid resize geometry";
+    return geometry_error;
+  }
+  if (!executor) {
+    error_out = "no mutation backend available";
+    return MutationError::Unsupported;
+  }
   MutationError lock_error = MutationError::Ok;
   const auto lock = MutationLock::acquire(lv_id, lock_error);
-  if (!lock.owns_lock()) return lock_error;
-  return MutationError::Unsupported;
+  if (!lock.owns_lock()) {
+    error_out = "logical volume is busy with another operation";
+    return lock_error;
+  }
+  if (!executor(error_out)) {
+    if (error_out.empty()) error_out = "mutation execution failed";
+    return MutationError::Failed;
+  }
+  return MutationError::Ok;
 }
 
-std::string_view mutation_error_name(MutationError error) {
+std::string_view mutation_error_name(MutationError error) noexcept {
   switch (error) {
-    case MutationError::Ok:
-      return "ok";
-    case MutationError::Busy:
-      return "busy";
-    case MutationError::InvalidGeometry:
-      return "invalid-geometry";
-    case MutationError::Unsupported:
-      return "unsupported";
+    case MutationError::Ok: return "ok";
+    case MutationError::Busy: return "busy";
+    case MutationError::InvalidGeometry: return "invalid-geometry";
+    case MutationError::Unsupported: return "unsupported";
+    case MutationError::Failed: return "failed";
   }
   return "unknown-error";
 }

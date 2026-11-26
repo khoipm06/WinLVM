@@ -197,8 +197,14 @@ add_library(winlvm_service_protocol STATIC
 )
 target_include_directories(winlvm_service_protocol PUBLIC src)
 
-add_executable(winlvm_svc src/service/main.cpp)
-target_link_libraries(winlvm_svc PRIVATE winlvm_service_protocol)
+add_executable(winlvm_svc
+  src/service/main.cpp
+  src/service/backend_win32.cpp
+)
+target_link_libraries(winlvm_svc PRIVATE winlvm_service_protocol lvmfmt)
+if(WIN32)
+  target_link_libraries(winlvm_svc PRIVATE advapi32 user32)
+endif()
 
 add_executable(winlvm_tests
   tests/test_main.cpp
