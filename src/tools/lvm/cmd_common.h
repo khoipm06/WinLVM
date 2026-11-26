@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <string_view>
@@ -62,17 +64,136 @@ inline std::optional<std::string> get_opt_value(const std::vector<std::string>& 
                                                 const std::string& opt,
                                                 const std::string& long_opt = "") {
   for (std::size_t i = 0; i < args.size(); ++i) {
-    if (args[i] == opt || (!long_opt.empty() && args[i] == long_opt)) {
+    if ((!opt.empty() && args[i] == opt) || (!long_opt.empty() && args[i] == long_opt)) {
       if (i + 1 < args.size()) return args[i + 1];
     }
     if (!long_opt.empty() && args[i].rfind(long_opt + "=", 0) == 0) {
       return args[i].substr(long_opt.size() + 1);
     }
-    if ((opt == "-L" || opt == "-l") && args[i].size() > 2 && args[i].rfind(opt, 0) == 0) {
+    if ((opt == "-L" || opt == "-l" || opt == "-V" || opt == "-m" || opt == "-x" || opt == "-c") &&
+        args[i].size() > 2 && args[i].rfind(opt, 0) == 0) {
       return args[i].substr(2);
     }
   }
   return std::nullopt;
+}
+
+inline std::vector<std::string> get_opt_values(const std::vector<std::string>& args,
+                                               const std::string& opt,
+                                               const std::string& long_opt = "") {
+  std::vector<std::string> values;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if ((!opt.empty() && args[i] == opt) || (!long_opt.empty() && args[i] == long_opt)) {
+      if (i + 1 < args.size()) {
+        values.push_back(args[i + 1]);
+        ++i;
+      }
+    } else if (!long_opt.empty() && args[i].rfind(long_opt + "=", 0) == 0) {
+      values.push_back(args[i].substr(long_opt.size() + 1));
+    }
+  }
+  return values;
+}
+
+inline std::string generate_random_lvm_uuid() {
+  static const char chars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<std::size_t> dis(0, sizeof(chars) - 2);
+  std::string s;
+  s.reserve(32);
+  for (int i = 0; i < 32; ++i) s.push_back(chars[dis(gen)]);
+  return s;
+}
+
+inline bool validate_lvm_tag(std::string_view tag, std::string& err) {
+  if (tag.empty()) {
+    err = "tag cannot be empty";
+    return false;
+  }
+  if (tag.size() > 128) {
+    err = "tag exceeds maximum length of 128 characters";
+    return false;
+  }
+  for (char c : tag) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '+' || c == '.' || c == '-';
+    if (!ok) {
+      err = "invalid tag character '" + std::string(1, c) + "' in tag \"" + std::string(tag) + "\"";
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool parse_tag_mutations(const std::vector<std::string>& args,
+                                std::vector<std::string>& add_tags,
+                                std::vector<std::string>& del_tags,
+                                std::string& error) {
+  add_tags.clear();
+  del_tags.clear();
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--addtag" || args[i] == "--deltag") {
+      if (i + 1 >= args.size()) {
+        error = args[i] + " requires a tag argument";
+        return false;
+      }
+      const std::string& val = args[i + 1];
+      if (!validate_lvm_tag(val, error)) return false;
+      if (args[i] == "--addtag") add_tags.push_back(val);
+      else del_tags.push_back(val);
+      ++i;
+    } else if (args[i].rfind("--addtag=", 0) == 0) {
+      const std::string val = args[i].substr(9);
+      if (!validate_lvm_tag(val, error)) return false;
+      add_tags.push_back(val);
+    } else if (args[i].rfind("--deltag=", 0) == 0) {
+      const std::string val = args[i].substr(9);
+      if (!validate_lvm_tag(val, error)) return false;
+      del_tags.push_back(val);
+    }
+  }
+  return true;
+}
+
+inline void apply_tag_mutations(std::vector<std::string>& tags,
+                                const std::vector<std::string>& add_tags,
+                                const std::vector<std::string>& del_tags) {
+  for (const auto& t : del_tags) {
+    tags.erase(std::remove(tags.begin(), tags.end(), t), tags.end());
+  }
+  for (const auto& t : add_tags) {
+    if (std::find(tags.begin(), tags.end(), t) == tags.end()) {
+      tags.push_back(t);
+    }
+  }
+}
+
+inline bool split_tag_filters(const std::vector<std::string>& pos,
+                              std::vector<std::string>& non_tag_pos,
+                              std::set<std::string>& tag_filters,
+                              std::string& error) {
+  non_tag_pos.clear();
+  tag_filters.clear();
+  for (const auto& p : pos) {
+    if (!p.empty() && p[0] == '@') {
+      const std::string tag = p.substr(1);
+      if (!validate_lvm_tag(tag, error)) return false;
+      tag_filters.insert(tag);
+    } else {
+      non_tag_pos.push_back(p);
+    }
+  }
+  return true;
+}
+
+inline bool matches_tag_filters(const std::vector<std::string>& obj_tags,
+                                const std::set<std::string>& tag_filters) {
+  if (tag_filters.empty()) return true;
+  for (const auto& t : obj_tags) {
+    if (tag_filters.count(t)) return true;
+  }
+  return false;
 }
 
 inline std::optional<bool> parse_activate_flag(const std::vector<std::string>& args,
@@ -175,10 +296,34 @@ inline bool validate_lv_name(std::string_view name, std::string& err) {
   return validate_lvm_name(name, "logical volume", err);
 }
 
+inline std::vector<std::string> get_positional_args_for(
+    const std::vector<std::string>& args,
+    const std::set<std::string>& value_flags) {
+  std::vector<std::string> pos;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--") {
+      for (std::size_t j = i + 1; j < args.size(); ++j) pos.push_back(args[j]);
+      break;
+    }
+    if (args[i].rfind("-", 0) == 0) {
+      if (args[i].find('=') == std::string::npos && value_flags.count(args[i]) > 0) {
+        if (i + 1 < args.size()) ++i;
+      }
+      continue;
+    }
+    pos.push_back(args[i]);
+  }
+  return pos;
+}
+
 inline std::vector<std::string> get_positional_args(const std::vector<std::string>& args,
                                                     bool f_takes_value = false) {
   std::vector<std::string> pos;
   for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--") {
+      for (std::size_t j = i + 1; j < args.size(); ++j) pos.push_back(args[j]);
+      break;
+    }
     if (args[i].rfind("-", 0) == 0) {
       if (args[i] == "-L" || args[i] == "--size" ||
           args[i] == "-l" || args[i] == "--extents" ||
@@ -195,6 +340,21 @@ inline std::vector<std::string> get_positional_args(const std::vector<std::strin
           args[i] == "--metadatasize" ||
           args[i] == "--dataalignment" ||
           args[i] == "--separator" ||
+          args[i] == "--reportformat" ||
+          args[i] == "--addtag" ||
+          args[i] == "--deltag" ||
+          args[i] == "--type" ||
+          args[i] == "--poolmetadatasize" ||
+          args[i] == "--thinpool" ||
+          args[i] == "--virtualsize" ||
+          args[i] == "--chunksize" ||
+          args[i] == "--mirrorlog" ||
+          args[i] == "--allocatable" ||
+          args[i] == "--mirrors" ||
+          args[i] == "-V" ||
+          args[i] == "-c" ||
+          args[i] == "-m" ||
+          args[i] == "-x" ||
           (f_takes_value && args[i] == "-f" && i + 1 < args.size() && args[i + 1][0] != '-')) {
         if (i + 1 < args.size()) {
           ++i;

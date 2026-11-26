@@ -1,9 +1,13 @@
 #include "subcommands.h"
 #include "cmd_common.h"
+#include "report_json.h"
+#include "lvmfmt/bytes.h"
 #include "lvmfmt/crc32.h"
 
+#include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <set>
 
 namespace lvmfmt {
@@ -16,12 +20,65 @@ std::uint64_t align_up_u64(std::uint64_t val, std::uint64_t align) {
   return rem ? (val + (align - rem)) : val;
 }
 
+void write_u32_le(std::uint8_t* p, std::uint32_t v) {
+  p[0] = static_cast<std::uint8_t>(v & 0xffu);
+  p[1] = static_cast<std::uint8_t>((v >> 8) & 0xffu);
+  p[2] = static_cast<std::uint8_t>((v >> 16) & 0xffu);
+  p[3] = static_cast<std::uint8_t>((v >> 24) & 0xffu);
+}
+
+bool pv_rewrite_label_uuid(ByteSource& storage,
+                           const PvLabel& label,
+                           std::string_view new_raw32_uuid,
+                           std::vector<std::uint8_t>& orig_sector_out,
+                           std::string& error) {
+  if (new_raw32_uuid.size() != 32) {
+    error = "new PV UUID must be 32 raw characters";
+    return false;
+  }
+  if (!storage.read_vec(label.label_offset, kLabelSize, orig_sector_out) ||
+      orig_sector_out.size() != kLabelSize) {
+    error = "failed to read PV label sector";
+    return false;
+  }
+  std::vector<std::uint8_t> sec = orig_sector_out;
+  const std::uint32_t data_off = le32(&sec[20]);
+  if (data_off < 32 || data_off + 40 > kLabelSize) {
+    error = "invalid PV header offset in label sector";
+    return false;
+  }
+  std::memcpy(&sec[data_off], new_raw32_uuid.data(), 32);
+  write_u32_le(&sec[16], lvm_crc32(&sec[20], kLabelSize - 20));
+  if (!storage.write(label.label_offset, sec.data(), sec.size(), error)) {
+    error = "failed to write updated PV label UUID: " + error;
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int cmd_pvcreate(const std::vector<std::string>& args) {
   if (check_help_requested(args, "pvcreate")) return 0;
 
-  auto pos = get_positional_args(args);
+  std::vector<std::string> add_tags;
+  std::vector<std::string> del_tags;
+  std::string tag_err;
+  if (!parse_tag_mutations(args, add_tags, del_tags, tag_err)) {
+    std::cerr << "error: " << tag_err << "\n";
+    return 1;
+  }
+  if (!add_tags.empty() || !del_tags.empty()) {
+    std::cerr << "error: pvcreate cannot persist PV tags on an orphan PV; "
+                 "create a volume group first and use pvchange --addtag\n";
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {
+      "-u", "--uuid", "--setphysicalvolumesize", "--metadatasize", "--dataalignment",
+      "--addtag", "--deltag",
+  };
+  auto pos = get_positional_args_for(args, val_flags);
   if (pos.empty()) {
     std::cerr << "error: pvcreate requires at least one device path\n";
     print_command_help("pvcreate");
@@ -149,8 +206,27 @@ int cmd_pvremove(const std::vector<std::string>& args) {
 int cmd_pvs(const std::vector<std::string>& args) {
   if (check_help_requested(args, "pvs")) return 0;
 
-  auto pos = get_positional_args(args);
+  ReportFormat fmt = ReportFormat::Default;
+  std::string err;
+  if (!parse_report_format(args, fmt, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {"-o", "--options", "--separator", "--reportformat"};
+  auto raw_pos = get_positional_args_for(args, val_flags);
+  std::vector<std::string> pos;
+  std::set<std::string> tag_filters;
+  if (!split_tag_filters(raw_pos, pos, tag_filters, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
   const bool noheadings = has_flag(args, "--noheadings");
+  const auto opt_cols = get_opt_value(args, "-o", "--options");
+  const auto sep_opt = get_opt_value(args, "", "--separator");
+  const std::string sep = sep_opt ? *sep_opt : "  ";
+  const bool show_tags = options_requests_column(opt_cols, "tags", "pv_tags");
   bool auto_scan = false;
 
 #ifdef _WIN32
@@ -167,22 +243,19 @@ int cmd_pvs(const std::vector<std::string>& args) {
   }
 #endif
 
-  if (!noheadings) {
-    std::cout << "  PV         VG         Fmt  Attr PSize   PFree   PV UUID\n";
-  }
-
+  std::vector<PvReportRow> rows;
   std::set<std::string> seen_pv_uuids;
   for (const auto& dev : pos) {
-    std::string err;
-    auto storage = open_storage_source(dev, false, err);
+    std::string local_err;
+    auto storage = open_storage_source(dev, false, local_err);
     if (!storage) {
-      if (!auto_scan) std::cerr << "error: " << dev << ": " << err << "\n";
+      if (!auto_scan) std::cerr << "error: " << dev << ": " << local_err << "\n";
       continue;
     }
 
-    auto label = read_pv_label(*storage, err);
+    auto label = read_pv_label(*storage, local_err);
     if (!label) {
-      if (!auto_scan) std::cerr << "error: " << dev << ": " << err << "\n";
+      if (!auto_scan) std::cerr << "error: " << dev << ": " << local_err << "\n";
       continue;
     }
     const std::string raw_pv_uuid = normalize_uuid_raw32(label->pv_uuid);
@@ -190,34 +263,58 @@ int cmd_pvs(const std::vector<std::string>& args) {
       continue;
     }
 
-    std::string vg_name = "";
-    std::string attr = "---";
-    std::string free_str = format_size_human(label->device_size);
-    auto meta = read_vg_metadata(*storage, *label, err);
+    PvReportRow row;
+    row.pv_name = dev;
+    row.pv_fmt = "lvm2";
+    row.pv_attr = "---";
+    row.pv_size = format_size_human(label->device_size);
+    row.pv_free = row.pv_size;
+    row.pv_uuid = format_uuid(label->pv_uuid);
+
+    auto meta = read_vg_metadata(*storage, *label, local_err);
     if (meta) {
-      auto vg = parse_vg_metadata(*meta, err);
+      auto vg = parse_vg_metadata(*meta, local_err);
       if (vg) {
-        vg_name = vg->name;
+        row.vg_name = vg->name;
         const PhysicalVolume* pv_entry = vg->find_pv_by_uuid(label->pv_uuid);
         if (pv_entry) {
-          attr[0] = pv_entry->is_allocatable() ? 'a' : '-';
-          attr[1] = vg->is_exported() ? 'x' : '-';
-          attr[2] = pv_entry->is_missing() ? 'm' : '-';
+          row.pv_attr[0] = pv_entry->is_allocatable() ? 'a' : '-';
+          row.pv_attr[1] = vg->is_exported() ? 'x' : '-';
+          row.pv_attr[2] = pv_entry->is_missing() ? 'm' : '-';
+          row.pv_tags = pv_entry->tags;
         }
         auto maps = build_vg_extent_maps(*vg);
         const std::string raw_uuid = normalize_uuid_raw32(label->pv_uuid);
         for (const auto& m : maps) {
           if (normalize_uuid_raw32(m.pv_uuid) == raw_uuid) {
-            free_str = format_size_human(m.free_extents * vg->extent_size_sectors * 512ULL);
+            row.pv_free = format_size_human(m.free_extents * vg->extent_size_sectors * 512ULL);
             break;
           }
         }
       }
     }
 
-    std::cout << "  " << dev << "  " << (vg_name.empty() ? "[orphan]" : vg_name)
-              << "  lvm2 " << attr << "  " << format_size_human(label->device_size)
-              << "  " << free_str << "  " << format_uuid(label->pv_uuid) << "\n";
+    if (!matches_tag_filters(row.pv_tags, tag_filters)) continue;
+    rows.push_back(std::move(row));
+  }
+
+  if (fmt == ReportFormat::Json || fmt == ReportFormat::JsonStd) {
+    print_pvs_json(rows, fmt);
+    return 0;
+  }
+
+  if (!noheadings) {
+    std::cout << "  PV         VG         Fmt  Attr PSize   PFree   PV UUID";
+    if (show_tags) std::cout << "   PV Tags";
+    std::cout << "\n";
+  }
+
+  for (const auto& r : rows) {
+    std::cout << "  " << r.pv_name << sep << (r.vg_name.empty() ? "[orphan]" : r.vg_name)
+              << sep << r.pv_fmt << " " << r.pv_attr << sep << r.pv_size
+              << sep << r.pv_free << sep << r.pv_uuid;
+    if (show_tags) std::cout << sep << join_tags_csv(r.pv_tags);
+    std::cout << "\n";
   }
 
   return 0;
@@ -226,7 +323,22 @@ int cmd_pvs(const std::vector<std::string>& args) {
 int cmd_pvdisplay(const std::vector<std::string>& args) {
   if (check_help_requested(args, "pvdisplay")) return 0;
 
-  auto pos = get_positional_args(args);
+  ReportFormat fmt = ReportFormat::Default;
+  std::string err;
+  if (!parse_report_format(args, fmt, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {"--reportformat", "-o", "--options", "--separator"};
+  auto raw_pos = get_positional_args_for(args, val_flags);
+  std::vector<std::string> pos;
+  std::set<std::string> tag_filters;
+  if (!split_tag_filters(raw_pos, pos, tag_filters, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
   bool auto_scan = false;
 #ifdef _WIN32
   if (pos.empty()) {
@@ -242,22 +354,59 @@ int cmd_pvdisplay(const std::vector<std::string>& args) {
   }
 #endif
 
+  std::vector<PvReportRow> json_rows;
   std::set<std::string> seen_pv_uuids;
   for (const auto& dev : pos) {
-    std::string err;
-    auto storage = open_storage_source(dev, false, err);
+    std::string local_err;
+    auto storage = open_storage_source(dev, false, local_err);
     if (!storage) {
-      if (!auto_scan) std::cerr << "error: " << dev << ": " << err << "\n";
+      if (!auto_scan) std::cerr << "error: " << dev << ": " << local_err << "\n";
       continue;
     }
 
-    auto label = read_pv_label(*storage, err);
+    auto label = read_pv_label(*storage, local_err);
     if (!label) {
-      if (!auto_scan) std::cerr << "error: " << dev << ": " << err << "\n";
+      if (!auto_scan) std::cerr << "error: " << dev << ": " << local_err << "\n";
       continue;
     }
     const std::string raw_pv_uuid = normalize_uuid_raw32(label->pv_uuid);
     if (auto_scan && !seen_pv_uuids.insert(raw_pv_uuid).second) {
+      continue;
+    }
+
+    std::optional<VolumeGroup> vg_opt;
+    auto meta = read_vg_metadata(*storage, *label, local_err);
+    if (meta) vg_opt = parse_vg_metadata(*meta, local_err);
+
+    const PhysicalVolume* pv_entry = vg_opt ? vg_opt->find_pv_by_uuid(label->pv_uuid) : nullptr;
+    const std::vector<std::string> pv_tags = pv_entry ? pv_entry->tags : std::vector<std::string>{};
+    if (!matches_tag_filters(pv_tags, tag_filters)) continue;
+
+    if (fmt == ReportFormat::Json || fmt == ReportFormat::JsonStd) {
+      PvReportRow row;
+      row.pv_name = dev;
+      row.pv_fmt = "lvm2";
+      row.pv_attr = "---";
+      row.pv_size = format_size_human(label->device_size);
+      row.pv_free = row.pv_size;
+      row.pv_uuid = format_uuid(label->pv_uuid);
+      row.pv_tags = pv_tags;
+      if (vg_opt) {
+        row.vg_name = vg_opt->name;
+        if (pv_entry) {
+          row.pv_attr[0] = pv_entry->is_allocatable() ? 'a' : '-';
+          row.pv_attr[1] = vg_opt->is_exported() ? 'x' : '-';
+          row.pv_attr[2] = pv_entry->is_missing() ? 'm' : '-';
+        }
+        auto maps = build_vg_extent_maps(*vg_opt);
+        for (const auto& m : maps) {
+          if (normalize_uuid_raw32(m.pv_uuid) == raw_pv_uuid) {
+            row.pv_free = format_size_human(m.free_extents * vg_opt->extent_size_sectors * 512ULL);
+            break;
+          }
+        }
+      }
+      json_rows.push_back(std::move(row));
       continue;
     }
 
@@ -266,32 +415,32 @@ int cmd_pvdisplay(const std::vector<std::string>& args) {
               << "  PV UUID               " << format_uuid(label->pv_uuid) << "\n"
               << "  PV Size               " << format_size_human(label->device_size) << "\n";
 
-    auto meta = read_vg_metadata(*storage, *label, err);
-    if (meta) {
-      auto vg = parse_vg_metadata(*meta, err);
-      if (vg) {
-        const PhysicalVolume* pv_entry = vg->find_pv_by_uuid(label->pv_uuid);
-        std::cout << "  VG Name               " << vg->name << "\n"
-                  << "  VG UUID               " << format_uuid(vg->id) << "\n"
-                  << "  Allocatable           "
-                  << ((pv_entry && pv_entry->is_allocatable()) ? "yes" : "no") << "\n"
-                  << "  PE Size               "
-                  << format_size_human(vg->extent_size_sectors * 512ULL) << "\n";
-        auto maps = build_vg_extent_maps(*vg);
-        const std::string raw_uuid = normalize_uuid_raw32(label->pv_uuid);
-        for (const auto& m : maps) {
-          if (normalize_uuid_raw32(m.pv_uuid) == raw_uuid) {
-            std::cout << "  Total PE              " << m.total_extents << "\n"
-                      << "  Allocated PE          " << (m.total_extents - m.free_extents) << "\n"
-                      << "  Free PE               " << m.free_extents << "\n";
-            break;
-          }
+    if (vg_opt) {
+      std::cout << "  VG Name               " << vg_opt->name << "\n"
+                << "  VG UUID               " << format_uuid(vg_opt->id) << "\n"
+                << "  Allocatable           "
+                << ((pv_entry && pv_entry->is_allocatable()) ? "yes" : "no") << "\n"
+                << "  PE Size               "
+                << format_size_human(vg_opt->extent_size_sectors * 512ULL) << "\n";
+      auto maps = build_vg_extent_maps(*vg_opt);
+      for (const auto& m : maps) {
+        if (normalize_uuid_raw32(m.pv_uuid) == raw_pv_uuid) {
+          std::cout << "  Total PE              " << m.total_extents << "\n"
+                    << "  Allocated PE          " << (m.total_extents - m.free_extents) << "\n"
+                    << "  Free PE               " << m.free_extents << "\n";
+          break;
         }
+      }
+      if (!pv_tags.empty()) {
+        std::cout << "  PV Tags               " << join_tags_csv(pv_tags) << "\n";
       }
     }
     std::cout << "\n";
   }
 
+  if (fmt == ReportFormat::Json || fmt == ReportFormat::JsonStd) {
+    print_pvs_json(json_rows, fmt);
+  }
   return 0;
 }
 
@@ -508,8 +657,249 @@ int cmd_pvresize(const std::vector<std::string>& args) {
 
 int cmd_pvchange(const std::vector<std::string>& args) {
   if (check_help_requested(args, "pvchange")) return 0;
-  std::cerr << "error: pvchange is not supported by this version of WinLVM\n";
-  return 1;
+
+  bool has_alloc = false;
+  bool alloc_val = true;
+  if (auto x_val = get_opt_value(args, "-x", "--allocatable")) {
+    has_alloc = true;
+    if (*x_val == "y" || *x_val == "yes") {
+      alloc_val = true;
+    } else if (*x_val == "n" || *x_val == "no") {
+      alloc_val = false;
+    } else {
+      std::cerr << "error: invalid --allocatable value \"" << *x_val << "\" (expected y or n)\n";
+      return 1;
+    }
+  }
+
+  const bool change_uuid = has_flag(args, "-u", "--uuid");
+  const bool apply_all = has_flag(args, "-a", "--all");
+
+  std::vector<std::string> add_tags;
+  std::vector<std::string> del_tags;
+  std::string err;
+  if (!parse_tag_mutations(args, add_tags, del_tags, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  const bool has_tags = !add_tags.empty() || !del_tags.empty();
+  if (!has_alloc && !change_uuid && !has_tags) {
+    std::cerr << "error: pvchange requires -x/--allocatable, -u/--uuid, --addtag, or --deltag\n";
+    print_command_help("pvchange");
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {"-x", "--allocatable", "--addtag", "--deltag"};
+  auto pos = get_positional_args_for(args, val_flags);
+
+#ifdef _WIN32
+  if (pos.empty() && apply_all) {
+    for (const auto& c : discover_win32_candidate_devices()) {
+      std::string probe_err;
+      auto s = open_storage_source(c.open_path, false, probe_err);
+      if (s && read_pv_label(*s, probe_err)) {
+        pos.push_back(c.open_path);
+      }
+    }
+  }
+#endif
+
+  if (pos.empty()) {
+    std::cerr << "error: pvchange requires physical volume path(s)\n";
+    return 1;
+  }
+
+  // Probe all passed PVs to classify VG groups vs orphan PVs cleanly.
+  struct PvProbe {
+    std::string path;
+    std::string pv_uuid;
+    std::string vg_uuid;  // empty if orphan
+  };
+  std::vector<PvProbe> probes;
+  for (const auto& p : pos) {
+    auto src = open_storage_source(p, false, err);
+    if (!src) {
+      std::cerr << "error: cannot open " << p << ": " << err << "\n";
+      return 1;
+    }
+    auto lbl = read_pv_label(*src, err);
+    if (!lbl) {
+      std::cerr << "error: cannot read PV label on " << p << ": " << err << "\n";
+      return 1;
+    }
+    PvProbe pr;
+    pr.path = p;
+    pr.pv_uuid = normalize_uuid_raw32(lbl->pv_uuid);
+    std::string meta_err;
+    if (auto meta = read_vg_metadata(*src, *lbl, meta_err)) {
+      if (auto vg = parse_vg_metadata(*meta, meta_err)) {
+        pr.vg_uuid = normalize_uuid_raw32(vg->id);
+      }
+    }
+    probes.push_back(std::move(pr));
+  }
+
+  // Determine which PVs are targeted vs sibling context PVs.
+  // If -a/--all is absent and all passed PVs belong to the SAME VG (size >= 2),
+  // pos[0] is the target PV and pos[1..] provide the sibling PVs for VG commit.
+  bool single_target_with_siblings = false;
+  if (!apply_all && probes.size() >= 2 && !probes[0].vg_uuid.empty()) {
+    bool all_same_vg = true;
+    for (std::size_t i = 1; i < probes.size(); ++i) {
+      if (probes[i].vg_uuid != probes[0].vg_uuid) {
+        all_same_vg = false;
+        break;
+      }
+    }
+    if (all_same_vg) single_target_with_siblings = true;
+  }
+
+  // Group PVs by VG UUID (preserving order) + orphan PVs.
+  std::map<std::string, std::vector<std::string>> vg_groups;
+  std::vector<std::string> vg_order;
+  std::vector<std::string> orphan_paths;
+  for (const auto& pr : probes) {
+    if (pr.vg_uuid.empty()) {
+      orphan_paths.push_back(pr.path);
+    } else {
+      if (!vg_groups.count(pr.vg_uuid)) vg_order.push_back(pr.vg_uuid);
+      vg_groups[pr.vg_uuid].push_back(pr.path);
+    }
+  }
+
+  std::size_t changed_count = 0;
+
+  // Process VG-backed PVs.
+  for (const auto& vg_id : vg_order) {
+    const auto& group_paths = vg_groups[vg_id];
+    auto loaded = load_vg_from_pvs(group_paths, true, err, true);
+    if (!loaded) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    if (!check_vg_mutable(loaded->vg, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+
+    std::set<std::string> target_pv_uuids;
+    if (single_target_with_siblings) {
+      target_pv_uuids.insert(probes[0].pv_uuid);
+    } else {
+      for (const auto& pr : probes) {
+        if (pr.vg_uuid == vg_id) target_pv_uuids.insert(pr.pv_uuid);
+      }
+    }
+
+    struct PendingUuidBackup {
+      std::size_t storage_idx = 0;
+      std::uint64_t label_offset = 0;
+      std::vector<std::uint8_t> orig_sector;
+      std::string new_uuid;
+    };
+    std::vector<PendingUuidBackup> uuid_updates;
+
+    for (auto& pv : loaded->vg.pvs) {
+      const std::string raw_old = normalize_uuid_raw32(pv.id);
+      if (!target_pv_uuids.count(raw_old)) continue;
+
+      if (has_alloc) {
+        pv.has_status = true;
+        set_status_flag(pv.status, "ALLOCATABLE", alloc_val);
+      }
+      if (has_tags) {
+        apply_tag_mutations(pv.tags, add_tags, del_tags);
+      }
+      if (change_uuid) {
+        std::size_t sidx = loaded->pv_labels.size();
+        for (std::size_t i = 0; i < loaded->pv_labels.size(); ++i) {
+          if (normalize_uuid_raw32(loaded->pv_labels[i].pv_uuid) == raw_old) {
+            sidx = i;
+            break;
+          }
+        }
+        if (sidx >= loaded->storages.size()) {
+          std::cerr << "error: backing storage for target PV not found\n";
+          return 1;
+        }
+        const std::string fresh_uuid = generate_random_lvm_uuid();
+        pv.id = fresh_uuid;
+        uuid_updates.push_back({sidx, loaded->pv_labels[sidx].label_offset, {}, fresh_uuid});
+      }
+      changed_count++;
+    }
+
+    loaded->vg.seqno++;
+
+    // Validate serialization before modifying any PV LABELONE sector.
+    if (!serialize_vg_to_text(loaded->vg, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+
+    // Rewrite PV LABELONE UUIDs first (keeping rollback snapshots).
+    for (auto& upd : uuid_updates) {
+      if (!pv_rewrite_label_uuid(*loaded->storages[upd.storage_idx],
+                                 loaded->pv_labels[upd.storage_idx],
+                                 upd.new_uuid, upd.orig_sector, err)) {
+        std::cerr << "error: " << err << "\n";
+        for (const auto& prev : uuid_updates) {
+          if (!prev.orig_sector.empty()) {
+            std::string rb_err;
+            loaded->storages[prev.storage_idx]->write(
+                prev.label_offset, prev.orig_sector.data(), prev.orig_sector.size(), rb_err);
+          }
+        }
+        return 1;
+      }
+    }
+
+    if (!commit_vg_metadata(loaded->vg, loaded->raw_storages(), err)) {
+      for (const auto& prev : uuid_updates) {
+        if (!prev.orig_sector.empty()) {
+          std::string rb_err;
+          loaded->storages[prev.storage_idx]->write(
+              prev.label_offset, prev.orig_sector.data(), prev.orig_sector.size(), rb_err);
+        }
+      }
+      std::cerr << "error: failed to commit pvchange metadata: " << err << "\n";
+      return 1;
+    }
+
+#ifdef _WIN32
+    driver_refresh();
+#endif
+  }
+
+  // Process orphan PVs.
+  for (const auto& opath : orphan_paths) {
+    if (has_alloc || has_tags) {
+      std::cerr << "error: PV \"" << opath
+                << "\" does not belong to a volume group; -x and --addtag/--deltag require VG metadata\n";
+      return 1;
+    }
+    auto src = open_storage_source(opath, true, err);
+    if (!src) {
+      std::cerr << "error: cannot open " << opath << ": " << err << "\n";
+      return 1;
+    }
+    auto lbl = read_pv_label(*src, err);
+    if (!lbl) {
+      std::cerr << "error: cannot read PV label on " << opath << ": " << err << "\n";
+      return 1;
+    }
+    std::vector<std::uint8_t> orig;
+    const std::string fresh_uuid = generate_random_lvm_uuid();
+    if (!pv_rewrite_label_uuid(*src, *lbl, fresh_uuid, orig, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    changed_count++;
+  }
+
+  std::cout << "  " << changed_count << " physical volume(s) changed\n";
+  return 0;
 }
 
 int cmd_pvmove(const std::vector<std::string>& args) {

@@ -1,5 +1,6 @@
 #include "subcommands.h"
 #include "cmd_common.h"
+#include "report_json.h"
 #include "lvmfmt/mapping.h"
 
 #include <fstream>
@@ -14,51 +15,15 @@ namespace lvmfmt {
 namespace {
 
 std::string generate_vg_uuid() {
-  static const char chars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<std::size_t> dis(0, sizeof(chars) - 2);
-
-  std::string s;
-  s.reserve(32);
-  for (int i = 0; i < 32; ++i) s.push_back(chars[dis(gen)]);
-  return s;
+  return generate_random_lvm_uuid();
 }
 
-std::string format_vg_attr(const VolumeGroup& vg) {
-  std::string attr = "wz--n-";
-  attr[0] = vg.is_read_only() ? 'r' : 'w';
-  attr[1] = vg.is_resizeable() ? 'z' : '-';
-  attr[2] = vg.is_exported() ? 'x' : '-';
-  bool any_missing = false;
-  for (const auto& pv : vg.pvs) {
-    if (pv.is_missing()) any_missing = true;
-  }
-  attr[3] = any_missing ? 'p' : '-';
-  return attr;
-}
-
-std::size_t count_visible_lvs(const VolumeGroup& vg) {
-  std::size_t count = 0;
-  for (const auto& lv : vg.lvs) {
-    if (!lv.internal) count++;
-  }
-  return count;
-}
-
-void print_vg_row(const VolumeGroup& vg) {
-  auto maps = build_vg_extent_maps(vg);
-  std::uint64_t total_extents = 0;
-  std::uint64_t free_extents = 0;
-  for (const auto& m : maps) {
-    total_extents += m.total_extents;
-    free_extents += m.free_extents;
-  }
-  const std::uint64_t ext_bytes = vg.extent_size_sectors * 512ULL;
-  std::cout << "  " << vg.name << "  " << vg.pvs.size() << "   " << count_visible_lvs(vg)
-            << "   0 " << format_vg_attr(vg) << " "
-            << format_size_human(total_extents * ext_bytes) << " "
-            << format_size_human(free_extents * ext_bytes) << "\n";
+void print_vg_row(const VgReportRow& r, const std::string& sep, bool show_tags) {
+  std::cout << "  " << r.vg_name << sep << r.pv_count << "   " << r.lv_count
+            << "   " << r.snap_count << " " << r.vg_attr << " "
+            << r.vg_size << " " << r.vg_free;
+  if (show_tags) std::cout << sep << join_tags_csv(r.vg_tags);
+  std::cout << "\n";
 }
 
 std::string next_unused_pv_key(const VolumeGroup& vg) {
@@ -73,7 +38,16 @@ std::string next_unused_pv_key(const VolumeGroup& vg) {
 int cmd_vgcreate(const std::vector<std::string>& args) {
   if (check_help_requested(args, "vgcreate")) return 0;
 
-  auto pos = get_positional_args(args);
+  std::vector<std::string> add_tags;
+  std::vector<std::string> del_tags;
+  std::string err;
+  if (!parse_tag_mutations(args, add_tags, del_tags, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {"-s", "--physicalextentsize", "--addtag", "--deltag"};
+  auto pos = get_positional_args_for(args, val_flags);
   if (pos.size() < 2) {
     std::cerr << "error: vgcreate requires VGName and at least one PV device path\n";
     print_command_help("vgcreate");
@@ -81,7 +55,6 @@ int cmd_vgcreate(const std::vector<std::string>& args) {
   }
 
   const std::string& vg_name = pos[0];
-  std::string err;
   if (!validate_lvm_name(vg_name, "volume group", err)) {
     std::cerr << "error: " << err << "\n";
     return 1;
@@ -107,6 +80,8 @@ int cmd_vgcreate(const std::vector<std::string>& args) {
   vg.seqno = 1;
   vg.extent_size_sectors = extent_size_sectors;
   vg.status = {"RESIZEABLE", "READ", "WRITE"};
+  vg.has_status = true;
+  apply_tag_mutations(vg.tags, add_tags, del_tags);
 
   std::vector<std::unique_ptr<ByteSource>> storages;
   std::vector<ByteSource*> raw_storages;
@@ -233,21 +208,42 @@ int cmd_vgremove(const std::vector<std::string>& args) {
 int cmd_vgs(const std::vector<std::string>& args) {
   if (check_help_requested(args, "vgs")) return 0;
 
-  auto pos = get_positional_args(args);
+  ReportFormat fmt = ReportFormat::Default;
+  std::string err;
+  if (!parse_report_format(args, fmt, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {"-o", "--options", "--separator", "--reportformat"};
+  auto raw_pos = get_positional_args_for(args, val_flags);
+  std::vector<std::string> pos;
+  std::set<std::string> tag_filters;
+  if (!split_tag_filters(raw_pos, pos, tag_filters, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
   const bool noheadings = has_flag(args, "--noheadings");
+  const auto opt_cols = get_opt_value(args, "-o", "--options");
+  const auto sep_opt = get_opt_value(args, "", "--separator");
+  const std::string sep = sep_opt ? *sep_opt : "  ";
+  const bool show_tags = options_requests_column(opt_cols, "tags", "vg_tags");
+
+  std::vector<VolumeGroup> vgs;
 
 #ifdef _WIN32
   if (pos.empty()) {
     std::map<std::string, VolumeGroup> vgs_by_uuid;
     for (const auto& cand : discover_win32_candidate_devices()) {
-      std::string err;
-      auto src = open_storage_source(cand.open_path, false, err);
+      std::string local_err;
+      auto src = open_storage_source(cand.open_path, false, local_err);
       if (!src) continue;
-      auto label = read_pv_label(*src, err);
+      auto label = read_pv_label(*src, local_err);
       if (!label) continue;
-      auto meta = read_vg_metadata(*src, *label, err);
+      auto meta = read_vg_metadata(*src, *label, local_err);
       if (!meta) continue;
-      auto vg = parse_vg_metadata(*meta, err);
+      auto vg = parse_vg_metadata(*meta, local_err);
       if (!vg) continue;
       const std::string key = normalize_uuid_raw32(vg->id);
       auto it = vgs_by_uuid.find(key);
@@ -255,11 +251,7 @@ int cmd_vgs(const std::vector<std::string>& args) {
         vgs_by_uuid[key] = std::move(*vg);
       }
     }
-    if (!noheadings) {
-      std::cout << "  VG         #PV #LV #SN Attr   VSize    VFree\n";
-    }
-    for (const auto& kv : vgs_by_uuid) print_vg_row(kv.second);
-    return 0;
+    for (auto& kv : vgs_by_uuid) vgs.push_back(std::move(kv.second));
   }
 #else
   if (pos.empty()) {
@@ -268,23 +260,76 @@ int cmd_vgs(const std::vector<std::string>& args) {
   }
 #endif
 
-  std::string err;
-  auto loaded = load_vg_flexible(pos, false, err, false);
-  if (!loaded) {
-    std::cerr << "error: " << err << "\n";
-    return 1;
+  if (vgs.empty() && !pos.empty()) {
+    auto loaded = load_vg_flexible(pos, false, err, false);
+    if (loaded) {
+      vgs.push_back(std::move(loaded->vg));
+    } else {
+      // Allow multi-VG scan when multiple unrelated PV paths are passed.
+      std::map<std::string, VolumeGroup> vgs_by_uuid;
+      for (const auto& dev : pos) {
+        std::string local_err;
+        auto src = open_storage_source(dev, false, local_err);
+        if (!src) continue;
+        auto label = read_pv_label(*src, local_err);
+        if (!label) continue;
+        auto meta = read_vg_metadata(*src, *label, local_err);
+        if (!meta) continue;
+        auto vg = parse_vg_metadata(*meta, local_err);
+        if (!vg) continue;
+        const std::string key = normalize_uuid_raw32(vg->id);
+        auto it = vgs_by_uuid.find(key);
+        if (it == vgs_by_uuid.end() || vg->seqno > it->second.seqno) {
+          vgs_by_uuid[key] = std::move(*vg);
+        }
+      }
+      if (vgs_by_uuid.empty()) {
+        std::cerr << "error: " << err << "\n";
+        return 1;
+      }
+      for (auto& kv : vgs_by_uuid) vgs.push_back(std::move(kv.second));
+    }
   }
+
+  std::vector<VgReportRow> rows;
+  for (const auto& vg : vgs) {
+    if (!matches_tag_filters(vg.tags, tag_filters)) continue;
+    rows.push_back(build_vg_report_row(vg));
+  }
+
+  if (fmt == ReportFormat::Json || fmt == ReportFormat::JsonStd) {
+    print_vgs_json(rows, fmt);
+    return 0;
+  }
+
   if (!noheadings) {
-    std::cout << "  VG         #PV #LV #SN Attr   VSize    VFree\n";
+    std::cout << "  VG         #PV #LV #SN Attr   VSize    VFree";
+    if (show_tags) std::cout << "  VG Tags";
+    std::cout << "\n";
   }
-  print_vg_row(loaded->vg);
+  for (const auto& r : rows) print_vg_row(r, sep, show_tags);
   return 0;
 }
 
 int cmd_vgdisplay(const std::vector<std::string>& args) {
   if (check_help_requested(args, "vgdisplay")) return 0;
 
-  auto pos = get_positional_args(args);
+  ReportFormat fmt = ReportFormat::Default;
+  std::string err;
+  if (!parse_report_format(args, fmt, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> val_flags = {"--reportformat", "-o", "--options", "--separator"};
+  auto raw_pos = get_positional_args_for(args, val_flags);
+  std::vector<std::string> pos;
+  std::set<std::string> tag_filters;
+  if (!split_tag_filters(raw_pos, pos, tag_filters, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
 #ifdef _WIN32
   if (pos.empty()) {
     pos = discover_win32_pv_paths_for_vg("");
@@ -295,11 +340,22 @@ int cmd_vgdisplay(const std::vector<std::string>& args) {
     return 1;
   }
 
-  std::string err;
   auto loaded = load_vg_flexible(pos, false, err, false);
   if (!loaded) {
     std::cerr << "error: " << err << "\n";
     return 1;
+  }
+
+  if (!matches_tag_filters(loaded->vg.tags, tag_filters)) {
+    if (fmt == ReportFormat::Json || fmt == ReportFormat::JsonStd) {
+      print_vgs_json({}, fmt);
+    }
+    return 0;
+  }
+
+  if (fmt == ReportFormat::Json || fmt == ReportFormat::JsonStd) {
+    print_vgs_json({build_vg_report_row(loaded->vg)}, fmt);
+    return 0;
   }
 
   auto maps = build_vg_extent_maps(loaded->vg);
@@ -313,6 +369,7 @@ int cmd_vgdisplay(const std::vector<std::string>& args) {
   std::size_t mda_total = 0;
   for (const auto& lbl : loaded->pv_labels) mda_total += lbl.metadata_areas.size();
   if (mda_total == 0) mda_total = loaded->vg.pvs.size();
+  const auto vg_row = build_vg_report_row(loaded->vg);
 
   std::cout << "  --- Volume group ---\n"
             << "  VG Name               " << loaded->vg.name << "\n"
@@ -324,7 +381,7 @@ int cmd_vgdisplay(const std::vector<std::string>& args) {
             << "  VG Status             "
             << (loaded->vg.is_exported() ? "exported/resizable" : "resizable") << "\n"
             << "  MAX LV                " << loaded->vg.max_lv << "\n"
-            << "  Cur LV                " << count_visible_lvs(loaded->vg) << "\n"
+            << "  Cur LV                " << vg_row.lv_count << "\n"
             << "  Max PV                " << loaded->vg.max_pv << "\n"
             << "  Cur PV                " << loaded->vg.pvs.size() << "\n"
             << "  Act PV                " << loaded->vg.pvs.size() << "\n"
@@ -335,7 +392,11 @@ int cmd_vgdisplay(const std::vector<std::string>& args) {
             << format_size_human((total_extents - free_extents) * ext_bytes) << "\n"
             << "  Free  PE / Size       " << free_extents << " / "
             << format_size_human(free_extents * ext_bytes) << "\n"
-            << "  VG UUID               " << format_uuid(loaded->vg.id) << "\n\n";
+            << "  VG UUID               " << format_uuid(loaded->vg.id) << "\n";
+  if (!loaded->vg.tags.empty()) {
+    std::cout << "  VG Tags               " << join_tags_csv(loaded->vg.tags) << "\n";
+  }
+  std::cout << "\n";
   return 0;
 }
 
@@ -407,43 +468,66 @@ int cmd_vgchange(const std::vector<std::string>& args) {
     std::cerr << "error: " << err << "\n";
     return 1;
   }
-  if (!has_act && !has_perm) {
-    std::cerr << "error: vgchange requires -a/--activate (y|n) or -p/--permission (r|rw)\n";
+  std::vector<std::string> add_tags;
+  std::vector<std::string> del_tags;
+  if (!parse_tag_mutations(args, add_tags, del_tags, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const bool has_tags = !add_tags.empty() || !del_tags.empty();
+
+  if (!has_act && !has_perm && !has_tags) {
+    std::cerr << "error: vgchange requires -a/--activate, -p/--permission, --addtag, or --deltag\n";
     return 1;
   }
 
-  auto pos = get_positional_args(args);
+  const std::set<std::string> val_flags = {
+      "-a", "--activate", "-p", "--permission", "--addtag", "--deltag",
+  };
+  auto pos = get_positional_args_for(args, val_flags);
   if (pos.empty()) {
     std::cerr << "error: vgchange requires VGName and/or member PV path(s)\n";
     return 1;
   }
 
-  auto loaded = load_vg_flexible(pos, has_perm, err, has_perm);
+  const bool mutates_meta = has_perm || has_tags;
+  auto loaded = load_vg_flexible(pos, mutates_meta, err, mutates_meta);
   if (!loaded) {
     std::cerr << "error: " << err << "\n";
     return 1;
   }
 
-  if (has_perm) {
-    if (!check_vg_mutable(loaded->vg, err, false, true)) {
+  if (mutates_meta) {
+    if (!check_vg_mutable(loaded->vg, err, false, has_perm && !has_tags)) {
       std::cerr << "error: " << err << "\n";
       return 1;
     }
-    if (loaded->vg.status.empty()) {
-      loaded->vg.status = {"RESIZEABLE", "READ", "WRITE"};
+    if (has_perm) {
+      if (loaded->vg.status.empty()) {
+        loaded->vg.status = {"RESIZEABLE", "READ", "WRITE"};
+      }
+      loaded->vg.has_status = true;
+      set_status_flag(loaded->vg.status, "READ", true);
+      set_status_flag(loaded->vg.status, "WRITE", *perm_opt);
     }
-    set_status_flag(loaded->vg.status, "READ", true);
-    set_status_flag(loaded->vg.status, "WRITE", *perm_opt);
+    if (has_tags) {
+      apply_tag_mutations(loaded->vg.tags, add_tags, del_tags);
+    }
     loaded->vg.seqno++;
     if (!commit_vg_metadata(loaded->vg, loaded->raw_storages(), err)) {
-      std::cerr << "error: failed to commit permission change: " << err << "\n";
+      std::cerr << "error: failed to commit vgchange metadata: " << err << "\n";
       return 1;
     }
 #ifdef _WIN32
     driver_refresh();
 #endif
-    std::cout << "  Volume group \"" << loaded->vg.name << "\" permission changed to "
-              << (*perm_opt ? "read/write" : "read-only") << "\n";
+    if (has_perm) {
+      std::cout << "  Volume group \"" << loaded->vg.name << "\" permission changed to "
+                << (*perm_opt ? "read/write" : "read-only") << "\n";
+    }
+    if (has_tags) {
+      std::cout << "  Volume group \"" << loaded->vg.name << "\" successfully changed\n";
+    }
   }
 
   if (has_act) {
@@ -985,34 +1069,41 @@ int cmd_vgck(const std::vector<std::string>& args) {
     }
   }
 
-  // Validate LV segment bounds and detect any double-allocated physical extents.
+  // Validate LV segment bounds and detect any double-allocated physical extents
+  // across both user-visible and internal sub-volume LVs.
   std::map<std::string, std::vector<bool>> pe_used;
   for (const auto& pv : ref_vg->pvs) {
     pe_used[pv.key].assign(static_cast<std::size_t>(pv.pe_count), false);
   }
   for (const auto& lv : ref_vg->lvs) {
-    if (lv.internal) continue;
-    if (lv.supported) {
+    if (!lv.internal && lv.supported) {
       std::string map_err;
       if (!build_dm_table(*ref_vg, lv, map_err)) {
         std::cerr << "error: LV \"" << lv.name << "\" failed segment validation: " << map_err
                   << "\n";
         return 1;
       }
-      for (const auto& seg : lv.segments) {
-        const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
-        const std::uint64_t per_stripe = seg.extent_count / sc;
-        for (const auto& st : seg.stripes) {
-          auto& used = pe_used[st.target];
-          for (std::uint64_t e = 0; e < per_stripe; ++e) {
-            const std::size_t idx = static_cast<std::size_t>(st.start_extent + e);
-            if (idx >= used.size() || used[idx]) {
-              std::cerr << "error: overlapping or out-of-bounds physical extent " << idx
-                        << " on " << st.target << " in LV \"" << lv.name << "\"\n";
-              return 1;
-            }
-            used[idx] = true;
+    }
+    for (const auto& seg : lv.segments) {
+      if (seg.type != "linear" && seg.type != "striped") continue;
+      const std::uint64_t sc = (seg.stripe_count == 0) ? 1ULL : seg.stripe_count;
+      if (sc == 0 || (seg.extent_count % sc) != 0) {
+        std::cerr << "error: LV \"" << lv.name << "\" has invalid stripe geometry\n";
+        return 1;
+      }
+      const std::uint64_t per_stripe = seg.extent_count / sc;
+      for (const auto& st : seg.stripes) {
+        auto it = pe_used.find(st.target);
+        if (it == pe_used.end()) continue;
+        auto& used = it->second;
+        for (std::uint64_t e = 0; e < per_stripe; ++e) {
+          const std::size_t idx = static_cast<std::size_t>(st.start_extent + e);
+          if (idx >= used.size() || used[idx]) {
+            std::cerr << "error: overlapping or out-of-bounds physical extent " << idx
+                      << " on " << st.target << " in LV \"" << lv.name << "\"\n";
+            return 1;
           }
+          used[idx] = true;
         }
       }
     }

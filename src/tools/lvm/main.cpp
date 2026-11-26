@@ -173,6 +173,8 @@ int main(int argc, char** argv) {
 
   // Misc subcommands
   if (command == "dumpconfig") return lvmfmt::cmd_dumpconfig(sub_args);
+  if (command == "lvmconfig") return lvmfmt::cmd_lvmconfig(sub_args);
+  if (command == "fullreport") return lvmfmt::cmd_fullreport(sub_args);
   if (command == "formats") return lvmfmt::cmd_formats(sub_args);
   if (command == "segtypes") return lvmfmt::cmd_segtypes(sub_args);
   if (command == "tags") return lvmfmt::cmd_tags(sub_args);

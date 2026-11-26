@@ -48,9 +48,10 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "pvs produces formatted summary output about physical volumes, their associated volume groups, sizes, free extents, and attributes.",
             {
                 "-a, --all : Display all devices, even uninitialized ones",
-                "-o, --options Columns : Comma-separated list of columns to display",
+                "-o, --options Columns : Comma-separated list of columns to display (e.g. +tags)",
                 "--noheadings : Suppress heading lines",
-                "--separator Char : Separator between columns"
+                "--separator Char : Separator between columns",
+                "--reportformat {basic|json|json_std} : Output report format"
             }
         },
         {
@@ -61,7 +62,8 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             {
                 "-c, --colon : Output in colon-separated format",
                 "-s, --short : Display only device name and size",
-                "-m, --maps : Display physical extent to logical extent mappings"
+                "-m, --maps : Display physical extent to logical extent mappings",
+                "--reportformat {basic|json|json_std} : Output report format"
             }
         },
         {
@@ -86,11 +88,14 @@ inline const std::vector<CommandDesc>& get_all_commands() {
         {
             "pvchange",
             "Change attributes of physical volume(s)",
-            "pvchange [OPTIONS] DevicePath",
-            "pvchange alters physical volume allocation policies (e.g. enabling or disabling extent allocation).",
+            "pvchange [OPTIONS] [DevicePath...]",
+            "pvchange alters physical volume allocation policies, regenerates PV UUIDs, and manages PV metadata tags.",
             {
                 "-x, --allocatable {y|n} : Enable or disable allocation of new extents on this PV",
-                "-u, --uuid : Generate and assign a new random UUID to the PV"
+                "-u, --uuid : Generate and assign a new random UUID to the PV",
+                "--addtag Tag : Add a tag to the physical volume (repeatable)",
+                "--deltag Tag : Delete a tag from the physical volume (repeatable)",
+                "-a, --all : Apply changes to all specified/discovered physical volumes"
             }
         },
         {
@@ -123,6 +128,7 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "vgcreate creates a new Volume Group containing one or more physical volumes. Initializes extent mapping and writes initial metadata text.",
             {
                 "-s, --physicalextentsize Size : Physical extent size (default 4 MiB)",
+                "--addtag Tag : Add a tag to the volume group (repeatable)",
                 "-f, --force : Force creation",
                 "-y, --yes : Answer yes to all questions"
             }
@@ -140,12 +146,13 @@ inline const std::vector<CommandDesc>& get_all_commands() {
         {
             "vgs",
             "Display information about volume groups",
-            "vgs [OPTIONS] [VGName...]",
+            "vgs [OPTIONS] [VGName|@Tag...]",
             "vgs produces formatted summary output about volume groups, PV count, LV count, total size, and free space.",
             {
-                "-o, --options Columns : Comma-separated list of columns to display",
+                "-o, --options Columns : Comma-separated list of columns to display (e.g. +tags)",
                 "--noheadings : Suppress heading lines",
-                "--separator Char : Separator between columns"
+                "--separator Char : Separator between columns",
+                "--reportformat {basic|json|json_std} : Output report format"
             }
         },
         {
@@ -155,7 +162,8 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "vgdisplay shows detailed multi-line output for volume groups including UUID, extent size, total/allocated/free extents.",
             {
                 "-c, --colon : Output in colon-separated format",
-                "-s, --short : Display only summary"
+                "-s, --short : Display only summary",
+                "--reportformat {basic|json|json_std} : Output report format"
             }
         },
         {
@@ -171,10 +179,12 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "vgchange",
             "Change volume group attributes",
             "vgchange [OPTIONS] [VGName] [PVPath...]",
-            "vgchange modifies volume group state, such as activating (-ay) or deactivating (-an) logical volumes or changing read/write permissions (-p r|rw).",
+            "vgchange modifies volume group state, such as activating (-ay) or deactivating (-an) logical volumes, permissions (-p r|rw), or tags.",
             {
                 "-a, --activate {y|n|ay|an} : Activate or deactivate logical volumes in the VG",
-                "-p, --permission {r|rw} : Set read-only (r) or read-write (rw) permission"
+                "-p, --permission {r|rw} : Set read-only (r) or read-write (rw) permission",
+                "--addtag Tag : Add a tag to the volume group (repeatable)",
+                "--deltag Tag : Delete a tag from the volume group (repeatable)"
             }
         },
         {
@@ -248,13 +258,21 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "lvcreate",
             "Create a logical volume",
             "lvcreate [OPTIONS] -L Size -n LVName VGName",
-            "lvcreate allocates physical extents from the specified volume group and creates a new logical volume (linear or striped).",
+            "lvcreate allocates physical extents from the specified volume group and creates a linear, striped, thin-pool, thin, or snapshot logical volume.",
             {
                 "-n, --name Name : Name of the new logical volume",
                 "-L, --size Size : Size of the logical volume (e.g. 100M, 2G)",
                 "-l, --extents Extents : Number of extents to allocate",
                 "-i, --stripes Count : Number of stripes for striped LV",
                 "-I, --stripesize Size : Stripe chunk size (default 64 KiB)",
+                "--type SegType : Segment type (linear, striped, thin-pool, thin, snapshot)",
+                "-T, --thin : Create a thin pool or thin logical volume",
+                "-V, --virtualsize Size : Virtual size for a thin logical volume",
+                "--thinpool PoolName : Target thin pool name",
+                "--poolmetadatasize Size : Metadata size for a new thin pool",
+                "-s, --snapshot : Create a copy-on-write snapshot of an origin LV",
+                "-c, --chunksize Size : Chunk size for thin-pool (default 64 KiB) or snapshot (default 4 KiB)",
+                "--addtag Tag : Add a tag to the new logical volume (repeatable)",
                 "-y, --yes : Answer yes to all questions"
             }
         },
@@ -271,12 +289,13 @@ inline const std::vector<CommandDesc>& get_all_commands() {
         {
             "lvs",
             "Display information about logical volumes",
-            "lvs [OPTIONS] [[VGName/]LVName...]",
+            "lvs [OPTIONS] [[VGName/]LVName|@Tag...]",
             "lvs produces formatted summary output about logical volumes, layout, size, and mapped segments.",
             {
-                "-o, --options Columns : Comma-separated list of columns to display",
+                "-o, --options Columns : Comma-separated list of columns to display (e.g. +tags)",
                 "--noheadings : Suppress heading lines",
-                "--separator Char : Separator between columns"
+                "--separator Char : Separator between columns",
+                "--reportformat {basic|json|json_std} : Output report format"
             }
         },
         {
@@ -286,7 +305,8 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "lvdisplay shows detailed multi-line output for logical volumes including UUID, status, size, segments, and stripe layout.",
             {
                 "-c, --colon : Output in colon-separated format",
-                "-m, --maps : Display logical extent to physical extent mappings"
+                "-m, --maps : Display logical extent to physical extent mappings",
+                "--reportformat {basic|json|json_std} : Output report format"
             }
         },
         {
@@ -300,10 +320,12 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "lvchange",
             "Change the attributes of logical volume(s)",
             "lvchange [OPTIONS] [VGName/]LVName",
-            "lvchange modifies logical volume runtime state (e.g. active/inactive, read-only/read-write).",
+            "lvchange modifies logical volume runtime state (e.g. active/inactive, read-only/read-write, or metadata tags).",
             {
                 "-a, --activate {y|n|ay|an} : Activate or deactivate the logical volume",
-                "-p, --permission {r|rw} : Set read-only (r) or read-write (rw) permission"
+                "-p, --permission {r|rw} : Set read-only (r) or read-write (rw) permission",
+                "--addtag Tag : Add a tag to the logical volume (repeatable)",
+                "--deltag Tag : Delete a tag from the logical volume (repeatable)"
             }
         },
         {
@@ -352,8 +374,13 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "lvconvert",
             "Change logical volume layout or segment type",
             "lvconvert [OPTIONS] [VGName/]LVName",
-            "lvconvert changes the segment layout of a logical volume (e.g. converting between linear and striped).",
-            {}
+            "lvconvert converts logical volume layouts (raid1, mirror, linear) or merges copy-on-write snapshots into their origin.",
+            {
+                "--type {raid1|mirror|linear} : Target segment type",
+                "-m, --mirrors Count : Mirror image count (1 to add mirror leg, 0 to collapse to linear)",
+                "--mirrorlog {core} : Mirror log type for mirror conversions",
+                "--merge : Merge a copy-on-write snapshot back into its origin LV"
+            }
         },
 
         // Reporting, Config & System Commands
@@ -374,9 +401,38 @@ inline const std::vector<CommandDesc>& get_all_commands() {
         {
             "dumpconfig",
             "Display and manipulate configuration information",
-            "dumpconfig [OPTIONS]",
-            "dumpconfig prints configuration settings and defaults in LVM2 config format.",
-            {}
+            "dumpconfig [OPTIONS] [Section[/Setting]...]",
+            "dumpconfig prints LVM2 configuration settings and defaults in canonical LVM2 config or JSON format.",
+            {
+                "--type {default|current|full} : Configuration view to display",
+                "--file Path : Write configuration output to file",
+                "--withcomments : Include descriptive comments",
+                "--withversions : Include version annotations",
+                "--reportformat {basic|json|json_std} : Output format"
+            }
+        },
+        {
+            "lvmconfig",
+            "Display and manipulate configuration information",
+            "lvmconfig [OPTIONS] [Section[/Setting]...]",
+            "lvmconfig prints LVM2 configuration settings and defaults in canonical LVM2 config or JSON format.",
+            {
+                "--type {default|current|full} : Configuration view to display",
+                "--file Path : Write configuration output to file",
+                "--withcomments : Include descriptive comments",
+                "--withversions : Include version annotations",
+                "--reportformat {basic|json|json_std} : Output format"
+            }
+        },
+        {
+            "fullreport",
+            "Display full report of VGs, PVs, and LVs",
+            "fullreport [OPTIONS] [VGName|PVPath...]",
+            "fullreport outputs a combined report covering volume groups, physical volumes, and logical volumes.",
+            {
+                "--reportformat {basic|json|json_std} : Output report format",
+                "--noheadings : Suppress heading lines"
+            }
         },
         {
             "formats",
@@ -389,14 +445,14 @@ inline const std::vector<CommandDesc>& get_all_commands() {
             "segtypes",
             "List available segment types",
             "segtypes",
-            "segtypes lists the segment types supported by this implementation (linear, striped).",
+            "segtypes lists the segment types supported by this implementation (linear, striped, thin-pool, thin, snapshot, raid1, mirror).",
             {}
         },
         {
             "tags",
-            "List tags defined on this host",
-            "tags",
-            "tags lists tags associated with volume groups and logical volumes.",
+            "List tags defined on discovered PVs, VGs, and LVs",
+            "tags [OPTIONS] [PVPath...]",
+            "tags lists all unique metadata tags associated with physical volumes, volume groups, and logical volumes.",
             {}
         },
         {

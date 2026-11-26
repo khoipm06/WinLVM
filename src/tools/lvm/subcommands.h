@@ -47,6 +47,8 @@ int cmd_lvconvert(const std::vector<std::string>& args);
 
 // Misc subcommands
 int cmd_dumpconfig(const std::vector<std::string>& args);
+int cmd_lvmconfig(const std::vector<std::string>& args);
+int cmd_fullreport(const std::vector<std::string>& args);
 int cmd_formats(const std::vector<std::string>& args);
 int cmd_segtypes(const std::vector<std::string>& args);
 int cmd_tags(const std::vector<std::string>& args);
