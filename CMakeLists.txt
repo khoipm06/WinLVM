@@ -206,6 +206,26 @@ if(WIN32)
   target_link_libraries(winlvm_svc PRIVATE advapi32 user32)
 endif()
 
+if(WIN32)
+  add_executable(winlvm_gui WIN32
+    src/gui/main.cpp
+    src/gui/dialogs.cpp
+    src/gui/tray.cpp
+    src/gui/winlvm_gui.rc
+    src/service/backend_win32.cpp
+    src/service/ipc_client_win32.cpp
+  )
+  target_include_directories(winlvm_gui PRIVATE src)
+  target_compile_definitions(winlvm_gui PRIVATE UNICODE _UNICODE)
+  target_link_libraries(winlvm_gui PRIVATE winlvm_service_protocol lvmfmt comctl32 shell32 advapi32 user32 gdi32)
+  if(MSVC)
+    target_link_options(winlvm_gui PRIVATE /MANIFEST:NO)
+  else()
+    target_compile_options(winlvm_gui PRIVATE -municode)
+    target_link_options(winlvm_gui PRIVATE -mwindows -municode)
+  endif()
+endif()
+
 add_executable(winlvm_tests
   tests/test_main.cpp
   tests/test_units.cpp

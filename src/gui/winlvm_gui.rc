@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDI_WINLVM_APP ICON "winlvm.ico"
+1 24 "winlvm_gui.manifest"
