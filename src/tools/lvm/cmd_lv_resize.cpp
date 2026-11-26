@@ -58,6 +58,31 @@ int execute_lv_resize(const std::vector<std::string>& args, ResizeMode mode,
               << loaded->vg.name << "\"\n";
     return 1;
   }
+  if (!lv->supported || lv->internal) {
+    std::cerr << "error: cannot resize " << (lv->internal ? "internal" : "unsupported")
+              << " logical volume \"" << lv_name << "\""
+              << (lv->unsupported_reason.empty() ? "" : (" (" + lv->unsupported_reason + ")"))
+              << "\n";
+    return 1;
+  }
+  for (const auto& seg : lv->segments) {
+    if (seg.type != "linear" && seg.type != "striped") {
+      std::cerr << "error: " << cmd_name << " does not support segment type \"" << seg.type
+                << "\" on logical volume \"" << lv_name << "\"\n";
+      return 1;
+    }
+  }
+  for (const auto& other : loaded->vg.lvs) {
+    for (const auto& seg : other.segments) {
+      if (seg.type == "snapshot" &&
+          (seg.origin_lv == lv_name || seg.cow_store_lv == lv_name)) {
+        std::cerr << "error: " << cmd_name
+                  << " does not support snapshot or snapshot origin logical volume \"" << lv_name
+                  << "\"\n";
+        return 1;
+      }
+    }
+  }
 
   const std::uint64_t ext_bytes = loaded->vg.extent_size_sectors * 512ULL;
   const std::uint64_t cur_extents = lv->extent_count();
