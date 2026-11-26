@@ -9,7 +9,14 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "lvmfmt/allocator.h"
+#include "lvmfmt/bytes.h"
 #include "lvmfmt/label.h"
 #include "lvmfmt/mapping.h"
 #include "lvmfmt/metadata.h"
@@ -58,7 +65,12 @@ void create_blank_file(const fs::path& path, std::uint64_t size_bytes) {
 struct TempDir {
   fs::path path;
   explicit TempDir(const std::string& tag) {
-    path = fs::temp_directory_path() / ("winlvm_ctrl_" + tag);
+#ifdef _WIN32
+    const auto pid = static_cast<unsigned long>(_getpid());
+#else
+    const auto pid = static_cast<unsigned long>(getpid());
+#endif
+    path = fs::temp_directory_path() / ("winlvm_ctrl_" + tag + "_" + std::to_string(pid));
     std::error_code ec;
     fs::remove_all(path, ec);
     fs::create_directories(path);
@@ -248,8 +260,9 @@ std::string expected_pattern_sha256(std::uint64_t start_sector,
 } // namespace
 
 TEST(lvm_control_plane_pv_lifecycle) {
+  TempDir tmp("pv_life");
   const fs::path exe = fs::path(WINLVM_LVM_EXE);
-  const fs::path pv_file = fs::temp_directory_path() / "test_ctrl_pv1.img";
+  const fs::path pv_file = tmp.path / "test_ctrl_pv1.img";
   create_blank_file(pv_file, 32 * 1024 * 1024);
 
   int status = 0;
@@ -293,10 +306,11 @@ TEST(lvm_control_plane_pv_lifecycle) {
 }
 
 TEST(lvm_control_plane_vg_and_lv_lifecycle) {
+  TempDir tmp("vg_lv_life");
   const fs::path exe = fs::path(WINLVM_LVM_EXE);
-  const fs::path pv1 = fs::temp_directory_path() / "test_ctrl_vg_pv1.img";
-  const fs::path pv2 = fs::temp_directory_path() / "test_ctrl_vg_pv2.img";
-  const fs::path backup_file = fs::temp_directory_path() / "test_ctrl_backup.vg";
+  const fs::path pv1 = tmp.path / "test_ctrl_vg_pv1.img";
+  const fs::path pv2 = tmp.path / "test_ctrl_vg_pv2.img";
+  const fs::path backup_file = tmp.path / "test_ctrl_backup.vg";
 
   create_blank_file(pv1, 32 * 1024 * 1024);
   create_blank_file(pv2, 32 * 1024 * 1024);
@@ -376,9 +390,10 @@ TEST(lvm_control_plane_vg_and_lv_lifecycle) {
 }
 
 TEST(lvm_control_plane_pvmove_and_data_copy) {
+  TempDir tmp("pvmove_life");
   const fs::path exe = fs::path(WINLVM_LVM_EXE);
-  const fs::path pv_a = fs::temp_directory_path() / "test_ctrl_move_a.img";
-  const fs::path pv_b = fs::temp_directory_path() / "test_ctrl_move_b.img";
+  const fs::path pv_a = tmp.path / "test_ctrl_move_a.img";
+  const fs::path pv_b = tmp.path / "test_ctrl_move_b.img";
 
   create_blank_file(pv_a, 32 * 1024 * 1024);
   create_blank_file(pv_b, 32 * 1024 * 1024);
@@ -800,5 +815,850 @@ TEST(lvm_control_plane_cross_boundary_payload_integrity) {
     out = run_cmd(exe, "vgck lin_vg \"" + l1.string() + "\"", st);
     CHECK_MSG(st == 0, out);
     CHECK_EQ(hash_lv_mapped_range({l1}, "lv_l", 0, kSectors16M * 512ULL), exp_16m);
+  }
+}
+
+namespace {
+
+std::uint32_t test_dm_bm_checksum(const std::uint8_t* block, std::uint32_t xor_salt) {
+  std::uint32_t crc = 0xffffffffu;
+  for (std::size_t i = 4; i < 4096u; ++i) {
+    crc ^= block[i];
+    for (int b = 0; b < 8; ++b) {
+      crc = (crc & 1u) ? ((crc >> 1) ^ 0x82f63b78u) : (crc >> 1);
+    }
+  }
+  return crc ^ xor_salt;
+}
+
+std::uint64_t linear_lv_first_pv_offset(const lvmfmt::VolumeGroup& vg,
+                                        const std::string& lv_name,
+                                        const std::map<std::string, fs::path>& uuid_to_path,
+                                        fs::path& out_pv_path) {
+  const auto* lv = vg.find_lv(lv_name);
+  CHECK(lv != nullptr);
+  CHECK(!lv->segments.empty());
+  CHECK(!lv->segments[0].stripes.empty());
+  const auto& st = lv->segments[0].stripes[0];
+  const auto* pv = vg.find_pv(st.target);
+  CHECK(pv != nullptr);
+  auto it = uuid_to_path.find(normalize_raw_uuid(pv->id));
+  CHECK(it != uuid_to_path.end());
+  out_pv_path = it->second;
+  return (pv->pe_start_sectors * 512ULL) +
+         (st.start_extent * vg.extent_size_sectors * 512ULL);
+}
+
+std::string hash_file_slice(const fs::path& path, std::uint64_t offset, std::uint64_t length) {
+  std::ifstream in(path, std::ios::binary);
+  CHECK(in.is_open());
+  in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+  test_sha256_ctx ctx;
+  test_sha256_init(&ctx);
+  std::vector<char> buf(65536);
+  std::uint64_t rem = length;
+  while (rem > 0) {
+    const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(rem, buf.size()));
+    in.read(buf.data(), static_cast<std::streamsize>(take));
+    CHECK_EQ(static_cast<std::size_t>(in.gcount()), take);
+    test_sha256_update(&ctx, buf.data(), take);
+    rem -= take;
+  }
+  char hex[65] = {};
+  test_sha256_final_hex(&ctx, hex);
+  return std::string(hex);
+}
+
+}  // namespace
+
+TEST(lvm_control_plane_pvchange_and_tags_lifecycle) {
+  TempDir tmp("pvchange_tags");
+  const fs::path exe = fs::path(WINLVM_LVM_EXE);
+  const fs::path pv0 = tmp.path / "pv0.img";
+  const fs::path pv1 = tmp.path / "pv1.img";
+  const fs::path orphan = tmp.path / "orphan.img";
+  create_blank_file(pv0, 32 * 1024 * 1024);
+  create_blank_file(pv1, 32 * 1024 * 1024);
+  create_blank_file(orphan, 16 * 1024 * 1024);
+
+  const std::string pvs = "\"" + pv0.string() + "\" \"" + pv1.string() + "\"";
+  int st = -1;
+
+  // pvcreate rejects both invalid tags and orphan PV tags (tags require VG membership).
+  run_cmd(exe, "pvcreate --addtag \"bad tag!\" \"" + orphan.string() + "\"", st);
+  CHECK(st != 0);
+  run_cmd(exe, "pvcreate --addtag valid_tag \"" + orphan.string() + "\"", st);
+  CHECK(st != 0);
+  std::string out = run_cmd(exe, "pvcreate \"" + orphan.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+
+  // Orphan pvchange -u regenerates LABELONE UUID cleanly.
+  std::string old_orphan_uuid;
+  {
+    std::string err;
+    auto src = lvmfmt::open_file_source(orphan.string(), err);
+    CHECK(src != nullptr);
+    auto lbl = lvmfmt::read_pv_label(*src, err);
+    CHECK(lbl.has_value());
+    old_orphan_uuid = lbl->pv_uuid;
+  }
+  out = run_cmd(exe, "pvchange -u \"" + orphan.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+  {
+    std::string err;
+    auto src = lvmfmt::open_file_source(orphan.string(), err);
+    CHECK(src != nullptr);
+    auto lbl = lvmfmt::read_pv_label(*src, err);
+    CHECK(lbl.has_value());
+    CHECK(lbl->pv_uuid != old_orphan_uuid);
+  }
+  out = run_cmd(exe, "pvck \"" + orphan.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+
+  // Create 2-PV VG with tags, test pvchange -x, -u, --addtag/--deltag, -a.
+  out = run_cmd(exe, "pvcreate " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "vgcreate --addtag vgtag1 --addtag vgtag2 -s 4M tagvg " + pvs, st);
+  CHECK_MSG(st == 0, out);
+
+  // vgchange tag mutations
+  out = run_cmd(exe, "vgchange --addtag vgtag3 --deltag vgtag1 tagvg " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  {
+    std::map<std::string, fs::path> dummy;
+    auto vg = load_vg_and_map_pvs({pv0, pv1}, dummy);
+    CHECK_EQ(vg.tags.size(), std::size_t{2});
+    CHECK(std::find(vg.tags.begin(), vg.tags.end(), "vgtag2") != vg.tags.end());
+    CHECK(std::find(vg.tags.begin(), vg.tags.end(), "vgtag3") != vg.tags.end());
+  }
+
+  // pvchange -x n on pv0 disables allocation on pv0 (persists status = []).
+  out = run_cmd(exe, "pvchange -x n \"" + pv0.string() + "\" \"" + pv1.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+  {
+    std::map<std::string, fs::path> dummy;
+    auto vg = load_vg_and_map_pvs({pv0, pv1}, dummy);
+    CHECK(!vg.pvs[0].is_allocatable());
+    CHECK(vg.pvs[1].is_allocatable());
+  }
+
+  // Creating a 2-stripe LV must fail while pv0 is non-allocatable.
+  run_cmd(exe, "lvcreate -L 8M -i 2 -n blocked_str tagvg " + pvs, st);
+  CHECK(st != 0);
+
+  // Re-enable allocation on all PVs via -a -x y, add PV tags to pv0, rotate pv1 UUID.
+  out = run_cmd(exe, "pvchange -a -x y " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "pvchange --addtag pvtag1 --addtag pvtag2 \"" + pv0.string() + "\" \"" +
+                     pv1.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "pvchange --deltag pvtag1 \"" + pv0.string() + "\" \"" + pv1.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+
+  std::string old_pv1_uuid;
+  {
+    std::string err;
+    auto src = lvmfmt::open_file_source(pv1.string(), err);
+    auto lbl = lvmfmt::read_pv_label(*src, err);
+    CHECK(lbl.has_value());
+    old_pv1_uuid = lbl->pv_uuid;
+  }
+  out = run_cmd(exe, "pvchange -u \"" + pv1.string() + "\" \"" + pv0.string() + "\"", st);
+  CHECK_MSG(st == 0, out);
+  {
+    std::string err;
+    auto src = lvmfmt::open_file_source(pv1.string(), err);
+    auto lbl = lvmfmt::read_pv_label(*src, err);
+    CHECK(lbl.has_value());
+    CHECK(lbl->pv_uuid != old_pv1_uuid);
+    std::map<std::string, fs::path> dummy;
+    auto vg = load_vg_and_map_pvs({pv0, pv1}, dummy);
+    CHECK(vg.find_pv_by_uuid(lbl->pv_uuid) != nullptr);
+    CHECK(vg.find_pv_by_uuid(old_pv1_uuid) == nullptr);
+  }
+
+  // Create tagged LVs and mutate LV tags.
+  out = run_cmd(exe, "lvcreate --addtag lvtag1 -L 4M -n lv1 tagvg " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "lvcreate --addtag other_lv -L 4M -n lv2 tagvg " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "lvchange --addtag lvtag2 --deltag lvtag1 tagvg/lv1 " + pvs, st);
+  CHECK_MSG(st == 0, out);
+
+  // Verify `lvm tags` lists every unique tag across PV/VG/LV.
+  out = run_cmd(exe, "tags " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("pvtag2") != std::string::npos);
+  CHECK(out.find("vgtag2") != std::string::npos);
+  CHECK(out.find("vgtag3") != std::string::npos);
+  CHECK(out.find("lvtag2") != std::string::npos);
+  CHECK(out.find("other_lv") != std::string::npos);
+  CHECK(out.find("pvtag1") == std::string::npos);
+  CHECK(out.find("vgtag1") == std::string::npos);
+  CHECK(out.find("lvtag1") == std::string::npos);
+
+  // Verify @tag filtering and -o +tags across pvs / vgs / lvs.
+  out = run_cmd(exe, "pvs -o +tags @pvtag2 " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find(pv0.string()) != std::string::npos);
+  CHECK(out.find(pv1.string()) == std::string::npos);
+  CHECK(out.find("pvtag2") != std::string::npos);
+
+  out = run_cmd(exe, "vgs -o +tags @vgtag3 " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("tagvg") != std::string::npos);
+  CHECK(out.find("vgtag3") != std::string::npos);
+  out = run_cmd(exe, "vgs --noheadings @nonexistent_tag " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("tagvg") == std::string::npos);
+
+  out = run_cmd(exe, "lvs -o +tags @lvtag2 " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("lv1") != std::string::npos);
+  CHECK(out.find("lv2") == std::string::npos);
+
+  // Verify JSON report includes tags cleanly.
+  out = run_cmd(exe, "lvs --reportformat json_std @lvtag2 " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"lv_tags\": [\"lvtag2\"]") != std::string::npos);
+
+  out = run_cmd(exe, "pvck " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "vgck tagvg " + pvs, st);
+  CHECK_MSG(st == 0, out);
+}
+
+TEST(lvm_control_plane_thin_pool_and_thin_lv_lifecycle) {
+  TempDir tmp("thin_life");
+  const fs::path exe = fs::path(WINLVM_LVM_EXE);
+  const fs::path pv0 = tmp.path / "pv0.img";
+  create_blank_file(pv0, 48 * 1024 * 1024);
+  const std::string q = "\"" + pv0.string() + "\"";
+
+  int st = -1;
+  std::string out = run_cmd(exe, "pvcreate " + q, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "vgcreate -s 4M thinvg " + q, st);
+  CHECK_MSG(st == 0, out);
+
+  // Create thin-pool via --type thin-pool AND another via -T -L <size> <vg>/<pool>.
+  out = run_cmd(exe, "lvcreate --type thin-pool -L 16M --poolmetadatasize 4M -n tpool thinvg " + q, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "lvcreate -L 8M -T thinvg/tpool2 " + q, st);
+  CHECK_MSG(st == 0, out);
+
+  // Create two thin volumes via both -V -T and --type thin --virtualsize --thinpool syntaxes.
+  out = run_cmd(exe, "lvcreate -V 8M -T thinvg/tpool -n lvthin1 " + q, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "lvcreate --type thin --virtualsize 12M --thinpool tpool -n lvthin2 thinvg " + q, st);
+  CHECK_MSG(st == 0, out);
+
+  // Verify raw dm-thin v2 superblock, B-tree roots, and space maps on tpool_tmeta.
+  std::map<std::string, fs::path> u2p;
+  auto vg = load_vg_and_map_pvs({pv0}, u2p);
+  const auto* pool = vg.find_lv("tpool");
+  const auto* t1 = vg.find_lv("lvthin1");
+  const auto* t2 = vg.find_lv("lvthin2");
+  CHECK(pool != nullptr && t1 != nullptr && t2 != nullptr);
+  CHECK_EQ(pool->segments[0].type, std::string("thin-pool"));
+  CHECK_EQ(pool->segments[0].transaction_id, std::uint64_t{2});
+  CHECK_EQ(t1->segments[0].device_id, std::uint64_t{1});
+  CHECK_EQ(t2->segments[0].device_id, std::uint64_t{2});
+
+  fs::path tmeta_pv_path;
+  const std::uint64_t tmeta_off = linear_lv_first_pv_offset(vg, "tpool_tmeta", u2p, tmeta_pv_path);
+  std::ifstream mf(tmeta_pv_path, std::ios::binary);
+  CHECK(mf.is_open());
+
+  std::vector<std::uint8_t> blk0(4096);
+  mf.seekg(static_cast<std::streamoff>(tmeta_off), std::ios::beg);
+  mf.read(reinterpret_cast<char*>(blk0.data()), 4096);
+  CHECK_EQ(lvmfmt::le32(blk0.data()), test_dm_bm_checksum(blk0.data(), 160774u));
+  CHECK_EQ(lvmfmt::le64(blk0.data() + 32), std::uint64_t{27022010ULL});
+  CHECK_EQ(lvmfmt::le32(blk0.data() + 40), std::uint32_t{2u});
+  CHECK_EQ(lvmfmt::le64(blk0.data() + 48), std::uint64_t{2ULL});  // trans_id
+  CHECK_EQ(lvmfmt::le32(blk0.data() + 336), std::uint32_t{128u});  // 64 KiB chunk
+
+  const std::uint64_t map_root = lvmfmt::le64(blk0.data() + 320);
+  const std::uint64_t det_root = lvmfmt::le64(blk0.data() + 328);
+
+  std::vector<std::uint8_t> map_blk(4096), det_blk(4096);
+  mf.seekg(static_cast<std::streamoff>(tmeta_off + map_root * 4096ULL), std::ios::beg);
+  mf.read(reinterpret_cast<char*>(map_blk.data()), 4096);
+  CHECK_EQ(lvmfmt::le32(map_blk.data()), test_dm_bm_checksum(map_blk.data(), 121107u));
+  CHECK_EQ(lvmfmt::le32(map_blk.data() + 16), std::uint32_t{2u});  // 2 thin devices
+
+  mf.seekg(static_cast<std::streamoff>(tmeta_off + det_root * 4096ULL), std::ios::beg);
+  mf.read(reinterpret_cast<char*>(det_blk.data()), 4096);
+  CHECK_EQ(lvmfmt::le32(det_blk.data()), test_dm_bm_checksum(det_blk.data(), 121107u));
+  CHECK_EQ(lvmfmt::le32(det_blk.data() + 16), std::uint32_t{2u});
+
+  out = run_cmd(exe, "lvs --reportformat json " + q, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"segtype\": \"thin-pool\"") != std::string::npos);
+  CHECK(out.find("\"segtype\": \"thin\"") != std::string::npos);
+  CHECK(out.find("\"pool_lv\": \"tpool\"") != std::string::npos);
+
+  out = run_cmd(exe, "vgck thinvg " + q, st);
+  CHECK_MSG(st == 0, out);
+}
+
+TEST(lvm_control_plane_snapshot_create_and_offline_merge) {
+  TempDir tmp("snap_merge");
+  const fs::path exe = fs::path(WINLVM_LVM_EXE);
+  const fs::path pv0 = tmp.path / "pv0.img";
+  create_blank_file(pv0, 32 * 1024 * 1024);
+  const std::string q = "\"" + pv0.string() + "\"";
+
+  int st = -1;
+  CHECK_MSG((run_cmd(exe, "pvcreate " + q, st), st == 0), "pvcreate");
+  CHECK_MSG((run_cmd(exe, "vgcreate -s 4M snapvg " + q, st), st == 0), "vgcreate");
+  CHECK_MSG((run_cmd(exe, "lvcreate -L 8M -n lvorig snapvg " + q, st), st == 0), "lvcreate");
+
+  // Populate 8 chunks (32 KiB) of lvorig with deterministic pattern tag 0x1111.
+  write_lv_pattern_range({pv0}, "lvorig", 0, 64, 0x1111ULL);
+  const std::string orig_c1_sha = expected_pattern_sha256(8, 8, 0x1111ULL);
+  const std::string orig_c2_sha = expected_pattern_sha256(16, 8, 0x1111ULL);
+
+  // Create snapshot lvsnap (4M COW, default 4 KiB chunks).
+  std::string out = run_cmd(exe, "lvcreate -s -L 4M -n lvsnap snapvg/lvorig " + q, st);
+  CHECK_MSG(st == 0, out);
+
+  // Verify COW header on disk and JSON lvs representation.
+  std::map<std::string, fs::path> u2p;
+  auto vg = load_vg_and_map_pvs({pv0}, u2p);
+  fs::path cow_pv_path;
+  const std::uint64_t cow_off = linear_lv_first_pv_offset(vg, "lvsnap", u2p, cow_pv_path);
+  {
+    std::ifstream cf(cow_pv_path, std::ios::binary);
+    std::uint8_t hdr[16]{};
+    cf.seekg(static_cast<std::streamoff>(cow_off), std::ios::beg);
+    cf.read(reinterpret_cast<char*>(hdr), 16);
+    CHECK_EQ(lvmfmt::le32(hdr + 0), std::uint32_t{0x70416e53u});
+    CHECK_EQ(lvmfmt::le32(hdr + 4), std::uint32_t{1u});
+    CHECK_EQ(lvmfmt::le32(hdr + 8), std::uint32_t{1u});
+    CHECK_EQ(lvmfmt::le32(hdr + 12), std::uint32_t{8u});
+  }
+
+  out = run_cmd(exe, "lvs --reportformat json " + q, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"lv_name\": \"lvsnap\"") != std::string::npos);
+  CHECK(out.find("\"origin\": \"lvorig\"") != std::string::npos);
+
+  // Populate two COW exceptions in area 0: old_chunk 0 -> new_chunk 2, old_chunk 3 -> new_chunk 3.
+  const std::string snap_c0_sha = expected_pattern_sha256(0, 8, 0x9999ULL);
+  const std::string snap_c3_sha = expected_pattern_sha256(24, 8, 0x8888ULL);
+  {
+    std::fstream cf(cow_pv_path, std::ios::in | std::ios::out | std::ios::binary);
+    CHECK(cf.is_open());
+    std::uint8_t area0[32]{};
+    const std::uint64_t pairs[4] = {0ULL, 2ULL, 3ULL, 3ULL};
+    for (int i = 0; i < 4; ++i) {
+      for (int b = 0; b < 8; ++b) {
+        area0[i * 8 + b] = static_cast<std::uint8_t>((pairs[i] >> (b * 8)) & 0xffu);
+      }
+    }
+    cf.seekp(static_cast<std::streamoff>(cow_off + 4096ULL), std::ios::beg);
+    cf.write(reinterpret_cast<const char*>(area0), sizeof(area0));
+
+    std::uint8_t sec[512];
+    cf.seekp(static_cast<std::streamoff>(cow_off + 2ULL * 4096ULL), std::ios::beg);
+    for (std::uint64_t s = 0; s < 8; ++s) {
+      make_sector_pattern(0x9999ULL, s, sec);
+      cf.write(reinterpret_cast<const char*>(sec), 512);
+    }
+    cf.seekp(static_cast<std::streamoff>(cow_off + 3ULL * 4096ULL), std::ios::beg);
+    for (std::uint64_t s = 24; s < 32; ++s) {
+      make_sector_pattern(0x8888ULL, s, sec);
+      cf.write(reinterpret_cast<const char*>(sec), 512);
+    }
+    cf.flush();
+  }
+
+  // Merge snapshot back into origin.
+  out = run_cmd(exe, "lvconvert --merge snapvg/lvsnap " + q, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("2 exception chunk(s) applied") != std::string::npos);
+
+  // Verify merged chunks 0 and 3 match snapshot payloads, chunks 1 and 2 unchanged, snapshot removed.
+  CHECK_EQ(hash_lv_mapped_range({pv0}, "lvorig", 0, 4096), snap_c0_sha);
+  CHECK_EQ(hash_lv_mapped_range({pv0}, "lvorig", 4096, 4096), orig_c1_sha);
+  CHECK_EQ(hash_lv_mapped_range({pv0}, "lvorig", 8192, 4096), orig_c2_sha);
+  CHECK_EQ(hash_lv_mapped_range({pv0}, "lvorig", 12288, 4096), snap_c3_sha);
+
+  auto vg_after = load_vg_and_map_pvs({pv0}, u2p);
+  CHECK(vg_after.find_lv("lvsnap") == nullptr);
+  CHECK(vg_after.find_lv("snapshot0") == nullptr);
+  CHECK(vg_after.find_lv("lvorig") != nullptr);
+  out = run_cmd(exe, "vgck snapvg " + q, st);
+  CHECK_MSG(st == 0, out);
+}
+
+TEST(lvm_control_plane_raid1_and_mirror_convert_roundtrip) {
+  TempDir tmp("raid_mirror");
+  const fs::path exe = fs::path(WINLVM_LVM_EXE);
+  const fs::path pv0 = tmp.path / "pv0.img";
+  const fs::path pv1 = tmp.path / "pv1.img";
+  create_blank_file(pv0, 32 * 1024 * 1024);
+  create_blank_file(pv1, 32 * 1024 * 1024);
+  const std::string pvs = "\"" + pv0.string() + "\" \"" + pv1.string() + "\"";
+
+  int st = -1;
+  CHECK_MSG((run_cmd(exe, "pvcreate " + pvs, st), st == 0), "pvcreate");
+  CHECK_MSG((run_cmd(exe, "vgcreate -s 4M rmvg " + pvs, st), st == 0), "vgcreate");
+  CHECK_MSG((run_cmd(exe, "lvcreate -L 4M -n lvraid rmvg " + pvs, st), st == 0), "lvcreate raid");
+  CHECK_MSG((run_cmd(exe, "lvcreate -L 4M -n lvmir rmvg " + pvs, st), st == 0), "lvcreate mir");
+
+  constexpr std::uint64_t kSectors4M = (4ULL * 1024ULL * 1024ULL) / 512ULL;
+  write_lv_pattern_range({pv0, pv1}, "lvraid", 0, kSectors4M, 0x52414944ULL);
+  write_lv_pattern_range({pv0, pv1}, "lvmir", 0, kSectors4M, 0x4d495252ULL);
+  const std::string exp_raid_sha = expected_pattern_sha256(0, kSectors4M, 0x52414944ULL);
+  const std::string exp_mir_sha = expected_pattern_sha256(0, kSectors4M, 0x4d495252ULL);
+
+  // Convert lvraid -> 2-leg raid1 and verify both legs + DmRd superblocks + JSON.
+  std::string out = run_cmd(exe, "lvconvert --type raid1 -m 1 rmvg/lvraid " + pvs, st);
+  CHECK_MSG(st == 0, out);
+
+  std::map<std::string, fs::path> u2p;
+  auto vg = load_vg_and_map_pvs({pv0, pv1}, u2p);
+  const auto* rlv = vg.find_lv("lvraid");
+  CHECK(rlv != nullptr);
+  CHECK_EQ(rlv->segments[0].type, std::string("raid1"));
+  CHECK_EQ(rlv->segments[0].device_count, std::uint64_t{2});
+  CHECK(vg.find_lv("lvraid_rmeta_0") != nullptr && vg.find_lv("lvraid_rmeta_1") != nullptr);
+  CHECK(vg.find_lv("lvraid_rimage_0") != nullptr && vg.find_lv("lvraid_rimage_1") != nullptr);
+
+  fs::path leg0_pv, leg1_pv, rm0_pv, rm1_pv;
+  const std::uint64_t leg0_off = linear_lv_first_pv_offset(vg, "lvraid_rimage_0", u2p, leg0_pv);
+  const std::uint64_t leg1_off = linear_lv_first_pv_offset(vg, "lvraid_rimage_1", u2p, leg1_pv);
+  CHECK(leg0_pv != leg1_pv);
+  CHECK_EQ(hash_file_slice(leg0_pv, leg0_off, 4ULL * 1024ULL * 1024ULL), exp_raid_sha);
+  CHECK_EQ(hash_file_slice(leg1_pv, leg1_off, 4ULL * 1024ULL * 1024ULL), exp_raid_sha);
+
+  const std::uint64_t rm0_off = linear_lv_first_pv_offset(vg, "lvraid_rmeta_0", u2p, rm0_pv);
+  const std::uint64_t rm1_off = linear_lv_first_pv_offset(vg, "lvraid_rmeta_1", u2p, rm1_pv);
+  auto check_rmeta = [](const fs::path& p, std::uint64_t off, std::uint32_t expected_pos) {
+    std::ifstream f(p, std::ios::binary);
+    std::vector<std::uint8_t> buf(8192);
+    f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+    f.read(reinterpret_cast<char*>(buf.data()), 8192);
+    CHECK_EQ(lvmfmt::le32(buf.data() + 0x00), std::uint32_t{0x64526d44u});
+    CHECK_EQ(lvmfmt::le32(buf.data() + 0x08), std::uint32_t{2u});
+    CHECK_EQ(lvmfmt::le32(buf.data() + 0x0c), expected_pos);
+    CHECK_EQ(lvmfmt::le64(buf.data() + 0x20), UINT64_MAX);
+    CHECK_EQ(lvmfmt::le64(buf.data() + 0x28), UINT64_MAX);
+    CHECK_EQ(lvmfmt::le32(buf.data() + 0x30), std::uint32_t{1u});
+    CHECK_EQ(lvmfmt::le32(buf.data() + 4096 + 0x00), std::uint32_t{0x6d746962u});
+  };
+  check_rmeta(rm0_pv, rm0_off, 0u);
+  check_rmeta(rm1_pv, rm1_off, 1u);
+
+  // Convert lvmir -> 2-leg mirror (--mirrorlog core) and verify both legs match SHA-256.
+  out = run_cmd(exe, "lvconvert --type mirror -m 1 --mirrorlog core rmvg/lvmir " + pvs, st);
+  CHECK_MSG(st == 0, out);
+
+  vg = load_vg_and_map_pvs({pv0, pv1}, u2p);
+  fs::path m0_pv, m1_pv;
+  const std::uint64_t m0_off = linear_lv_first_pv_offset(vg, "lvmir_mimage_0", u2p, m0_pv);
+  const std::uint64_t m1_off = linear_lv_first_pv_offset(vg, "lvmir_mimage_1", u2p, m1_pv);
+  CHECK(m0_pv != m1_pv);
+  CHECK_EQ(hash_file_slice(m0_pv, m0_off, 4ULL * 1024ULL * 1024ULL), exp_mir_sha);
+  CHECK_EQ(hash_file_slice(m1_pv, m1_off, 4ULL * 1024ULL * 1024ULL), exp_mir_sha);
+
+  out = run_cmd(exe, "lvs --reportformat json " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"segtype\": \"raid1\"") != std::string::npos);
+  CHECK(out.find("\"segtype\": \"mirror\"") != std::string::npos);
+
+  // Collapse both back to linear (-m 0 and --type linear) and verify data + freed extents.
+  out = run_cmd(exe, "lvconvert -m 0 rmvg/lvraid " + pvs, st);
+  CHECK_MSG(st == 0, out);
+  out = run_cmd(exe, "lvconvert --type linear rmvg/lvmir " + pvs, st);
+  CHECK_MSG(st == 0, out);
+
+  vg = load_vg_and_map_pvs({pv0, pv1}, u2p);
+  CHECK(vg.find_lv("lvraid_rmeta_0") == nullptr);
+  CHECK(vg.find_lv("lvraid_rimage_1") == nullptr);
+  CHECK(vg.find_lv("lvmir_mimage_1") == nullptr);
+  CHECK_EQ(hash_lv_mapped_range({pv0, pv1}, "lvraid", 0, 4ULL * 1024ULL * 1024ULL), exp_raid_sha);
+  CHECK_EQ(hash_lv_mapped_range({pv0, pv1}, "lvmir", 0, 4ULL * 1024ULL * 1024ULL), exp_mir_sha);
+
+  out = run_cmd(exe, "vgck rmvg " + pvs, st);
+  CHECK_MSG(st == 0, out);
+}
+
+TEST(lvm_control_plane_composite_safety_and_corruption_guards) {
+  TempDir tmp("composite_guards");
+  const fs::path exe = fs::path(WINLVM_LVM_EXE);
+
+  auto patch_u32 = [](std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t v) {
+    buf[off + 0] = static_cast<std::uint8_t>(v & 0xffu);
+    buf[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xffu);
+    buf[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xffu);
+    buf[off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xffu);
+  };
+  auto patch_u64 = [](std::vector<std::uint8_t>& buf, std::size_t off, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) buf[off + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((v >> (i * 8)) & 0xffu);
+  };
+
+  // 1. Thin-pool safety guards: resize refusal, composite rename, thin LV removal
+  //    (including last thin LV), superblock state checks, and B-tree bounds validation.
+  {
+    const fs::path pv = tmp.path / "thin_adv.img";
+    create_blank_file(pv, 48 * 1024 * 1024);
+    const std::string q = "\"" + pv.string() + "\"";
+    int st = -1;
+    CHECK_MSG((run_cmd(exe, "pvcreate " + q, st), st == 0), "pvcreate");
+    CHECK_MSG((run_cmd(exe, "vgcreate -s 4M tv " + q, st), st == 0), "vgcreate");
+    CHECK_MSG((run_cmd(exe, "lvcreate --type thin-pool -L 16M --poolmetadatasize 4M -n tp tv " + q, st), st == 0), "tp");
+    CHECK_MSG((run_cmd(exe, "lvcreate -V 8M -T tv/tp -n th1 " + q, st), st == 0), "th1");
+    CHECK_MSG((run_cmd(exe, "lvcreate -V 8M -T tv/tp -n th2 " + q, st), st == 0), "th2");
+
+    // lvreduce/lvresize on thin-pool and thin LV must fail closed without touching disk.
+    const std::string pre_reduce_sha = hash_file(pv);
+    run_cmd(exe, "lvreduce -L -4M tv/tp " + q, st);
+    CHECK(st != 0);
+    run_cmd(exe, "lvreduce -L -4M tv/th1 " + q, st);
+    CHECK(st != 0);
+    run_cmd(exe, "lvresize -L 4M tv/th1 " + q, st);
+    CHECK(st != 0);
+    CHECK_EQ(hash_file(pv), pre_reduce_sha);
+
+    // lvrename on thin-pool atomically updates _tmeta/_tdata and thin LV pool references.
+    std::string out = run_cmd(exe, "lvrename tv/tp tp_ren " + q, st);
+    CHECK_MSG(st == 0, out);
+    out = run_cmd(exe, "vgck tv " + q, st);
+    CHECK_MSG(st == 0, out);
+    {
+      std::map<std::string, fs::path> u2p;
+      auto vg = load_vg_and_map_pvs({pv}, u2p);
+      CHECK(vg.find_lv("tp_ren") != nullptr);
+      CHECK(vg.find_lv("tp_ren_tmeta") != nullptr);
+      CHECK(vg.find_lv("tp_ren_tdata") != nullptr);
+      CHECK_EQ(vg.find_lv("th1")->segments[0].pool_lv, std::string("tp_ren"));
+    }
+
+    // lvremove on non-last and last thin LVs updates tmeta, bumps transaction_id, and leaves pool valid.
+    out = run_cmd(exe, "lvremove tv/th1 " + q, st);
+    CHECK_MSG(st == 0, out);
+    out = run_cmd(exe, "lvremove tv/th2 " + q, st);
+    CHECK_MSG(st == 0, out);
+    out = run_cmd(exe, "vgck tv " + q, st);
+    CHECK_MSG(st == 0, out);
+    {
+      std::map<std::string, fs::path> u2p;
+      auto vg = load_vg_and_map_pvs({pv}, u2p);
+      CHECK(vg.find_lv("th1") == nullptr && vg.find_lv("th2") == nullptr);
+      const auto* pool = vg.find_lv("tp_ren");
+      CHECK(pool != nullptr);
+      CHECK(!pool->internal);
+      CHECK_EQ(pool->segments[0].transaction_id, std::uint64_t{4});
+    }
+
+    // Locate tp_ren_tmeta for superblock and B-tree corruption tests.
+    std::map<std::string, fs::path> u2p;
+    auto vg = load_vg_and_map_pvs({pv}, u2p);
+    fs::path tmeta_pv;
+    const std::uint64_t tmeta_off = linear_lv_first_pv_offset(vg, "tp_ren_tmeta", u2p, tmeta_pv);
+
+    auto read_blk = [&](std::uint64_t bnr) {
+      std::vector<std::uint8_t> b(4096);
+      std::ifstream f(tmeta_pv, std::ios::binary);
+      f.seekg(static_cast<std::streamoff>(tmeta_off + bnr * 4096ULL), std::ios::beg);
+      f.read(reinterpret_cast<char*>(b.data()), 4096);
+      return b;
+    };
+    auto write_blk = [&](std::uint64_t bnr, const std::vector<std::uint8_t>& b) {
+      std::fstream f(tmeta_pv, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(static_cast<std::streamoff>(tmeta_off + bnr * 4096ULL), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(b.data()), 4096);
+      f.flush();
+    };
+
+    const auto orig_sb = read_blk(0);
+    const std::uint64_t det_root = lvmfmt::le64(orig_sb.data() + 328);
+    const auto orig_det = read_blk(det_root);
+
+    // NEEDS_CHECK flag set (with valid CRC) must fail closed with zero disk changes.
+    {
+      auto bad_sb = orig_sb;
+      patch_u32(bad_sb, 4, 1u);
+      patch_u32(bad_sb, 0, test_dm_bm_checksum(bad_sb.data(), 160774u));
+      write_blk(0, bad_sb);
+      const std::string sha = hash_file(pv);
+      run_cmd(exe, "lvcreate -V 8M -T tv/tp_ren -n blocked1 " + q, st);
+      CHECK(st != 0);
+      CHECK_EQ(hash_file(pv), sha);
+    }
+
+    // Non-zero held_root (with valid CRC) must fail closed with zero disk changes.
+    {
+      auto bad_sb = orig_sb;
+      patch_u64(bad_sb, 56, 99ULL);
+      patch_u32(bad_sb, 0, test_dm_bm_checksum(bad_sb.data(), 160774u));
+      write_blk(0, bad_sb);
+      const std::string sha = hash_file(pv);
+      run_cmd(exe, "lvcreate -V 8M -T tv/tp_ren -n blocked2 " + q, st);
+      CHECK(st != 0);
+      CHECK_EQ(hash_file(pv), sha);
+    }
+
+    // transaction_id mismatch (tmeta=42 vs VG=4) must fail closed with zero disk changes.
+    {
+      auto bad_sb = orig_sb;
+      patch_u64(bad_sb, 48, 42ULL);
+      patch_u32(bad_sb, 0, test_dm_bm_checksum(bad_sb.data(), 160774u));
+      write_blk(0, bad_sb);
+      const std::string sha = hash_file(pv);
+      run_cmd(exe, "lvcreate -V 8M -T tv/tp_ren -n blocked3 " + q, st);
+      CHECK(st != 0);
+      CHECK_EQ(hash_file(pv), sha);
+    }
+
+    // Restore clean superblock, then corrupt device_details_root B-tree node bounds.
+    write_blk(0, orig_sb);
+    {
+      auto bad_det = orig_det;
+      patch_u32(bad_det, 16, 500u);     // nr_entries = 500
+      patch_u32(bad_det, 20, 100000u);  // max_entries = 100000 (exceeds 4 KiB block)
+      patch_u32(bad_det, 0, test_dm_bm_checksum(bad_det.data(), 121107u));
+      write_blk(det_root, bad_det);
+      const std::string sha = hash_file(pv);
+      out = run_cmd(exe, "lvcreate -V 8M -T tv/tp_ren -n blocked_oob " + q, st);
+      CHECK_MSG(st != 0, "corrupt B-tree node must fail closed");
+      CHECK_EQ(hash_file(pv), sha);
+    }
+
+    // Restore clean device_details_root, then verify dm-thin lazy refcounting when
+    // deleting a thin LV whose mapping leaf is shared (msm rc == 2) vs overflow (rc == 3).
+    write_blk(det_root, orig_det);
+    CHECK_MSG((run_cmd(exe, "lvcreate -V 8M -T tv/tp_ren -n th_a " + q, st), st == 0), "th_a");
+    CHECK_MSG((run_cmd(exe, "lvcreate -V 8M -T tv/tp_ren -n th_b " + q, st), st == 0), "th_b");
+    {
+      auto set_bm2 = [](std::vector<std::uint8_t>& bm, std::uint32_t slot, std::uint8_t rc) {
+        const std::uint8_t enc = (rc == 0u) ? 0u : (rc == 1u) ? 2u : (rc == 2u) ? 1u : 3u;
+        const std::size_t off = 16u + (slot / 4u);
+        const std::uint32_t shift = (slot % 4u) * 2u;
+        bm[off] = static_cast<std::uint8_t>(
+            (static_cast<std::uint32_t>(bm[off]) & ~(0x3u << shift)) |
+            (static_cast<std::uint32_t>(enc) << shift));
+      };
+      auto get_bm2 = [](const std::vector<std::uint8_t>& bm, std::uint32_t slot) -> std::uint8_t {
+        const std::uint8_t enc = static_cast<std::uint8_t>(
+            (static_cast<std::uint32_t>(bm[16u + (slot / 4u)]) >> ((slot % 4u) * 2u)) & 0x3u);
+        return (enc == 0u) ? 0u : (enc == 2u) ? 1u : (enc == 1u) ? 2u : 3u;
+      };
+
+      auto sb = read_blk(0);
+      const std::uint64_t map_root_blk = lvmfmt::le64(sb.data() + 320);
+      const std::uint64_t msm_idx_blk = lvmfmt::le64(sb.data() + 208);
+      const std::uint64_t dsm_root_blk = lvmfmt::le64(sb.data() + 80);
+
+      auto map_root = read_blk(map_root_blk);
+      const std::uint32_t mr_max = lvmfmt::le32(map_root.data() + 20);
+      const std::size_t mr_vbase = 32u + static_cast<std::size_t>(mr_max) * 8u;
+      const std::uint64_t leaf_a = lvmfmt::le64(map_root.data() + mr_vbase + 0u);
+      const std::uint64_t leaf_b = lvmfmt::le64(map_root.data() + mr_vbase + 8u);
+
+      // Populate leaf_a with 1 mapped data block (block 5, dsm rc = 1), point dev_b to
+      // leaf_a as a lazy-shared snapshot leaf (msm rc[leaf_a] = 2, free leaf_b).
+      auto la = read_blk(leaf_a);
+      const std::uint32_t la_max = lvmfmt::le32(la.data() + 20);
+      const std::size_t la_vbase = 32u + static_cast<std::size_t>(la_max) * 8u;
+      patch_u32(la, 16, 1u);
+      patch_u64(la, 32, 0ULL);               // virtual block 0
+      patch_u64(la, la_vbase, 5ULL << 24);   // data block 5
+      patch_u32(la, 0, test_dm_bm_checksum(la.data(), 121107u));
+      write_blk(leaf_a, la);
+
+      patch_u64(map_root, mr_vbase + 8u, leaf_a);
+      patch_u32(map_root, 0, test_dm_bm_checksum(map_root.data(), 121107u));
+      write_blk(map_root_blk, map_root);
+
+      // Mark data block 5 allocated (dsm rc = 1) and update dsm_nr_allocated = 1.
+      auto dsm_leaf = read_blk(dsm_root_blk);
+      const std::uint32_t dl_max = lvmfmt::le32(dsm_leaf.data() + 20);
+      const std::size_t dl_vbase = 32u + static_cast<std::size_t>(dl_max) * 8u;
+      const std::uint64_t dsm_bm_blk = lvmfmt::le64(dsm_leaf.data() + dl_vbase);
+      const std::uint32_t dsm_free = lvmfmt::le32(dsm_leaf.data() + dl_vbase + 8);
+      auto dsm_bm = read_blk(dsm_bm_blk);
+      set_bm2(dsm_bm, 5u, 1u);
+      patch_u32(dsm_bm, 0, test_dm_bm_checksum(dsm_bm.data(), 240779u));
+      write_blk(dsm_bm_blk, dsm_bm);
+      patch_u32(dsm_leaf, dl_vbase + 8, dsm_free - 1u);
+      patch_u32(dsm_leaf, 0, test_dm_bm_checksum(dsm_leaf.data(), 121107u));
+      write_blk(dsm_root_blk, dsm_leaf);
+      patch_u64(sb, 72, 1ULL);
+
+      // Set msm rc[leaf_a] = 3 (overflow) first -> lvremove th_a must fail closed.
+      auto msm_idx = read_blk(msm_idx_blk);
+      const std::uint64_t msm_bm_blk = lvmfmt::le64(msm_idx.data() + 16);
+      auto msm_bm = read_blk(msm_bm_blk);
+      set_bm2(msm_bm, static_cast<std::uint32_t>(leaf_a), 3u);
+      set_bm2(msm_bm, static_cast<std::uint32_t>(leaf_b), 0u);
+      patch_u32(msm_bm, 0, test_dm_bm_checksum(msm_bm.data(), 240779u));
+      write_blk(msm_bm_blk, msm_bm);
+      patch_u32(sb, 0, test_dm_bm_checksum(sb.data(), 160774u));
+      write_blk(0, sb);
+      {
+        const std::string sha = hash_file(pv);
+        run_cmd(exe, "lvremove tv/th_a " + q, st);
+        CHECK_MSG(st != 0, "overflow msm refcount (>=3) must fail closed");
+        CHECK_EQ(hash_file(pv), sha);
+      }
+
+      // Now set msm rc[leaf_a] = 2 (lazy shared snapshot) -> lvremove th_a must drop
+      // msm rc[leaf_a] 2 -> 1 and leave data block 5 dsm rc == 1 untouched!
+      set_bm2(msm_bm, static_cast<std::uint32_t>(leaf_a), 2u);
+      patch_u32(msm_bm, 0, test_dm_bm_checksum(msm_bm.data(), 240779u));
+      write_blk(msm_bm_blk, msm_bm);
+      out = run_cmd(exe, "lvremove tv/th_a " + q, st);
+      CHECK_MSG(st == 0, out);
+      CHECK_EQ(get_bm2(read_blk(msm_bm_blk), static_cast<std::uint32_t>(leaf_a)), std::uint8_t{1});
+      CHECK_EQ(get_bm2(read_blk(dsm_bm_blk), 5u), std::uint8_t{1});
+      CHECK_EQ(lvmfmt::le64(read_blk(0).data() + 72), std::uint64_t{1});
+
+      // Deleting the surviving th_b now drops msm rc[leaf_a] 1 -> 0 and frees data block 5!
+      out = run_cmd(exe, "lvremove tv/th_b " + q, st);
+      CHECK_MSG(st == 0, out);
+      CHECK_EQ(get_bm2(read_blk(msm_bm_blk), static_cast<std::uint32_t>(leaf_a)), std::uint8_t{0});
+      CHECK_EQ(get_bm2(read_blk(dsm_bm_blk), 5u), std::uint8_t{0});
+      CHECK_EQ(lvmfmt::le64(read_blk(0).data() + 72), std::uint64_t{0});
+    }
+  }
+
+  // 2. Snapshot guards: origin reduce refusal, exception chunk overflow & metadata collision,
+  //    and multi-snapshot merge refusal.
+  {
+    const fs::path pv = tmp.path / "snap_adv.img";
+    create_blank_file(pv, 32 * 1024 * 1024);
+    const std::string q = "\"" + pv.string() + "\"";
+    int st = -1;
+    CHECK_MSG((run_cmd(exe, "pvcreate " + q, st), st == 0), "pvcreate");
+    CHECK_MSG((run_cmd(exe, "vgcreate -s 4M sv " + q, st), st == 0), "vgcreate");
+    CHECK_MSG((run_cmd(exe, "lvcreate -L 8M -n orig sv " + q, st), st == 0), "orig");
+    write_lv_pattern_range({pv}, "orig", 0, 16, 0xCAFEBABEULL);
+    const std::string orig_c0_sha = expected_pattern_sha256(0, 8, 0xCAFEBABEULL);
+
+    CHECK_MSG((run_cmd(exe, "lvcreate -s -L 4M -n sn1 sv/orig " + q, st), st == 0), "sn1");
+
+    // lvreduce on a snapshot origin must fail closed.
+    run_cmd(exe, "lvreduce -L -4M sv/orig " + q, st);
+    CHECK(st != 0);
+
+    // Exception (old_chunk = 1ULL << 52, new_chunk = 2) wraps old_chunk * 4096 to 0;
+    // merge must fail closed and leave origin chunk 0 untouched.
+    std::map<std::string, fs::path> u2p;
+    auto vg = load_vg_and_map_pvs({pv}, u2p);
+    fs::path cow_pv;
+    const std::uint64_t cow_off = linear_lv_first_pv_offset(vg, "sn1", u2p, cow_pv);
+    {
+      std::vector<std::uint8_t> area0(32, 0);
+      patch_u64(area0, 0, (1ULL << 52));  // wraps to 0 when multiplied by 4096
+      patch_u64(area0, 8, 2ULL);
+      std::fstream f(cow_pv, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(static_cast<std::streamoff>(cow_off + 4096ULL), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(area0.data()), static_cast<std::streamsize>(area0.size()));
+      std::vector<std::uint8_t> pwn(4096, 0xEE);
+      f.seekp(static_cast<std::streamoff>(cow_off + 2ULL * 4096ULL), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(pwn.data()), 4096);
+      f.flush();
+    }
+    run_cmd(exe, "lvconvert --merge sv/sn1 " + q, st);
+    CHECK(st != 0);
+
+    // new_chunk colliding with an exception metadata chunk (chunk 258) must fail closed.
+    {
+      std::vector<std::uint8_t> area0(32, 0);
+      patch_u64(area0, 0, 0ULL);
+      patch_u64(area0, 8, 258ULL);  // area 1 metadata chunk: 1 + 1*(256+1) == 258
+      std::fstream f(cow_pv, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(static_cast<std::streamoff>(cow_off + 4096ULL), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(area0.data()), static_cast<std::streamsize>(area0.size()));
+      f.flush();
+    }
+    run_cmd(exe, "lvconvert --merge sv/sn1 " + q, st);
+    CHECK(st != 0);
+
+    // Clear sn1 area 0 and add sibling snapshot sn2: merge with sibling snapshots must fail closed.
+    {
+      std::vector<std::uint8_t> zeros(32, 0);
+      std::fstream f(cow_pv, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(static_cast<std::streamoff>(cow_off + 4096ULL), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+      f.flush();
+    }
+    CHECK_MSG((run_cmd(exe, "lvcreate -s -L 4M -n sn2 sv/orig " + q, st), st == 0), "sn2");
+    run_cmd(exe, "lvconvert --merge sv/sn1 " + q, st);
+    CHECK(st != 0);
+
+    // Verify origin chunk 0 was never corrupted by any failed merge.
+    CHECK_EQ(hash_file_slice(cow_pv, linear_lv_first_pv_offset(vg, "orig", u2p, cow_pv), 4096), orig_c0_sha);
+  }
+
+  // 3. RAID1 guards: lvreduce refusal, pvmove colocation refusal, atomic composite rename,
+  //    and DmRd superblock consistency checks before collapsing to linear.
+  {
+    const fs::path pv0 = tmp.path / "raid_adv0.img";
+    const fs::path pv1 = tmp.path / "raid_adv1.img";
+    create_blank_file(pv0, 32 * 1024 * 1024);
+    create_blank_file(pv1, 32 * 1024 * 1024);
+    const std::string pvs = "\"" + pv0.string() + "\" \"" + pv1.string() + "\"";
+    int st = -1;
+    CHECK_MSG((run_cmd(exe, "pvcreate " + pvs, st), st == 0), "pvcreate");
+    CHECK_MSG((run_cmd(exe, "vgcreate -s 4M rv " + pvs, st), st == 0), "vgcreate");
+    CHECK_MSG((run_cmd(exe, "lvcreate -L 8M -n lvr rv " + pvs, st), st == 0), "lvr");
+    CHECK_MSG((run_cmd(exe, "lvconvert --type raid1 -m 1 rv/lvr " + pvs, st), st == 0), "raid1");
+
+    // lvreduce on raid1 fails closed.
+    run_cmd(exe, "lvreduce -L -4M rv/lvr " + pvs, st);
+    CHECK(st != 0);
+
+    // pvmove targeting a raid1 LV or whole-PV pvmove colocating legs must fail closed.
+    run_cmd(exe, "pvmove -n lvr " + pvs, st);
+    CHECK(st != 0);
+    run_cmd(exe, "pvmove " + pvs, st);
+    CHECK(st != 0);
+
+    // lvrename on raid1 atomically renames all 4 sub-LVs and passes vgck.
+    std::string out = run_cmd(exe, "lvrename rv/lvr lvr_ren " + pvs, st);
+    CHECK_MSG(st == 0, out);
+    out = run_cmd(exe, "vgck rv " + pvs, st);
+    CHECK_MSG(st == 0, out);
+
+    // Degraded or stale rmeta_1 (events=5, failed_devices=1) must block lvconvert -m 0.
+    std::map<std::string, fs::path> u2p;
+    auto vg = load_vg_and_map_pvs({pv0, pv1}, u2p);
+    fs::path rm1_pv;
+    const std::uint64_t rm1_off = linear_lv_first_pv_offset(vg, "lvr_ren_rmeta_1", u2p, rm1_pv);
+    std::vector<std::uint8_t> orig_rm1(4096);
+    {
+      std::ifstream f(rm1_pv, std::ios::binary);
+      f.seekg(static_cast<std::streamoff>(rm1_off), std::ios::beg);
+      f.read(reinterpret_cast<char*>(orig_rm1.data()), 4096);
+    }
+    {
+      auto bad = orig_rm1;
+      patch_u64(bad, 0x10, 5ULL);  // events = 5 (diverges from leg 0 events = 1)
+      patch_u64(bad, 0x18, 1ULL);  // failed_devices = 0x1 (leg 0 marked failed)
+      std::fstream f(rm1_pv, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(static_cast<std::streamoff>(rm1_off), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(bad.data()), 4096);
+      f.flush();
+    }
+    run_cmd(exe, "lvconvert -m 0 rv/lvr_ren " + pvs, st);
+    CHECK(st != 0);
+
+    // Incomplete recovery (disk_recovery_offset = 0) must also block lvconvert -m 0.
+    {
+      auto bad = orig_rm1;
+      patch_u64(bad, 0x20, 0ULL);  // disk_recovery_offset = 0 (< array_sectors)
+      std::fstream f(rm1_pv, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekp(static_cast<std::streamoff>(rm1_off), std::ios::beg);
+      f.write(reinterpret_cast<const char*>(bad.data()), 4096);
+      f.flush();
+    }
+    run_cmd(exe, "lvconvert -m 0 rv/lvr_ren " + pvs, st);
+    CHECK(st != 0);
   }
 }

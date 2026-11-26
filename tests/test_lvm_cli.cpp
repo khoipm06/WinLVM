@@ -6,6 +6,14 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+#include "lvmfmt/commit.h"
+#include "lvmfmt/crc32.h"
 #include "lvmfmt/label.h"
 #include "lvmfmt/metadata.h"
 #include "lvmfmt/source.h"
@@ -55,7 +63,12 @@ std::string file_sha256(const fs::path& path) {
 struct TempDirGuard {
   fs::path dir;
   explicit TempDirGuard(const std::string& suffix) {
-    dir = fs::temp_directory_path() / ("winlvm_cli_" + suffix);
+#ifdef _WIN32
+    const auto pid = static_cast<unsigned long>(_getpid());
+#else
+    const auto pid = static_cast<unsigned long>(getpid());
+#endif
+    dir = fs::temp_directory_path() / ("winlvm_cli_" + suffix + "_" + std::to_string(pid));
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir);
@@ -156,9 +169,18 @@ TEST(lvm_cli_read_only_commands_preserve_exact_image_sha256) {
       "pvs " + q,
       "vgs " + q,
       "lvs " + q,
+      "pvs --reportformat json " + q,
+      "vgs --reportformat json " + q,
+      "lvs --reportformat json " + q,
       "pvdisplay " + q,
+      "pvdisplay --reportformat json " + q,
       "vgdisplay " + q,
+      "vgdisplay --reportformat json " + q,
       "lvdisplay " + q,
+      "lvdisplay --reportformat json " + q,
+      "fullreport --reportformat json " + q,
+      "fullreport --reportformat json_std " + q,
+      "tags " + q,
       "pvck " + q,
       "vgck " + q,
       "pvscan " + q,
@@ -268,30 +290,52 @@ TEST(lvm_cli_failed_mutations_fail_closed_and_preserve_image_sha256) {
     CHECK_EQ(file_sha256(img_a), sha);
   }
 
-  // 5. mixed-vg unsupported segment mutation attempt
+  // 5. Unsupported segment type (raid5) mutation attempt must fail closed
   {
-    const fs::path mix_a = tmp.dir / "mixed-vg-a.img";
-    const fs::path mix_b = tmp.dir / "mixed-vg-b.img";
-    fs::copy_file(fs::path(WINLVM_CORPUS_IMAGES) / "mixed-vg-a.img", mix_a,
+    const fs::path img = tmp.dir / "unsupported_raid5.img";
+    fs::copy_file(fs::path(WINLVM_CORPUS_IMAGES) / "linear-1pv.img", img,
                   fs::copy_options::overwrite_existing);
-    fs::copy_file(fs::path(WINLVM_CORPUS_IMAGES) / "mixed-vg-b.img", mix_b,
-                  fs::copy_options::overwrite_existing);
-    const std::string sha_a = file_sha256(mix_a);
-    const std::string sha_b = file_sha256(mix_b);
-    const std::string qa = "\"" + mix_a.string() + "\"";
-    const std::string qb = "\"" + mix_b.string() + "\"";
+    // Patch the linear segment type in the committed VG metadata to "raid5" and recompute CRCs.
+    std::string err;
+    {
+      auto src = lvmfmt::open_storage_source(img.string(), true, err);
+      CHECK_MSG(src != nullptr, err);
+      auto lbl = lvmfmt::read_pv_label(*src, err);
+      CHECK_MSG(lbl.has_value(), err);
+      auto mda = lvmfmt::read_mda_header(*src, lbl->metadata_areas[0], err);
+      CHECK_MSG(mda.has_value(), err);
+      auto text = lvmfmt::read_metadata_text(*src, *mda, err);
+      CHECK_MSG(text.has_value(), err);
+      auto pos = text->find("type = \"striped\"");
+      CHECK(pos != std::string::npos);
+      text->replace(pos, 16, "type = \"raid5\"  ");
+      // Write back exact same length and update raw_locn CRC + mda header CRC.
+      const std::uint32_t new_text_crc = lvmfmt::lvm_crc32(text->data(), text->size());
+      CHECK(src->write(mda->start + mda->commit_offset, text->data(), text->size(), err));
+      std::vector<std::uint8_t> hdr;
+      CHECK(src->read_vec(mda->start, 512, hdr));
+      hdr[56] = static_cast<std::uint8_t>(new_text_crc & 0xffu);
+      hdr[57] = static_cast<std::uint8_t>((new_text_crc >> 8) & 0xffu);
+      hdr[58] = static_cast<std::uint8_t>((new_text_crc >> 16) & 0xffu);
+      hdr[59] = static_cast<std::uint8_t>((new_text_crc >> 24) & 0xffu);
+      const std::uint32_t hdr_crc = lvmfmt::lvm_crc32(hdr.data() + 4, 512 - 4);
+      hdr[0] = static_cast<std::uint8_t>(hdr_crc & 0xffu);
+      hdr[1] = static_cast<std::uint8_t>((hdr_crc >> 8) & 0xffu);
+      hdr[2] = static_cast<std::uint8_t>((hdr_crc >> 16) & 0xffu);
+      hdr[3] = static_cast<std::uint8_t>((hdr_crc >> 24) & 0xffu);
+      CHECK(src->write(mda->start, hdr.data(), hdr.size(), err));
+    }
+    const std::string sha = file_sha256(img);
+    const std::string q = "\"" + img.string() + "\"";
     int st = 0;
-    run(lvm, "lvcreate -L 4M -n new_lv vgmix " + qa + " " + qb, st);
+    run(lvm, "lvcreate -L 4M -n new_lv vgbase " + q, st);
     CHECK(st != 0);
-    run(lvm, "lvrename vgmix/lvplain lvplain2 " + qa + " " + qb, st);
+    run(lvm, "lvrename vgbase/lvlin lv2 " + q, st);
     CHECK(st != 0);
-    run(lvm, "lvremove vgmix/lvthin " + qa + " " + qb, st);
-    CHECK(st != 0);
-    CHECK_EQ(file_sha256(mix_a), sha_a);
-    CHECK_EQ(file_sha256(mix_b), sha_b);
+    CHECK_EQ(file_sha256(img), sha);
   }
 
-  // 6. Unsupported subcommands (pvchange, lvconvert, lvm lvmdump)
+  // 6. Unsupported subcommands/modes must fail closed without touching image
   {
     const fs::path img = tmp.dir / "unsupported_subcmd.img";
     fs::copy_file(fs::path(WINLVM_CORPUS_IMAGES) / "linear-1pv.img", img,
@@ -299,12 +343,122 @@ TEST(lvm_cli_failed_mutations_fail_closed_and_preserve_image_sha256) {
     const std::string sha = file_sha256(img);
     const std::string q = "\"" + img.string() + "\"";
     int st = 0;
-    run(lvm, "pvchange -x n " + q, st);
-    CHECK(st != 0);
     run(lvm, "lvconvert vgbase/lvlin " + q, st);
+    CHECK(st != 0);
+    run(lvm, "lvconvert --type raid5 -m 1 vgbase/lvlin " + q, st);
+    CHECK(st != 0);
+    run(lvm, "lvconvert --type cache vgbase/lvlin " + q, st);
+    CHECK(st != 0);
+    run(lvm, "lvconvert --type mirror -m 1 --mirrorlog disk vgbase/lvlin " + q, st);
+    CHECK(st != 0);
+    run(lvm, "pvs --reportformat invalid_fmt " + q, st);
+    CHECK(st != 0);
+    run(lvm, "pvchange --addtag \"bad!tag\" " + q, st);
     CHECK(st != 0);
     run(lvm, "lvmdump " + q, st);
     CHECK(st != 0);
     CHECK_EQ(file_sha256(img), sha);
   }
+}
+
+TEST(lvm_cli_json_reporting_and_fullreport) {
+  const fs::path lvm = fs::path(WINLVM_LVM_EXE);
+  const fs::path mix_a = fs::path(WINLVM_CORPUS_IMAGES) / "mixed-vg-a.img";
+  const fs::path mix_b = fs::path(WINLVM_CORPUS_IMAGES) / "mixed-vg-b.img";
+  const std::string args = "\"" + mix_a.string() + "\" \"" + mix_b.string() + "\"";
+
+  int st = -1;
+  std::string out = run(lvm, "pvs --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"report\"") != std::string::npos);
+  CHECK(out.find("\"pv\"") != std::string::npos);
+  CHECK(out.find("\"pv_fmt\": \"lvm2\"") != std::string::npos);
+  CHECK(out.find("\"pv_tags\": \"\"") != std::string::npos);
+
+  out = run(lvm, "pvs --reportformat json_std " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"pv_tags\": []") != std::string::npos);
+
+  out = run(lvm, "vgs --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"vg\"") != std::string::npos);
+  CHECK(out.find("\"vg_name\": \"vgmix\"") != std::string::npos);
+  CHECK(out.find("\"snap_count\": \"1\"") != std::string::npos);
+
+  out = run(lvm, "vgs --reportformat json_std " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"pv_count\": 2") != std::string::npos);
+  CHECK(out.find("\"snap_count\": 1") != std::string::npos);
+  CHECK(out.find("\"vg_tags\": []") != std::string::npos);
+
+  out = run(lvm, "lvs --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"lv\"") != std::string::npos);
+  CHECK(out.find("\"segtype\": \"thin-pool\"") != std::string::npos);
+  CHECK(out.find("\"segtype\": \"thin\"") != std::string::npos);
+  CHECK(out.find("\"pool_lv\": \"tpool\"") != std::string::npos);
+  CHECK(out.find("\"origin\": \"lvplain\"") != std::string::npos);
+  CHECK(out.find("\"segtype\": \"raid1\"") != std::string::npos);
+
+  out = run(lvm, "pvdisplay --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"pv\"") != std::string::npos);
+
+  out = run(lvm, "vgdisplay --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"vg\"") != std::string::npos);
+
+  out = run(lvm, "lvdisplay --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"lv\"") != std::string::npos);
+
+  out = run(lvm, "fullreport --reportformat json " + args, st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"vg\"") != std::string::npos);
+  CHECK(out.find("\"pv\"") != std::string::npos);
+  CHECK(out.find("\"lv\"") != std::string::npos);
+}
+
+TEST(lvm_cli_lvmconfig_and_dumpconfig) {
+  TempDirGuard tmp("cfg");
+  const fs::path lvm = fs::path(WINLVM_LVM_EXE);
+  const fs::path out_file = tmp.dir / "lvm.conf";
+
+  int st = -1;
+  std::string out = run(lvm, "lvmconfig --type default", st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("global {") != std::string::npos);
+  CHECK(out.find("devices {") != std::string::npos);
+  CHECK(out.find("allocation {") != std::string::npos);
+  CHECK(out.find("activation {") != std::string::npos);
+  CHECK(out.find("log {") != std::string::npos);
+
+  out = run(lvm, "dumpconfig --type full --withcomments --withversions global", st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("# Configuration section global.") != std::string::npos);
+  CHECK(out.find("2.03.22") != std::string::npos);
+  CHECK(out.find("umask=077") != std::string::npos);
+
+  out = run(lvm, "lvmconfig global/umask", st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("umask=077") != std::string::npos);
+
+  out = run(lvm, "lvmconfig --reportformat json global/umask", st);
+  CHECK_MSG(st == 0, out);
+  CHECK(out.find("\"global\"") != std::string::npos);
+  CHECK(out.find("\"umask\": \"077\"") != std::string::npos);
+
+  out = run(lvm, "lvmconfig --type current --file \"" + out_file.string() + "\" activation", st);
+  CHECK_MSG(st == 0, out);
+  CHECK(fs::exists(out_file));
+  std::ifstream in(out_file);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  CHECK(ss.str().find("activation {") != std::string::npos);
+
+  // Unknown section/key and invalid --type must fail closed.
+  run(lvm, "lvmconfig nonexistent/key", st);
+  CHECK(st != 0);
+  run(lvm, "lvmconfig --type bogus_type", st);
+  CHECK(st != 0);
 }
