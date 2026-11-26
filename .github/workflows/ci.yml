@@ -18,8 +18,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build zstd python3
-          zstd --version
+          sudo apt-get install -y --no-install-recommends ninja-build python3
+          python3 --version
 
       - name: Configure CMake (Release, -Werror)
         run: >
@@ -44,7 +44,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build zstd python3
+          sudo apt-get install -y --no-install-recommends ninja-build python3
 
       - name: Configure CMake (UBSan, -Werror)
         run: >
@@ -134,14 +134,6 @@ jobs:
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Install zstd
-        shell: pwsh
-        run: |
-          choco install zstandard -y
-          echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
-          $env:PATH = "C:\Program Files\zstd;$env:PATH"
-          zstd --version
 
       - name: Configure CMake (MSVC x64)
         run: cmake -B build -A x64

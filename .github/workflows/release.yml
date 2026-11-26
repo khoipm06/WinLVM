@@ -38,12 +38,9 @@ jobs:
           }
           echo "version=$ver" >> $env:GITHUB_OUTPUT
 
-      - name: Install build prerequisites (zstd and WDK if absent)
+      - name: Install WDK if absent
         shell: pwsh
         run: |
-          choco install zstandard -y
-          echo "C:\Program Files\zstd" >> $env:GITHUB_PATH
-          $env:PATH = "C:\Program Files\zstd;$env:PATH"
           $wdkProps = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\build" -Filter "WindowsDriver.Default.props" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $wdkProps) {
             choco install windowsdriverkit11 -y

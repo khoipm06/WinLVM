@@ -3,23 +3,26 @@
 WinLVM has two build surfaces:
 
 1. **CMake user-mode & host-test build** — builds `lvmcore`, `lvmfmt`,
-   `winlvm_service_protocol`, `lvm`, `lvmdump`, `winlvm_svc`, and all automated
-   unit, parser, hardening, serialization, VG state-machine, CLI, IOCTL, and
-   corpus oracle tests on Linux or Windows.
+   `winlvm_service_protocol`, `winlvm_installer_archive`, `lvm`, `lvmdump`,
+   `winlvm_svc`, Windows GUI (`winlvm_gui.exe`), installer/uninstaller
+   (`winlvm_setup_stub.exe`, `winlvm-uninstall.exe`), and all 7 automated CTest
+   suites on Linux or Windows.
 2. **WDK MSBuild kernel driver build** — builds `winlvm.sys` and its driver
    packages (`winlvm.inf` / `winlvm-vol.inf`) on Windows x64.
 
 ---
 
-## 1. User-Mode Libraries, Tools, and Tests (CMake)
+## 1. User-Mode Libraries, Tools, GUI, Installer, and Tests (CMake)
 
 ### Prerequisites
 
 - CMake 3.24 or newer
 - Ninja (recommended) or Visual Studio / Make
 - A C11 and C++20 compiler (GCC, Clang, MSVC, or MinGW-w64)
-- `zstd` CLI on `PATH` (decompresses `corpus/images/*.img.zst` at build time;
-  without `zstd`, CMake warns and omits the corpus-dependent CTest targets)
+- Python 3 (standard library only; invokes `scripts/gen_test_fixtures.py` at
+  build time to generate deterministic LVM2/LUKS2 test images out-of-tree into
+  `${CMAKE_BINARY_DIR}/corpus-images/`, and `scripts/pack_installer.py` when
+  packaging `winlvm-setup-x64.exe`)
 
 ### Linux (GCC / Clang)
 
@@ -27,10 +30,10 @@ Install build prerequisites (Debian/Ubuntu example):
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build zstd
+sudo apt-get install -y build-essential cmake ninja-build python3
 ```
 
-Configure, build, and run the full test suite:
+Configure, build, and run all 7 CTest suites:
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -38,14 +41,15 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-On non-MSVC compilers, `lvmcore` is compiled with `-Wframe-larger-than=512` to
-enforce bounded kernel stack frames.
+On non-MSVC compilers, `lvmcore` and the portable kernel VG/segment C11 modules
+(`winlvm_vg.c`, `winlvm_map.c`, `winlvm_thin.c`, `winlvm_snap.c`,
+`winlvm_raid.c`) are compiled with `-Wframe-larger-than=512` to enforce bounded
+kernel stack frames.
 
 ### Windows (MSVC)
 
-1. Install `zstd` and ensure it is on `PATH` (for example,
-   `choco install zstandard -y` or `winget install facebook.zstd`).
-2. Open an **x64 Native Tools Command Prompt for VS 2022** and run:
+Open an **x64 Native Tools Command Prompt for VS 2022** (with Python 3 on
+`PATH`) and run:
 
 ```powershell
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
@@ -61,27 +65,37 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-### Windows (MinGW-w64)
+### Windows Cross-Compilation (MinGW-w64)
 
-When compiling with MinGW-w64 (`WIN32` and non-MSVC), `CMakeLists.txt`
-automatically links `-static -static-libgcc -static-libstdc++` so `lvm.exe`,
-`lvmdump.exe`, and `winlvm_svc.exe` run standalone without MSYS2 runtime DLLs:
+When compiling for `WIN32` with MinGW-w64, `CMakeLists.txt` automatically links
+`-static -static-libgcc -static-libstdc++` so all 6 Windows executables run
+standalone without MSYS2/MinGW runtime DLLs:
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
+cmake -B build-mingw -G Ninja \
+  -DCMAKE_SYSTEM_NAME=Windows \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+  -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+  -DCMAKE_C_FLAGS="-Werror" \
+  -DCMAKE_CXX_FLAGS="-Werror" \
+  -DCMAKE_EXE_LINKER_FLAGS="-static"
+cmake --build build-mingw --target lvm lvmdump winlvm_svc winlvm_gui winlvm_setup_stub winlvm_uninstall
 ```
 
 ### Produced User-Mode Artifacts
 
 | Target | Output | Purpose |
 | --- | --- | --- |
-| `lvmcore` | Static library | Freestanding C11 LVM2 parser, arena, CRC-32, serializer |
-| `lvmfmt` | Static library | Portable C++20 LVM2 format, mapping, allocator, commit engine |
-| `lvm` | `lvm` / `lvm.exe` | LVM2 control-plane CLI |
+| `lvmcore` | Static library | Freestanding C11 LVM2 parser, serializer, and dm-thin / dm-snapshot / raid1-mirror block engines |
+| `lvmfmt` | Static library | Portable C++20 LVM2 format, mapping, allocator, and two-phase MDA commit engine |
+| `lvm` | `lvm` / `lvm.exe` | LVM2 control-plane CLI (`pvs`/`vgs`/`lvs`, `fullreport`, JSON, tags, `pvchange`, `lvconvert`, `lvmconfig`) |
 | `lvmdump` | `lvmdump` / `lvmdump.exe` | Standalone PV/VG metadata and DM-table dumper |
 | `winlvm_svc` | `winlvm_svc` / `winlvm_svc.exe` | Windows SCM named-pipe broker (`\\.\pipe\winlvm-svc`) |
+| `winlvm_gui` | `winlvm_gui.exe` (Windows) | Native Win32 desktop & system-tray volume manager |
+| `winlvm_setup_stub` | `winlvm_setup_stub.exe` (Windows) | Native Win32 installer stub packed into `winlvm-setup-x64.exe` |
+| `winlvm_uninstall` | `winlvm-uninstall.exe` (Windows) | Native Win32 uninstaller |
 
 ---
 
@@ -108,37 +122,44 @@ From an **x64 Native Tools Command Prompt for VS 2022**:
 msbuild src\driver\winlvm.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
-This outputs the driver package (including `winlvm.sys`, `winlvm.inf`, and
-`winlvm.cat`) under `src\driver\x64\Release\` (or
+This outputs the driver package under `src\driver\x64\Release\` (or
 `$(SolutionDir)x64\Release\` when built from a solution).
 
 ### Sources Compiled by `src/driver/winlvm.vcxproj`
 
-- **Modular C11 WDM driver (`src/driver/`)**:
+- **Modular C11 WDM driver (`src/driver/`)** (every module kept under 500 LOC):
   - `winlvm.c` — `DriverEntry`, `WinLvmUnload`, ACL-hardened `\Device\WinLvmControl`
     (`IoCreateDeviceSecure` + `SDDL_DEVOBJ_SYS_ALL_ADM_ALL`), ring logger, WMI
     provider, and top-level IRP dispatch
   - `winlvm_pnp.c` — bus FDO PnP lifecycle, `BusRelations`, PV tag teardown, and
     live child geometry reconciliation
   - `winlvm_probe.c` — PnP disk/volume interface notification lifecycle, link
-    filtering, and unified PV probing (PnP and `IOCTL_WINLVM_PROBE_DEVICE`)
+    filtering, cold partition retry, and unified PV probing
+  - `winlvm_notify.c` — refcounted target-device PnP removal notifications,
+    `IoWorkItem` teardown, and Mount Manager arrival notification
+  - `winlvm_vg_ops.c` — recent PV path tracking, probe arrival commit, child PDO
+    rebinding, and LV activation/deactivation
   - `winlvm_control.c` — `\Device\WinLvmControl` IOCTL dispatch plane
   - `winlvm_child.c` — child LV raw-PDO creation, PnP dispatch, read-only policy,
     and teardown
   - `winlvm_gate.c` — cancel-safe I/O admission and quiesce gate (`IO_CSQ`)
-  - `winlvm_power.c` — WDM power IRP dispatch for control, bus FDO, and LV PDOs
+  - `winlvm_power.c` — WDM power IRP dispatch and system/device state tracking
   - `winlvm_dispatch_io.c` — `IRP_MJ_READ`, `IRP_MJ_WRITE`,
-    `IRP_MJ_FLUSH_BUFFERS`, and `IRP_MJ_SHUTDOWN` dispatch and aligned pass-through
+    `IRP_MJ_FLUSH_BUFFERS`, and `IRP_MJ_SHUTDOWN` dispatch (fast-path pass-through
+    and complex-segment work-item routing)
   - `winlvm_subirp.c` — multi-piece sub-IRP fan-out, partial MDL / bounce-buffer
     handling, and completion aggregation
-  - `winlvm_sector.c` — backing-disk geometry, writability, and GPT/MBR
-    partition layout queries (`IOCTL_DISK_GET_DRIVE_LAYOUT_EX`), synchronous
-    sector-aligned metadata reads, and LV-to-PV piece mapping
-  - `winlvm_mount.c` — Mount Manager (`IOCTL_MOUNTDEV_*`) and volume FSCTL handlers
+  - `winlvm_sector.c` — backing-disk geometry, writability, GPT/MBR partition
+    layout queries, metadata reads, and LV-to-PV piece mapping
+  - `winlvm_mount.c` — Mount Manager (`IOCTL_MOUNTDEV_*`) link tracking and
+    volume FSCTL handlers
   - `winlvm_storage.c` — Storage, Disk, and Volume IOCTL handlers
-  - `winlvm_vg.c` — freestanding multi-VG registry and PV arrival / `seqno` state machine
-  - `winlvm_map.c` — freestanding streaming LV-byte to PV-extent mapper
-- **Freestanding parser (`src/lvmcore/`)**: `crc32.c`, `arena.c`, `parser.c`
+  - `winlvm_vg.c`, `winlvm_map.c` — freestanding multi-VG registry, PV arrival /
+    `seqno` state machine, streaming extent mapper, and sub-LV slot collector
+  - `winlvm_thin.c`, `winlvm_snap.c`, `winlvm_raid.c` — kernel PV I/O bridge,
+    complex-segment dispatchers, and `PASSIVE_LEVEL` work-item I/O runner
+- **Freestanding core (`src/lvmcore/`)**: `crc32.c`, `arena.c`, `parser.c`,
+  `lvmcore_thin.c`, `lvmcore_snap.c`, `lvmcore_raid.c`
 - **Shared ABI headers**: `src/winlvm_ioctl.h`, `src/winlvm_types.h`
 - **Driver packages**: `winlvm.inf` (bus FDO, `ROOT\winlvm`, `Class=System`) and
   `winlvm-vol.inf` (raw child LV PDOs, `WinLvm\Volume` / `WinLvmVolume`,
@@ -147,53 +168,51 @@ This outputs the driver package (including `winlvm.sys`, `winlvm.inf`, and
 
 ---
 
-## 3. Installing and Running the Driver on Windows (Test-Signed)
+## 3. Packaging & Installing on Windows
 
-Use a dedicated test VM or test machine with test signing enabled.
+### Standalone Installer (`winlvm-setup-x64.exe`)
 
-### 1. Enable Test Signing and Trust the Test Certificate
+Stage the user-mode binaries (`bin/lvm.exe`, `bin/lvmdump.exe`,
+`bin/winlvm_svc.exe`, `bin/winlvm_gui.exe`), `winlvm-uninstall.exe`, signed
+driver packages (`driver/winlvm.sys`, `driver/winlvm.inf`, `driver/winlvm.cat`,
+`driver/vol/winlvm-vol.inf`, `driver/vol/winlvm-vol.cat`, and optional
+`driver/winlvm.cer`), `LICENSE`, and `NOTICE`, then pack and verify:
 
-From an elevated Command Prompt or PowerShell:
+```bash
+python3 scripts/pack_installer.py \
+  --stub build/winlvm_setup_stub.exe \
+  --stage-dir dist/stage \
+  --out dist/winlvm-setup-x64.exe
+python3 scripts/pack_installer.py --verify-only dist/winlvm-setup-x64.exe
+```
+
+Running `winlvm-setup-x64.exe` on Windows x64 installs binaries into
+`%ProgramFiles%\WinLVM`, registers PATH and Start Menu shortcuts, stages
+`winlvm-vol.inf` and `winlvm.inf` (`ROOT\winlvm`), installs and starts
+`winlvm-svc`, and writes an Uninstall entry backed by `winlvm-uninstall.exe`.
+Silent automation flags (`--silent`, `--verify-only`, `--no-driver`,
+`--no-service`) are also supported.
+
+### Manual Driver Installation (Test-Signed)
+
+Use a dedicated test VM or test machine with test signing enabled:
 
 ```powershell
 bcdedit /set testsigning on
-```
-
-Reboot, then install the test certificate generated by the WDK build into both
-machine trust stores:
-
-```powershell
+# Reboot, then trust the signing certificate:
 certutil -addstore Root <path-to>\winlvm.cer
 certutil -addstore TrustedPublisher <path-to>\winlvm.cer
-```
 
-### 2. Package and Stage `winlvm-vol.inf` First
-
-Child LV devices are raw PDOs (`RawDeviceOK=TRUE`) bound by `winlvm-vol.inf`
-with an empty `AddService` directive so `winlvm.sys` handles all child IRPs
-directly. Stage `winlvm-vol.inf` before creating the bus devnode so PnP binds
-enumerated LV children immediately.
-
-If packaging `winlvm-vol.inf` into a standalone directory (for example
-`C:\winlvm\vol_pkg` containing `winlvm-vol.inf`):
-
-```powershell
+# Stage winlvm-vol.inf first so raw LV PDOs bind immediately:
 Inf2Cat.exe /driver:C:\winlvm\vol_pkg /os:10_X64
 signtool.exe sign /ph /fd sha256 /sha1 <cert-thumbprint> C:\winlvm\vol_pkg\winlvm-vol.cat
 pnputil.exe /add-driver C:\winlvm\vol_pkg\winlvm-vol.inf /install
-```
 
-### 3. Install the Root Bus Devnode via `devcon`
-
-`winlvm.inf` targets the root-enumerated hardware ID `ROOT\winlvm`
-(`Class=System`) and has no `[DefaultInstall]` section; use WDK `devcon.exe`
-rather than right-click Install or `sc create`:
-
-```powershell
+# Install the root bus devnode:
 devcon.exe install <driver-out>\winlvm\winlvm.inf "ROOT\winlvm"
 ```
 
-### 4. Verify Installation and Enumerated Volumes
+Verify installation and enumerate volumes:
 
 ```powershell
 devcon.exe status "ROOT\winlvm"
@@ -202,17 +221,7 @@ lvm.exe version
 lvm.exe vgscan
 ```
 
-- Backing PVs on PnP disks and partitions (`GUID_DEVINTERFACE_DISK` /
-  `GUID_DEVINTERFACE_VOLUME`) are discovered automatically after bus startup,
-  including automatic GPT/MBR partition enumeration via
-  `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` on whole disks (covering Linux LVM GPT/MBR
-  partitions that lack `GUID_DEVINTERFACE_VOLUME`).
-- For unlocked `WinLUKS` devices exposed as non-PnP NT device objects (such as
-  `\Device\WinLuksVolumeN`), run `lvm.exe vgscan` or `lvm.exe pvscan` from an
-  elevated shell so the CLI probes them into `winlvm.sys` via
-  `IOCTL_WINLVM_PROBE_DEVICE`.
-
-### 5. Uninstall
+To remove the bus devnode manually:
 
 ```powershell
 devcon.exe remove "ROOT\winlvm"
@@ -220,28 +229,17 @@ devcon.exe remove "ROOT\winlvm"
 
 ---
 
-## 4. Windows Control Broker Service (`winlvm_svc.exe`)
+## 4. Test Fixtures (`scripts/gen_test_fixtures.py`)
 
-To run the optional SCM service broker (`\\.\pipe\winlvm-svc`), register and
-start it from an elevated prompt:
-
-```powershell
-sc.exe create winlvm-svc binPath= "<path-to>\winlvm_svc.exe" start= demand
-sc.exe start winlvm-svc
-```
+CMake invokes
+`scripts/gen_test_fixtures.py` during the build to generate all 16 LVM2/LUKS2
+test images into `${CMAKE_BINARY_DIR}/corpus-images/`, matching the lightweight
+text/hash oracles under `corpus/expected/`. See [`corpus/README.md`](corpus/README.md)
+for details.
 
 ---
 
-## 5. Regenerating the Ground-Truth Corpus
-
-The committed `.img.zst` fixtures and Linux oracle files under `corpus/` can be
-regenerated on a Linux VM with `lvm2`, `cryptsetup`, `python3`, `zstd`, and
-`e2fsprogs` installed. See [`corpus/README.md`](corpus/README.md) for usage and
-disk-space details.
-
----
-
-## 6. Optional Pre-Commit Hook
+## 5. Optional Pre-Commit Hook
 
 A POSIX `sh` pre-commit hook at [`scripts/hooks/pre-commit`](scripts/hooks/pre-commit)
 checks staged changes for whitespace errors (`git diff --cached --check`),
