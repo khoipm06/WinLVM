@@ -19,6 +19,7 @@ struct _WINLVM_TARGET_NOTIFY {
 typedef struct {
     PIO_WORKITEM   io_work;
     PDEVICE_OBJECT lv_pdo;
+    BOOLEAN        dismount_first;
 } WINLVM_MM_NOTIFY_WORK;
 
 static KSPIN_LOCK g_target_notify_lock;
@@ -274,8 +275,9 @@ void WinLvmReleasePvAndQuiesceChildren(WINLVM_BUS_EXT *bus,
     size_t kept_tn_count = 0;
     WINLVM_VIEW_BLOCK *freed_views[WL_VG_MAX];
     size_t view_count = 0;
-    PDEVICE_OBJECT affected[WL_MAX_CHILDREN];
-    size_t affected_count = 0;
+    PDEVICE_OBJECT targets[WL_MAX_CHILDREN];
+    size_t target_count = 0;
+    uint32_t rebind_mask = 0;
     BOOLEAN any_matched = FALSE;
 
     KIRQL old;
@@ -319,15 +321,29 @@ void WinLvmReleasePvAndQuiesceChildren(WINLVM_BUS_EXT *bus,
         for (size_t c = 0; c < bus->child_count; c++) {
             PDEVICE_OBJECT child = bus->children[c];
             WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)child->DeviceExtension;
-            if (lext->record == r && wl_vg_lv_any_pv_gone(r, lext->lv_index)) {
+            if (lext->record != r) continue;
+            if (wl_vg_lv_any_pv_gone(r, lext->lv_index)) {
                 lext->unavailable = TRUE;
-                BOOLEAN seen = FALSE;
-                for (size_t a = 0; a < affected_count; a++) {
-                    if (affected[a] == child) { seen = TRUE; break; }
+                size_t found = SIZE_MAX;
+                for (size_t a = 0; a < target_count; a++) {
+                    if (targets[a] == child) { found = a; break; }
                 }
-                if (!seen && affected_count < WL_MAX_CHILDREN) {
+                if (found != SIZE_MAX) {
+                    rebind_mask &= ~(1u << found);
+                } else if (target_count < WL_MAX_CHILDREN) {
                     ObReferenceObject(child);
-                    affected[affected_count++] = child;
+                    targets[target_count++] = child;
+                }
+            } else if (!lext->unavailable && !lext->deactivating &&
+                       WinLvmChildBindingChangedLocked(r, lext->lv_index, lext)) {
+                BOOLEAN seen = FALSE;
+                for (size_t a = 0; a < target_count; a++) {
+                    if (targets[a] == child) { seen = TRUE; break; }
+                }
+                if (!seen && target_count < WL_MAX_CHILDREN) {
+                    ObReferenceObject(child);
+                    rebind_mask |= (1u << target_count);
+                    targets[target_count++] = child;
                 }
             }
         }
@@ -347,8 +363,9 @@ void WinLvmReleasePvAndQuiesceChildren(WINLVM_BUS_EXT *bus,
     }
     KeReleaseSpinLock(&bus->lock, old);
 
-    for (size_t a = 0; a < affected_count; a++) {
-        PDEVICE_OBJECT child = affected[a];
+    for (size_t a = 0; a < target_count; a++) {
+        if (rebind_mask & (1u << a)) continue;
+        PDEVICE_OBJECT child = targets[a];
         WINLVM_LV_EXT *lext = (WINLVM_LV_EXT *)child->DeviceExtension;
         NTSTATUS qst = WinLvmIoGateBeginQuiesce(&lext->io_gate);
         WinLvmLvSetInterfaceEnabled(child, FALSE);
@@ -369,10 +386,16 @@ void WinLvmReleasePvAndQuiesceChildren(WINLVM_BUS_EXT *bus,
         ObDereferenceObject(child);
     }
 
+    for (size_t a = 0; a < target_count; a++) {
+        if (!(rebind_mask & (1u << a))) continue;
+        (void)WinLvmRebindChildPdo(bus, targets[a]);
+        ObDereferenceObject(targets[a]);
+    }
+
     for (size_t k = 0; k < kept_tn_count; k++) WinLvmTargetNotifyRelease(kept_tns[k]);
     for (size_t k = 0; k < removed_count; k++) WinLvmFreePvTag(removed_tags[k]);
     for (size_t k = 0; k < view_count; k++) ExFreePoolWithTag(freed_views[k], WINLVM_WIN_TAG);
-    if (any_matched || affected_count > 0) {
+    if (any_matched || target_count > 0) {
         IoInvalidateDeviceRelations(bus->pdo, BusRelations);
     }
 }
@@ -417,58 +440,24 @@ static void WinLvmMountMgrArrivalWorker(PDEVICE_OBJECT DeviceObject, PVOID Conte
     WINLVM_MM_NOTIFY_WORK *work = (WINLVM_MM_NOTIFY_WORK *)Context;
     PDEVICE_OBJECT lv_pdo = work ? work->lv_pdo : NULL;
     PIO_WORKITEM io_work = work ? work->io_work : NULL;
+    BOOLEAN dismount_first = work ? work->dismount_first : FALSE;
     if (work) ExFreePoolWithTag(work, WINLVM_WIN_TAG);
 
     if (lv_pdo && !WinLvmIsProbeStopping()) {
         WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)lv_pdo->DeviceExtension;
         if (!lvext->unavailable && !lvext->deactivating && lvext->devname[0] != 0) {
-            UNICODE_STRING mm_name;
-            RtlInitUnicodeString(&mm_name, MOUNTMGR_DEVICE_NAME);
-            PFILE_OBJECT mm_file = NULL;
-            PDEVICE_OBJECT mm_dev = NULL;
-            NTSTATUS st = IoGetDeviceObjectPointer(
-                &mm_name, FILE_READ_ATTRIBUTES, &mm_file, &mm_dev);
-            if (NT_SUCCESS(st) && mm_file && mm_dev) {
-                UNICODE_STRING dev_name;
-                RtlInitUnicodeString(&dev_name, lvext->devname);
-                ULONG in_len = (ULONG)(FIELD_OFFSET(MOUNTMGR_TARGET_NAME, DeviceName) +
-                                       dev_name.Length);
-                PMOUNTMGR_TARGET_NAME target = (PMOUNTMGR_TARGET_NAME)ExAllocatePoolZero(
-                    NonPagedPool, in_len, WINLVM_WIN_TAG);
-                if (target) {
-                    target->DeviceNameLength = dev_name.Length;
-                    RtlCopyMemory(target->DeviceName, dev_name.Buffer, dev_name.Length);
-
-                    KEVENT ev;
-                    IO_STATUS_BLOCK iosb;
-                    KeInitializeEvent(&ev, NotificationEvent, FALSE);
-                    RtlZeroMemory(&iosb, sizeof(iosb));
-                    PIRP irp = IoBuildDeviceIoControlRequest(
-                        IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION,
-                        mm_dev, target, in_len, NULL, 0, FALSE, &ev, &iosb);
-                    if (irp) {
-                        IoGetNextIrpStackLocation(irp)->FileObject = mm_file;
-                        st = IoCallDriver(mm_dev, irp);
-                        if (st == STATUS_PENDING) {
-                            KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, NULL);
-                            st = iosb.Status;
-                        }
-                        WL_TRACE_2("mountmgr arrival %wZ -> 0x%08x",
-                                   &dev_name, (unsigned)st);
-                    }
-                    ExFreePoolWithTag(target, WINLVM_WIN_TAG);
-                }
-                ObDereferenceObject(mm_file);
-            }
+            if (dismount_first) WinLvmRemountLvVolumeIfMounted(lv_pdo);
+            WinLvmSendMountMgrArrival(lvext->devname);
+            if (dismount_first) WinLvmTriggerLvVolumeMount(lv_pdo);
         }
     }
 
-    if (lv_pdo) ObDereferenceObject(lv_pdo);
     if (io_work) IoFreeWorkItem(io_work);
+    if (lv_pdo) ObDereferenceObject(lv_pdo);
     WinLvmWorkRelease();
 }
 
-void WinLvmQueueMountMgrArrival(PDEVICE_OBJECT LvPdo) {
+void WinLvmQueueMountMgrArrivalEx(PDEVICE_OBJECT LvPdo, BOOLEAN dismount_first) {
     if (!LvPdo || !WinLvmWorkAcquire()) return;
     WINLVM_MM_NOTIFY_WORK *work = (WINLVM_MM_NOTIFY_WORK *)ExAllocatePoolZero(
         NonPagedPool, sizeof(WINLVM_MM_NOTIFY_WORK), WINLVM_WIN_TAG);
@@ -485,5 +474,10 @@ void WinLvmQueueMountMgrArrival(PDEVICE_OBJECT LvPdo) {
     ObReferenceObject(LvPdo);
     work->lv_pdo = LvPdo;
     work->io_work = io_work;
+    work->dismount_first = dismount_first;
     IoQueueWorkItem(io_work, WinLvmMountMgrArrivalWorker, DelayedWorkQueue, work);
+}
+
+void WinLvmQueueMountMgrArrival(PDEVICE_OBJECT LvPdo) {
+    WinLvmQueueMountMgrArrivalEx(LvPdo, FALSE);
 }

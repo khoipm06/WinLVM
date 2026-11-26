@@ -173,6 +173,10 @@ size_t wl_vg_lv_collect_pv_slots(const wl_vg_record *r, size_t lv_index,
                 if (ii >= 0) wl_append_sublv_slots(r, (size_t)ii, slots_out, slots_cap, &n);
                 if (mi >= 0) wl_append_sublv_slots(r, (size_t)mi, slots_out, slots_cap, &n);
             }
+            if (seg->mirror_log[0]) {
+                int li = wl_find_lv_index(v, seg->mirror_log);
+                if (li >= 0) wl_append_sublv_slots(r, (size_t)li, slots_out, slots_cap, &n);
+            }
         }
     }
     return n;

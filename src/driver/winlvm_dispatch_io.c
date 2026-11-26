@@ -76,6 +76,10 @@ static NTSTATUS LvForwardIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (wl_vg_lv_is_complex(view, ext->lv_index)) {
+        return WinLvmComplexIoDispatch(DeviceObject, Irp);
+    }
+
     wl_map_iter it;
     uint64_t pv_byte = 0;
     uint32_t pv_slot = 0;

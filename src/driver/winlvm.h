@@ -176,6 +176,7 @@ typedef struct _WINLVM_LV_EXT {
     ULONG          physical_sector;
     ULONGLONG      byte_size;
     BOOLEAN        read_only;
+    BOOLEAN        pending_remount;
     BOOLEAN        unavailable;
     BOOLEAN        deactivating;
     BOOLEAN        reported_to_pnp;
@@ -315,6 +316,7 @@ void WinLvmDetachChildBackingLocked(WINLVM_LV_EXT *lext,
                                     PDEVICE_OBJECT *pdos_out,
                                     PFILE_OBJECT *files_out,
                                     size_t *count_out);
+void WinLvmQueueMountMgrArrivalEx(PDEVICE_OBJECT LvPdo, BOOLEAN dismount_first);
 void WinLvmQueueMountMgrArrival(PDEVICE_OBJECT LvPdo);
 
 /* winlvm_vg_ops.c */
@@ -324,6 +326,9 @@ size_t WinLvmCopyRecentPvPaths(WINLVM_BUS_EXT *bus,
                                UNICODE_STRING *out, size_t cap);
 void WinLvmFreeRecentPvPathsLocked(WINLVM_BUS_EXT *bus,
                                    PWCHAR *bufs_out, size_t *count_out);
+BOOLEAN WinLvmChildBindingChangedLocked(const wl_vg_record *r,
+                                        size_t lv_index,
+                                        const WINLVM_LV_EXT *ce);
 BOOLEAN WinLvmRebindChildPdo(WINLVM_BUS_EXT *bus, PDEVICE_OBJECT child);
 void WinLvmCollectExistingChildrenForActivationLocked(WINLVM_BUS_EXT *bus,
                                                       wl_vg_record *r,
@@ -388,6 +393,9 @@ size_t winlvm_disk_source_read(void *impl, uint64_t off, void *buf, size_t len);
 
 /* winlvm_mount.c */
 NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext);
+void WinLvmSendMountMgrArrival(const WCHAR *devname);
+void WinLvmRemountLvVolumeIfMounted(PDEVICE_OBJECT LvPdo);
+void WinLvmTriggerLvVolumeMount(PDEVICE_OBJECT LvPdo);
 
 /* winlvm_storage.c */
 NTSTATUS WinLvmStorageIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *ext);

@@ -534,7 +534,7 @@ int cmd_vgchange(const std::vector<std::string>& args) {
 #ifdef _WIN32
     std::size_t changed = 0;
     for (const auto& lv : loaded->vg.lvs) {
-      if (lv.internal || !lv.supported) continue;
+      if (lv.internal || lv.is_thin_pool || !lv.supported) continue;
       if (!driver_activate_lv(lv.id, *act_opt)) {
         std::cerr << "error: failed to " << (*act_opt ? "activate" : "deactivate")
                   << " LV \"" << lv.name << "\" via WinLVM driver\n";
@@ -1077,11 +1077,22 @@ int cmd_vgck(const std::vector<std::string>& args) {
   }
   for (const auto& lv : ref_vg->lvs) {
     if (!lv.internal && lv.supported) {
-      std::string map_err;
-      if (!build_dm_table(*ref_vg, lv, map_err)) {
-        std::cerr << "error: LV \"" << lv.name << "\" failed segment validation: " << map_err
-                  << "\n";
-        return 1;
+      if (lv.is_thin_pool) {
+        if (lv.segments.empty() || lv.segments[0].metadata_lv.empty() ||
+            lv.segments[0].pool_lv.empty() || lv.segments[0].chunk_size_sectors == 0 ||
+            !ref_vg->find_lv(lv.segments[0].metadata_lv) ||
+            !ref_vg->find_lv(lv.segments[0].pool_lv)) {
+          std::cerr << "error: LV \"" << lv.name
+                    << "\" failed thin-pool segment validation\n";
+          return 1;
+        }
+      } else {
+        std::string map_err;
+        if (!build_dm_table(*ref_vg, lv, map_err)) {
+          std::cerr << "error: LV \"" << lv.name << "\" failed segment validation: " << map_err
+                    << "\n";
+          return 1;
+        }
       }
     }
     for (const auto& seg : lv.segments) {

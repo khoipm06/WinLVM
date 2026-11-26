@@ -481,7 +481,7 @@ int create_snapshot_lv(const std::vector<std::string>& args,
   }
 
   const LogicalVolume* origin_lv = loaded->vg.find_lv(origin_name);
-  if (!origin_lv || origin_lv->internal || origin_lv->segments.empty()) {
+  if (!origin_lv || origin_lv->internal || origin_lv->is_snapshot_cow || origin_lv->segments.empty()) {
     std::cerr << "error: origin logical volume \"" << origin_name << "\" not found in VG \""
               << loaded->vg.name << "\"\n";
     return 1;

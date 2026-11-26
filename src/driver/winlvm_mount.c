@@ -216,3 +216,124 @@ NTSTATUS WinLvmMountIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp, WINLVM_LV_EXT *
 
     return STATUS_INVALID_DEVICE_REQUEST;
 }
+
+#ifdef _KERNEL_MODE
+void WinLvmSendMountMgrArrival(const WCHAR *devname) {
+    if (!devname || devname[0] == 0 || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    UNICODE_STRING mm_name;
+    RtlInitUnicodeString(&mm_name, MOUNTMGR_DEVICE_NAME);
+    PFILE_OBJECT mm_file = NULL;
+    PDEVICE_OBJECT mm_dev = NULL;
+    NTSTATUS st = IoGetDeviceObjectPointer(
+        &mm_name, FILE_READ_ATTRIBUTES, &mm_file, &mm_dev);
+    if (!NT_SUCCESS(st) || !mm_file || !mm_dev) return;
+
+    UNICODE_STRING dev_name;
+    RtlInitUnicodeString(&dev_name, devname);
+    ULONG in_len = (ULONG)(FIELD_OFFSET(MOUNTMGR_TARGET_NAME, DeviceName) + dev_name.Length);
+    PMOUNTMGR_TARGET_NAME target = (PMOUNTMGR_TARGET_NAME)ExAllocatePoolZero(
+        NonPagedPool, in_len, WINLVM_WIN_TAG);
+    if (target) {
+        target->DeviceNameLength = dev_name.Length;
+        RtlCopyMemory(target->DeviceName, dev_name.Buffer, dev_name.Length);
+
+        KEVENT ev;
+        IO_STATUS_BLOCK iosb;
+        KeInitializeEvent(&ev, NotificationEvent, FALSE);
+        RtlZeroMemory(&iosb, sizeof(iosb));
+        PIRP irp = IoBuildDeviceIoControlRequest(
+            IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION,
+            mm_dev, target, in_len, NULL, 0, FALSE, &ev, &iosb);
+        if (irp) {
+            IoGetNextIrpStackLocation(irp)->FileObject = mm_file;
+            st = IoCallDriver(mm_dev, irp);
+            if (st == STATUS_PENDING) {
+                KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, NULL);
+                st = iosb.Status;
+            }
+            WL_TRACE_2("mountmgr arrival %wZ -> 0x%08x", &dev_name, (unsigned)st);
+        }
+        ExFreePoolWithTag(target, WINLVM_WIN_TAG);
+    }
+    ObDereferenceObject(mm_file);
+}
+
+/*
+ * Synchronized VPB_MOUNTED probe under the global VPB spinlock so concurrent
+ * dismounts/VPB swaps cannot free LvPdo->Vpb while we inspect its flags.
+ */
+static BOOLEAN WinLvmIsVolumeMounted(PDEVICE_OBJECT LvPdo) {
+    if (!LvPdo) return FALSE;
+    KIRQL irql;
+    IoAcquireVpbSpinLock(&irql);
+    BOOLEAN mounted = (LvPdo->Vpb && (LvPdo->Vpb->Flags & VPB_MOUNTED)) ? TRUE : FALSE;
+    IoReleaseVpbSpinLock(irql);
+    return mounted;
+}
+
+/*
+ * Force-dismount any already-mounted VPB on our own LV PDO and bounce the
+ * volume device interface so Windows tears down a stale read-only (or RW)
+ * filesystem instance before re-mounting under the updated read_only state.
+ * FILE_READ_DATA is required alongside FILE_READ_ATTRIBUTES so IopParseDevice
+ * routes through Vpb->DeviceObject instead of taking the DirectOpen bypass.
+ */
+void WinLvmRemountLvVolumeIfMounted(PDEVICE_OBJECT LvPdo) {
+    if (!LvPdo || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)LvPdo->DeviceExtension;
+    if (!lvext || lvext->devname[0] == 0) return;
+
+    if (WinLvmIsVolumeMounted(LvPdo)) {
+        UNICODE_STRING dev_name;
+        RtlInitUnicodeString(&dev_name, lvext->devname);
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &dev_name,
+                                   OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                                   NULL, NULL);
+        HANDLE vh = NULL;
+        IO_STATUS_BLOCK iosb;
+        RtlZeroMemory(&iosb, sizeof(iosb));
+        NTSTATUS st = ZwCreateFile(
+            &vh, SYNCHRONIZE | FILE_READ_DATA | FILE_READ_ATTRIBUTES, &oa, &iosb, NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+        if (NT_SUCCESS(st) && vh) {
+            RtlZeroMemory(&iosb, sizeof(iosb));
+            NTSTATUS dst = ZwFsControlFile(
+                vh, NULL, NULL, NULL, &iosb,
+                FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
+            WL_TRACE_2("remount dismount %wZ -> 0x%08x", &dev_name, (unsigned)dst);
+            ZwClose(vh);
+        } else {
+            WL_TRACE_2("remount open %wZ -> 0x%08x", &dev_name, (unsigned)st);
+        }
+    }
+    WinLvmLvSetInterfaceEnabled(LvPdo, FALSE);
+    WinLvmLvSetInterfaceEnabled(LvPdo, TRUE);
+}
+
+void WinLvmTriggerLvVolumeMount(PDEVICE_OBJECT LvPdo) {
+    if (!LvPdo || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    WINLVM_LV_EXT *lvext = (WINLVM_LV_EXT *)LvPdo->DeviceExtension;
+    if (!lvext || lvext->devname[0] == 0) return;
+    if (WinLvmIsVolumeMounted(LvPdo)) return;
+
+    UNICODE_STRING dev_name;
+    RtlInitUnicodeString(&dev_name, lvext->devname);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &dev_name,
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL, NULL);
+    HANDLE vh = NULL;
+    IO_STATUS_BLOCK iosb;
+    RtlZeroMemory(&iosb, sizeof(iosb));
+    NTSTATUS st = ZwCreateFile(
+        &vh, SYNCHRONIZE | FILE_READ_DATA | FILE_READ_ATTRIBUTES, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (NT_SUCCESS(st) && vh) ZwClose(vh);
+    WL_TRACE_2("remount trigger %wZ -> 0x%08x", &dev_name, (unsigned)st);
+}
+#endif

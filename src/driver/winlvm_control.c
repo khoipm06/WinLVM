@@ -246,8 +246,24 @@ static NTSTATUS WinLvmHandleInventory(PVOID sysBuf, ULONG output_length, ULONG_P
                 if (v->read_only || lv->read_only || v->system_id[0] != '\0') {
                     flags |= WINLVM_INV_LV_READONLY;
                 }
+                if (lv->is_snapshot_cow) {
+                    flags |= WINLVM_INV_LV_SNAPSHOT;
+                } else if (lv->is_snapshot_origin) {
+                    flags |= WINLVM_INV_LV_SNAPSHOT_ORIGIN;
+                }
                 for (size_t s = 0; s < lv->segment_count; s++) {
-                    if (lv->segments[s].stripe_count > 1) { flags |= WINLVM_INV_LV_STRIPED; break; }
+                    lvmcore_seg_type st = lv->segments[s].type;
+                    if (st == LVMCORE_SEG_STRIPED && lv->segments[s].stripe_count > 1) {
+                        flags |= WINLVM_INV_LV_STRIPED;
+                    } else if (st == LVMCORE_SEG_THIN) {
+                        flags |= WINLVM_INV_LV_THIN;
+                    } else if (st == LVMCORE_SEG_SNAPSHOT) {
+                        flags |= WINLVM_INV_LV_SNAPSHOT;
+                    } else if (st == LVMCORE_SEG_RAID1) {
+                        flags |= WINLVM_INV_LV_RAID1;
+                    } else if (st == LVMCORE_SEG_MIRROR) {
+                        flags |= WINLVM_INV_LV_MIRROR;
+                    }
                 }
                 for (size_t c = 0; c < bus->child_count; c++) {
                     WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;

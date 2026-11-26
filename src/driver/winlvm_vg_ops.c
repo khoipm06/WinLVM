@@ -69,6 +69,30 @@ void WinLvmFreeRecentPvPathsLocked(WINLVM_BUS_EXT *bus,
     bus->recent_pv_count = 0;
 }
 
+BOOLEAN WinLvmChildBindingChangedLocked(const wl_vg_record *r,
+                                        size_t lv_index,
+                                        const WINLVM_LV_EXT *ce) {
+    if (!r || !ce) return FALSE;
+    size_t slots[WL_VG_MAX_PVS];
+    size_t slot_count = 0;
+    ULONG max_stack = 0, max_logical = 0, max_physical = 0;
+    if (!WinLvmCollectLvBackingSlotsLocked(r, lv_index, slots, &slot_count,
+                                           &max_stack, &max_logical, &max_physical)) {
+        return FALSE;
+    }
+    if (WinLvmComputeLvReadOnly(r, lv_index, slots, slot_count) != ce->read_only) return TRUE;
+    if (slot_count != ce->backing_count) return TRUE;
+    for (size_t j = 0; j < slot_count; j++) {
+        const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)r->pv_tag[slots[j]];
+        if (!tag || ce->pv_slot[j] != (uint32_t)slots[j] ||
+            ce->backing_pdo[j] != tag->backing_pdo ||
+            ce->backing_file[j] != tag->backing_file) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 BOOLEAN WinLvmRebindChildPdo(WINLVM_BUS_EXT *bus, PDEVICE_OBJECT child) {
     if (!bus || !child) return FALSE;
     WINLVM_RECONCILE_DROPS *drops = (WINLVM_RECONCILE_DROPS *)ExAllocatePoolZero(
@@ -82,17 +106,21 @@ BOOLEAN WinLvmRebindChildPdo(WINLVM_BUS_EXT *bus, PDEVICE_OBJECT child) {
     }
 
     BOOLEAN ok = FALSE;
+    BOOLEAN ro_changed = FALSE;
     KIRQL old;
     KeAcquireSpinLock(&bus->lock, &old);
     BOOLEAN present = FALSE;
     for (size_t i = 0; i < bus->child_count; i++) {
         if (bus->children[i] == child) { present = TRUE; break; }
     }
+    BOOLEAN was_ro = ce->read_only;
     if (present && ce->record && !ce->record->dead &&
         WinLvmReconcileSingleChildLocked(ce->record, ce, drops)) {
         ce->deactivating = FALSE;
         ce->unavailable = FALSE;
         wl_vg_lv_set_activated(ce->record, ce->lv_index, 1);
+        ro_changed = ((was_ro != ce->read_only) || ce->pending_remount);
+        ce->pending_remount = FALSE;
         ok = TRUE;
     }
     KeReleaseSpinLock(&bus->lock, old);
@@ -101,7 +129,7 @@ BOOLEAN WinLvmRebindChildPdo(WINLVM_BUS_EXT *bus, PDEVICE_OBJECT child) {
     WinLvmIoGateResume(&ce->io_gate, child);
     if (ok) {
         WinLvmLvSetInterfaceEnabled(child, TRUE);
-        WinLvmQueueMountMgrArrival(child);
+        WinLvmQueueMountMgrArrivalEx(child, ro_changed);
     }
     return ok;
 }
@@ -153,7 +181,9 @@ void WinLvmCollectExistingChildrenForActivationLocked(WINLVM_BUS_EXT *bus,
         }
         if (existing) {
             WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)existing->DeviceExtension;
-            BOOLEAN need_revive = (ce->unavailable || (explicit_probe && ce->deactivating));
+            BOOLEAN need_revive = (ce->unavailable ||
+                                   (explicit_probe && ce->deactivating) ||
+                                   (!ce->deactivating && WinLvmChildBindingChangedLocked(r, k, ce)));
             if (need_revive && *revived_count_out < WL_MAX_CHILDREN) {
                 BOOLEAN seen = FALSE;
                 for (size_t j = 0; j < *revived_count_out; j++) {
@@ -362,13 +392,28 @@ wl_arrival_result WinLvmProbeCommitArrivalLocked(WINLVM_BUS_EXT *bus,
         *block_io = NULL;
     }
     if (res == WL_ARR_RECONCILED) {
-        for (size_t c = 0; c < bus->child_count && pre_unavail_count < WL_MAX_CHILDREN; c++) {
+        uint32_t pre_avail = 0, pre_ro = 0;
+        for (size_t c = 0; c < bus->child_count && c < WL_MAX_CHILDREN; c++) {
             WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;
-            if (ce->record == &bus->vg_records[out->slot] && ce->unavailable) {
+            if (ce->record != &bus->vg_records[out->slot]) continue;
+            if (ce->unavailable && pre_unavail_count < WL_MAX_CHILDREN) {
                 pre_unavail[pre_unavail_count++] = bus->children[c];
+            } else if (!ce->unavailable && !ce->deactivating) {
+                pre_avail |= (1u << c);
+                if (ce->read_only) pre_ro |= (1u << c);
             }
         }
         WinLvmReconcileChildrenLocked(bus, &bus->vg_records[out->slot], drops);
+        for (size_t c = 0; c < bus->child_count && c < WL_MAX_CHILDREN; c++) {
+            if (!(pre_avail & (1u << c))) continue;
+            WINLVM_LV_EXT *ce = (WINLVM_LV_EXT *)bus->children[c]->DeviceExtension;
+            if (!ce->unavailable && !ce->deactivating &&
+                (((pre_ro >> c) & 1u) != (ce->read_only ? 1u : 0u)) &&
+                pre_unavail_count < WL_MAX_CHILDREN) {
+                ce->pending_remount = TRUE;
+                pre_unavail[pre_unavail_count++] = bus->children[c];
+            }
+        }
     }
 
     if (res != WL_ARR_REJECTED && res != WL_ARR_DUPLICATE) {

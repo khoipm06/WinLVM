@@ -9,7 +9,14 @@ BOOLEAN WinLvmComputeLvReadOnly(const wl_vg_record *record, size_t lv_index,
     const lvmcore_volume_group *view = record ? record->view : NULL;
     if (!view || !view->lvs || lv_index >= view->lv_count) return TRUE;
     if (view->read_only || view->system_id[0] != '\0') return TRUE;
-    if (view->lvs[lv_index].read_only) return TRUE;
+    const lvmcore_logical_volume *lv = &view->lvs[lv_index];
+    if (lv->read_only) return TRUE;
+    if (lv->segment_count > 0 && lv->segments &&
+        (lv->segments[0].type == LVMCORE_SEG_RAID1 ||
+         lv->segments[0].type == LVMCORE_SEG_MIRROR) &&
+        !wl_vg_lv_raid_all_legs_present(record, lv_index)) {
+        return TRUE;
+    }
     for (size_t i = 0; i < slot_count; i++) {
         const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)record->pv_tag[slots[i]];
         if (!tag || tag->read_only) return TRUE;
@@ -28,38 +35,27 @@ BOOLEAN WinLvmCollectLvBackingSlotsLocked(const wl_vg_record *record, size_t lv_
 
     const lvmcore_volume_group *view = record ? record->view : NULL;
     if (!view || !view->lvs || lv_index >= view->lv_count) return FALSE;
-    const lvmcore_logical_volume *lv0 = &view->lvs[lv_index];
-    if (lv0->segment_count == 0 || !lv0->segments) return FALSE;
+    if (!wl_vg_lv_pv_complete(record, lv_index)) return FALSE;
+
+    uint32_t raw_slots[WL_VG_MAX_PVS];
+    size_t raw_count = wl_vg_lv_collect_pv_slots(record, lv_index, raw_slots, WL_VG_MAX_PVS);
+    if (raw_count == 0) return FALSE;
 
     size_t count = 0;
     ULONG max_stack = 0, max_logical = 0, max_physical = 0;
-    for (size_t s = 0; s < lv0->segment_count; s++) {
-        const lvmcore_segment *seg = &lv0->segments[s];
-        if (!seg->stripes || seg->stripe_count_used == 0) return FALSE;
-        for (size_t t = 0; t < seg->stripe_count_used; t++) {
-            const lvmcore_physical_volume *pv = lvmcore_vg_find_pv(view, seg->stripes[t].pv_key);
-            if (!pv) return FALSE;
-            size_t slot = SIZE_MAX;
-            for (size_t k = 0; k < record->pv_count; k++) {
-                if (RtlEqualMemory(record->pv_uuid[k], pv->id, 32)) { slot = k; break; }
-            }
-            if (slot == SIZE_MAX) return FALSE;
-
-            size_t known = 0;
-            for (; known < count; known++) if (slots_out[known] == slot) break;
-            if (known == count) {
-                const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)record->pv_tag[slot];
-                if (!tag || !tag->backing_pdo || !tag->backing_file || count >= WL_VG_MAX_PVS) {
-                    return FALSE;
-                }
-                slots_out[count++] = slot;
-                if ((ULONG)tag->backing_pdo->StackSize > max_stack) {
-                    max_stack = (ULONG)tag->backing_pdo->StackSize;
-                }
-                if (tag->logical_sector > max_logical) max_logical = tag->logical_sector;
-                if (tag->physical_sector > max_physical) max_physical = tag->physical_sector;
-            }
+    for (size_t i = 0; i < raw_count; i++) {
+        size_t slot = (size_t)raw_slots[i];
+        if (slot >= record->pv_count) return FALSE;
+        const WINLVM_PV_TAG *tag = (const WINLVM_PV_TAG *)record->pv_tag[slot];
+        if (!tag || !tag->backing_pdo || !tag->backing_file || count >= WL_VG_MAX_PVS) {
+            return FALSE;
         }
+        slots_out[count++] = slot;
+        if ((ULONG)tag->backing_pdo->StackSize > max_stack) {
+            max_stack = (ULONG)tag->backing_pdo->StackSize;
+        }
+        if (tag->logical_sector > max_logical) max_logical = tag->logical_sector;
+        if (tag->physical_sector > max_physical) max_physical = tag->physical_sector;
     }
     if (count == 0) return FALSE;
     if (max_logical == 0) max_logical = 512;

@@ -854,15 +854,27 @@ Topology query_live_topology(bool service_connected, bool caller_elevated) {
         lvi.active = active;
         lvi.read_only = lvi.read_only || ro;
         if (e.byte_size > 0) lvi.size_bytes = e.byte_size;
+        if (lvi.drive_letter.empty() && e.drive_letter >= L'A' && e.drive_letter <= L'Z') {
+          lvi.drive_letter = std::string(1, static_cast<char>(e.drive_letter)) + ":\\";
+        }
       } else if (raw_uuid.size() == 32) {
         LvInfo lvi;
         lvi.vg_name = std::string(e.vg_name, strnlen(e.vg_name, sizeof(e.vg_name)));
         lvi.lv_name = std::string(e.lv_name, strnlen(e.lv_name, sizeof(e.lv_name)));
         lvi.lv_uuid = lvmfmt::format_uuid(raw_uuid);
-        lvi.segment_type = (e.flags & WINLVM_INV_LV_STRIPED) ? "striped" : "linear";
+        if (e.flags & WINLVM_INV_LV_THIN) lvi.segment_type = "thin";
+        else if (e.flags & WINLVM_INV_LV_SNAPSHOT) lvi.segment_type = "snapshot";
+        else if (e.flags & WINLVM_INV_LV_SNAPSHOT_ORIGIN) lvi.segment_type = "snapshot-origin";
+        else if (e.flags & WINLVM_INV_LV_RAID1) lvi.segment_type = "raid1";
+        else if (e.flags & WINLVM_INV_LV_MIRROR) lvi.segment_type = "mirror";
+        else if (e.flags & WINLVM_INV_LV_STRIPED) lvi.segment_type = "striped";
+        else lvi.segment_type = "linear";
         lvi.size_bytes = e.byte_size;
         lvi.active = active;
         lvi.read_only = ro;
+        if (e.drive_letter >= L'A' && e.drive_letter <= L'Z') {
+          lvi.drive_letter = std::string(1, static_cast<char>(e.drive_letter)) + ":\\";
+        }
         lv_index_by_raw_uuid[raw_uuid] = topo.lvs.size();
         topo.lvs.push_back(std::move(lvi));
       }

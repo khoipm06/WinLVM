@@ -204,12 +204,20 @@ BOOLEAN WinLvmReconcileSingleChildLocked(wl_vg_record *r, WINLVM_LV_EXT *lext,
         new_slot[j] = (uint32_t)slots[j];
     }
 
+    size_t old_count = lext->backing_count;
     for (size_t j = 0; j < slot_count; j++) {
         lext->backing_pdo[j] = new_pdo[j];
         lext->backing_file[j] = new_file[j];
         lext->backing_logical[j] = new_logical[j];
         lext->backing_physical[j] = new_physical[j];
         lext->pv_slot[j] = new_slot[j];
+    }
+    for (size_t j = slot_count; j < old_count && j < WL_VG_MAX_PVS; j++) {
+        lext->backing_pdo[j] = NULL;
+        lext->backing_file[j] = NULL;
+        lext->backing_logical[j] = 0;
+        lext->backing_physical[j] = 0;
+        lext->pv_slot[j] = 0;
     }
     lext->backing_count = slot_count;
     lext->lv_index = match;

@@ -154,7 +154,7 @@ int lvconvert_to_raid1_or_mirror(LoadedVG& loaded,
       break;
     }
   }
-  if (!target_lv || target_lv->internal || target_lv->segments.empty()) {
+  if (!target_lv || target_lv->internal || target_lv->is_snapshot_cow || target_lv->segments.empty()) {
     std::cerr << "error: logical volume \"" << lv_name << "\" not found in VG \""
               << loaded.vg.name << "\"\n";
     return 1;
