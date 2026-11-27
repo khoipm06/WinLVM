@@ -38,35 +38,9 @@
 
 ---
 
-## 3. Repository Structure
+## 3. Future & Boot Architecture
 
-### Implemented Tree
-
-```text
-winlvm/
-  corpus/               Lightweight LVM2/LUKS2 text/hash oracles and corpus-manifest.json
-  scripts/
-    gen_test_fixtures.py  Deterministic out-of-tree Python 3 LVM2/LUKS2 image generator
-    pack_installer.py     Trailer-archive installer packager and integrity verifier
-  docs/
-    ROADMAP.md          This document
-  src/
-    winlvm_ioctl.h      Shared user/kernel control-plane ABI
-    winlvm_types.h      Shared fixed-width ABI primitives
-    lvmcore/            Freestanding C11 parser, arena, CRC-32/CRC-32c, serializer,
-                        and dm-thin / dm-snapshot / raid1-mirror block engines
-    lvmfmt/             Portable C++20 LVM2 format, mapping, allocator, two-phase MDA commit engine
-    driver/             WDM kernel driver (winlvm.sys, 19 C11 modules, winlvm.inf, winlvm-vol.inf)
-    tools/lvm/          lvm / lvm.exe CLI control plane
-    tools/lvmdump/      lvmdump / lvmdump.exe standalone metadata & DM-table dumper
-    service/            winlvm_svc / winlvm_svc.exe SCM named-pipe broker & Win32 backend
-    gui/                winlvm_gui.exe native Win32 desktop & system-tray application
-    installer/          winlvm_setup_stub.exe & winlvm-uninstall.exe native Win32 installer
-  tests/                Unit, parser, hardening, serialization, VG state-machine, CLI,
-                        service, installer archive, IOCTL, corpus oracle suites, and VM harnesses
-```
-
-### Planned Future Boot Components
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the current driver, user-mode, and repository layout. Planned pre-boot and crash-dump extensions:
 
 ```text
   src/
@@ -76,83 +50,9 @@ winlvm/
 
 ---
 
-## 4. Implemented Foundation
+## 4. Test Fixtures
 
-### Dynamic Out-of-Tree Test Fixtures (`scripts/gen_test_fixtures.py`, `corpus/`)
-
-- Deterministic stdlib-only Python 3 generator invoked automatically by CMake to
-  build 16 LVM2/LUKS2 disk images out-of-tree in
-  `${CMAKE_BINARY_DIR}/corpus-images/`.
-- Covers single-PV linear, discontiguous multi-segment linear, multi-PV spanning
-  linear, 2-PV 64 KiB striped, 4Kn sector geometry, odd geometry (dual MDAs,
-  wrapped circular MDA ring buffers), `thin-pool` + `thin` + thin snapshot,
-  `snapshot` + `snapshot-origin`, 2-PV `raid1` + `mirror` (core and disk log),
-  mixed VG with fail-closed `cache` LV, and two LUKS2 opaque-container cases
-  (`luks2-default`, `luks2-pbkdf2`).
-
-### Format Libraries & Block Engines (`src/lvmcore/`, `src/lvmfmt/`)
-
-- Full LVM2 label (`LABELONE`), `pv_header`, `pv_header_extension` v2
-  (`PV_EXT_USED`), multi-MDA `mda_header`, and circular ring-buffer support.
-- Weak CRC-32 (`0xedb88320`, init `0xf597a6cf`, no final XOR), CRC-32c for
-  `dm-thin` metadata integrity, and checked 64-bit arithmetic throughout.
-- Lossless parsing and serialization of `linear`, `striped`, `thin-pool`,
-  `thin`, `snapshot`, `raid1`, `mirror`, and PV/VG/LV `tags`, with out-of-scope
-  segment types (`raid4`/`5`/`6`/`10`, `cache`, `vdo`, `writecache`,
-  `integrity`) parsed and refused per LV.
-- Freestanding C11 on-disk block engines (`lvmcore_thin.c`, `lvmcore_snap.c`,
-  `lvmcore_raid.c`) supporting `dm-thin` B-tree reads/CoW writes/leaf splits
-  verified against Linux `thin_check`, `dm-snapshot` origin/snapshot CoW reads
-  and writes, and `raid1`/`mirror` degraded read failover and multi-leg writes.
-- Two-phase circular MDA metadata commits (`raw_locns[1]` precommit ->
-  `raw_locns[0]` commit with rollback) across all active MDAs of all member PVs,
-  honoring `RAW_LOCN_IGNORED`.
-
-### WDM Kernel Driver (`src/driver/winlvm.sys`)
-
-- Modular 19-file C11 WDM software-bus driver (`winlvm.c`, `winlvm_pnp.c`,
-  `winlvm_probe.c`, `winlvm_notify.c`, `winlvm_vg_ops.c`, `winlvm_control.c`,
-  `winlvm_child.c`, `winlvm_gate.c`, `winlvm_power.c`, `winlvm_dispatch_io.c`,
-  `winlvm_subirp.c`, `winlvm_sector.c`, `winlvm_mount.c`, `winlvm_storage.c`,
-  `winlvm_vg.c`, `winlvm_map.c`, `winlvm_thin.c`, `winlvm_snap.c`,
-  `winlvm_raid.c`) linked with freestanding `src/lvmcore/` modules, keeping
-  every driver file under 500 LOC.
-- Split INF packaging: `winlvm.inf` (`ROOT\winlvm`, `Class=System`) and
-  `winlvm-vol.inf` (`WinLvm\Volume` / `WinLvmVolume`, `Class=Volume`, null
-  service for raw PDOs).
-- Automatic PV discovery on `GUID_DEVINTERFACE_DISK` and
-  `GUID_DEVINTERFACE_VOLUME`, cold partition symlink retry, automatic GPT/MBR
-  partition scanning via `IOCTL_DISK_GET_DRIVE_LAYOUT_EX`, refcounted
-  target-device removal notifications, WDM power state tracking, Mount Manager
-  link tracking and arrival notification, and explicit probing via
-  `IOCTL_WINLVM_PROBE_DEVICE`.
-- Read, write, flush, and shutdown I/O paths with aligned single-member
-  pass-through, partial-MDL multi-piece sub-IRP fan-out, `PASSIVE_LEVEL`
-  work-item dispatch into the freestanding `thin`/`snapshot`/`raid1`/`mirror`
-  block engines, 512e/4Kn sector alignment and bounce buffers, and cancel-safe
-  quiesce gating (`IO_CSQ`).
-- Enforces read-only protection (`STATUS_MEDIA_WRITE_PROTECTED`) on foreign
-  `system_id`, `READ`-only VG/LV metadata, read-only backing PVs, and degraded
-  `raid1`/`mirror` arrays.
-- ACL-hardened `\Device\WinLvmControl` (`IoCreateDeviceSecure`,
-  `SDDL_DEVOBJ_SYS_ALL_ADM_ALL`) reporting full LV inventory (including segment
-  flags, active state, and MountMgr drive letter) alongside refresh, quiesce /
-  resume, dynamic LV activate / deactivate / resize update, ring log drain, and
-  explicit device probing.
-
-### User-Mode Tooling, Desktop GUI, & Installer
-
-- `lvm.exe` CLI covering full PV/VG/LV lifecycle management including
-  `thin-pool`, `thin`, `snapshot`, `raid1`, `mirror`, `pvchange`, `lvconvert`
-  (RAID1/mirror/linear conversion and `--merge`), `lvmconfig`/`dumpconfig`,
-  `tags`, `fullreport`, and `--reportformat json` / `json_std`.
-- `lvmdump.exe` diagnostic inspection utility.
-- `winlvm_svc.exe` SCM service over an ACL-restricted named pipe
-  (`\\.\pipe\winlvm-svc`) with framed JSON IPC and Win32 volume/MountMgr
-  control backend.
-- `winlvm_gui.exe` native Win32 desktop and system-tray manager.
-- `winlvm-setup-x64.exe` and `winlvm-uninstall.exe` standalone installer and
-  uninstaller with SHA-256 integrity-verified trailer archives.
+`scripts/gen_test_fixtures.py` (invoked automatically by CMake into `${CMAKE_BINARY_DIR}/corpus-images/` and `${CMAKE_BINARY_DIR}/corpus-expected/`) generates deterministic LVM2/LUKS2 fixtures covering single-PV linear, discontiguous multi-segment linear, multi-PV spanning linear, 2-PV 64 KiB striped, 4Kn sector geometry, odd geometry (dual MDAs, wrapped circular MDA ring buffers), `thin-pool` + `thin` + thin snapshot, `snapshot` + `snapshot-origin`, 2-PV `raid1` + `mirror` (core and disk log), mixed VG with fail-closed `cache` LV, and two LUKS2 opaque-container cases (`luks2-default`, `luks2-pbkdf2`).
 
 ---
 

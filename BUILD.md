@@ -127,7 +127,7 @@ This outputs the driver package under `src\driver\x64\Release\` (or
 
 ### Sources Compiled by `src/driver/winlvm.vcxproj`
 
-- **Modular C11 WDM driver (`src/driver/`)** (every module kept under 500 LOC):
+- **Modular C11 WDM driver (`src/driver/`)**:
   - `winlvm.c` — `DriverEntry`, `WinLvmUnload`, ACL-hardened `\Device\WinLvmControl`
     (`IoCreateDeviceSecure` + `SDDL_DEVOBJ_SYS_ALL_ADM_ALL`), ring logger, WMI
     provider, and top-level IRP dispatch
@@ -231,22 +231,6 @@ devcon.exe remove "ROOT\winlvm"
 
 ## 4. Test Fixtures (`scripts/gen_test_fixtures.py`)
 
-CMake invokes
-`scripts/gen_test_fixtures.py` during the build to generate all 16 LVM2/LUKS2
-test images into `${CMAKE_BINARY_DIR}/corpus-images/`, matching the lightweight
-text/hash oracles under `corpus/expected/`. See [`corpus/README.md`](corpus/README.md)
-for details.
-
----
-
-## 5. Optional Pre-Commit Hook
-
-A POSIX `sh` pre-commit hook at [`scripts/hooks/pre-commit`](scripts/hooks/pre-commit)
-checks staged changes for whitespace errors (`git diff --cached --check`),
-guards against committing raw disk images, VM/key artifacts, or unintended
-`third_party/` submodule pointer changes, and warns on oversized multi-area
-commits:
-
-```bash
-cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
-```
+CMake invokes `scripts/gen_test_fixtures.py` during the build to generate all 16
+LVM2/LUKS2 disk images into `${CMAKE_BINARY_DIR}/corpus-images/` and matching
+text/hash oracle files into `${CMAKE_BINARY_DIR}/corpus-expected/`.
