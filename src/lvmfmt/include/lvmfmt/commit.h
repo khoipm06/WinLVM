@@ -47,9 +47,6 @@ bool commit_vg_metadata(const VolumeGroup& vg,
 // Fails closed if any LV uses an unsupported or internal segment layout.
 std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::string& error);
 
-// Legacy convenience wrapper; returns empty string if serialization is refused.
-std::string serialize_vg_to_text(const VolumeGroup& vg);
-
 // Save VG configuration to backup archive file.
 bool backup_vg_metadata(const VolumeGroup& vg,
                         std::string_view filepath,

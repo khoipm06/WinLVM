@@ -552,13 +552,13 @@ int main(int argc, char **argv) {
         verify_mappable_case(images_dir, expected_dir, &kMappableCases[i]);
     }
 
-    CHECK("corpus total: all 95/95 oracle hashes across 19 mappable LVs matched",
+    CHECK("expected oracle hash count verified across mappable LVs",
           g_hashes_verified == 95);
 
     verify_mixed_vg_per_lv_gating(images_dir);
     verify_luks_fail_closed(images_dir);
 
-    printf("\ntest_driver_corpus_map: %d passed, %d failed (%d/95 corpus hashes verified)\n",
+    printf("\ntest_driver_corpus_map: %d passed, %d failed (%d hashes verified)\n",
            g_passes, g_fails, g_hashes_verified);
     return g_fails == 0 ? 0 : 1;
 }

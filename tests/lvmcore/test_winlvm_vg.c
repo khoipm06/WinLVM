@@ -1252,7 +1252,7 @@ static void test_raid1_mirror_engine_rw_degraded(void) {
 
 static void test_raid1_staggered_arrival_and_leg_loss(void) {
     /*
-     * Regression for staggered 2-PV raid1/mirror arrival at constant seqno and
+     * Staggered 2-PV raid1/mirror arrival at constant seqno and
      * symmetric 1-leg removal / re-insertion:
      *   PV0 alone -> degraded readable (1 slot, all_legs_present==0, write fails closed)
      *   PV1 arrives at same seqno -> WL_ARR_COMPLETED with newly_count==0,

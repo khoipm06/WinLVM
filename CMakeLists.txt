@@ -86,12 +86,11 @@ target_include_directories(lvm PRIVATE src/tools/lvm)
 target_link_libraries(lvm PRIVATE lvmfmt)
 
 # ---------------------------------------------------------------------------
-# Test Corpus. Disk images are generated deterministically out-of-tree at build
-# time by scripts/gen_test_fixtures.py; only lightweight text/hash oracles live
-# under corpus/expected/.
+# Test Corpus. Disk images and expected text/hash oracles are generated
+# deterministically out-of-tree at build time by scripts/gen_test_fixtures.py.
 # ---------------------------------------------------------------------------
-set(CORPUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/corpus")
 set(CORPUS_OUT "${CMAKE_BINARY_DIR}/corpus-images" CACHE PATH "Directory containing generated corpus images")
+set(CORPUS_EXPECTED_OUT "${CMAKE_BINARY_DIR}/corpus-expected" CACHE PATH "Directory containing generated corpus oracle files")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -118,15 +117,37 @@ foreach(iname ${CORPUS_IMAGE_NAMES})
   list(APPEND CORPUS_IMAGES "${CORPUS_OUT}/${iname}")
 endforeach()
 
+set(CORPUS_LVM_CASES
+  linear-1pv
+  linear-1pv-multiseg
+  linear-2pv
+  striped-2pv
+  sector4k
+  odd-geometry
+  thin-pool
+  snapshot
+  raid1-mirror
+  mixed-vg
+)
+set(CORPUS_EXPECTED_FILES "")
+foreach(cname ${CORPUS_LVM_CASES})
+  foreach(oname vg-metadata.txt dmsetup-table.txt lv-hashes.txt vgs.txt pvs.txt lvs.txt)
+    list(APPEND CORPUS_EXPECTED_FILES "${CORPUS_EXPECTED_OUT}/${cname}/${oname}")
+  endforeach()
+endforeach()
+foreach(cname luks2-default luks2-pbkdf2)
+  list(APPEND CORPUS_EXPECTED_FILES "${CORPUS_EXPECTED_OUT}/${cname}/luks-info.txt")
+endforeach()
+
 set(FIXTURE_GEN_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_test_fixtures.py")
 add_custom_command(
-  OUTPUT ${CORPUS_IMAGES}
-  COMMAND "${Python3_EXECUTABLE}" "${FIXTURE_GEN_SCRIPT}" --out-dir "${CORPUS_OUT}"
+  OUTPUT ${CORPUS_IMAGES} ${CORPUS_EXPECTED_FILES}
+  COMMAND "${Python3_EXECUTABLE}" "${FIXTURE_GEN_SCRIPT}" --out-dir "${CORPUS_OUT}" --expected-dir "${CORPUS_EXPECTED_OUT}"
   DEPENDS "${FIXTURE_GEN_SCRIPT}"
-  COMMENT "Generating deterministic LVM2/LUKS2 test fixtures into ${CORPUS_OUT}"
+  COMMENT "Generating deterministic LVM2/LUKS2 test fixtures into ${CORPUS_OUT} and ${CORPUS_EXPECTED_OUT}"
   VERBATIM
 )
-add_custom_target(corpus ALL DEPENDS ${CORPUS_IMAGES})
+add_custom_target(corpus ALL DEPENDS ${CORPUS_IMAGES} ${CORPUS_EXPECTED_FILES})
 
 enable_testing()
 
@@ -159,7 +180,7 @@ add_executable(test_lvmcore_parser
 target_link_libraries(test_lvmcore_parser PRIVATE lvmcore)
 add_dependencies(test_lvmcore_parser corpus)
 add_test(NAME test_lvmcore_parser
-  COMMAND test_lvmcore_parser "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
+  COMMAND test_lvmcore_parser "${CORPUS_OUT}" "${CORPUS_EXPECTED_OUT}")
 
 add_executable(test_lvmcore_serialize
   tests/lvmcore/test_lvmcore_serialize.c
@@ -183,7 +204,7 @@ target_include_directories(test_driver_corpus_map PRIVATE src/driver tests)
 target_link_libraries(test_driver_corpus_map PRIVATE lvmcore)
 add_dependencies(test_driver_corpus_map corpus)
 add_test(NAME test_driver_corpus_map
-  COMMAND test_driver_corpus_map "${CORPUS_OUT}" "${CORPUS_SRC}/expected")
+  COMMAND test_driver_corpus_map "${CORPUS_OUT}" "${CORPUS_EXPECTED_OUT}")
 
 add_executable(lvmcore_dump_vgcfg
   tests/lvmcore/lvmcore_dump_vgcfg.c
@@ -242,7 +263,7 @@ add_executable(winlvm_tests
 target_include_directories(winlvm_tests PRIVATE src tests src/driver)
 target_link_libraries(winlvm_tests PRIVATE lvmfmt winlvm_service_protocol lvmcore)
 target_compile_definitions(winlvm_tests PRIVATE
-  WINLVM_CORPUS_EXPECTED="${CORPUS_SRC}/expected"
+  WINLVM_CORPUS_EXPECTED="${CORPUS_EXPECTED_OUT}"
   WINLVM_CORPUS_IMAGES="${CORPUS_OUT}"
   WINLVM_LVM_EXE="$<TARGET_FILE:lvm>"
   WINLVM_LVMDUMP_EXE="$<TARGET_FILE:lvmdump>"

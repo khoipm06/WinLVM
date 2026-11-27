@@ -1,6 +1,6 @@
 ﻿# test_multi_pv.ps1 — Black-box verification of multi-PV corpus volumes on Windows.
 # Verifies whole-volume and cross-boundary window SHA-256 digests against
-# corpus/expected/<case>/lv-hashes.txt without hardcoded signing or SDK paths.
+# generated <case>/lv-hashes.txt oracles without hardcoded signing or SDK paths.
 
 [CmdletBinding()]
 param(

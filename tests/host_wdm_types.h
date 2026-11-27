@@ -2,8 +2,8 @@
  * host_wdm_types.h — Freestanding Windows Driver Kit (WDK) type compatibility shim
  * for building and unit-testing Windows storage surface IOCTL drivers on host Linux.
  *
- * Strictly defines official WDK binary struct layouts, status codes, and IOCTL/FSCTL
- * control codes for CONTRACT-STORAGE-SURFACE-001.
+ * Defines WDK binary struct layouts, status codes, and IOCTL/FSCTL
+ * control codes for host testing.
  */
 #ifndef HOST_WDM_TYPES_H
 #define HOST_WDM_TYPES_H

@@ -1,7 +1,7 @@
 /*
  * test_lvmcore_hardening.c — adversarial vectors and hardening tests for lvmcore.
  *
- * Verifies all 5 crash fix scenarios and edge cases:
+ * Verifies memory safety, boundary conditions, and error handling:
  *   1. Stack limit: strictly non-recursive, stack frame <= 512 bytes.
  *   2. Static scratch race: multiple arenas concurrently/interleaved, no statics.
  *   3. Unaligned read: unaligned memory sources and offsets handled safely.
@@ -392,7 +392,7 @@ int main(void) {
               lvmcore_read_vg(&src, LVMCORE_READ_FLAG_DEFAULT, &arena, &vg2, &err2) != LVMCORE_OK);
     }
 
-    /* ---- 10. Crash Fix Scenario 1: Fixed-size Arena Exhaustion ------- */
+    /* ---- 10. Fixed-size Arena Exhaustion ----------------------------- */
     {
         build_label();
         stripes_vg(meta, sizeof(meta), 1, "striped");
@@ -413,7 +413,7 @@ int main(void) {
               st == LVMCORE_ERR_SCRATCH_EXHAUSTED && err.failed);
     }
 
-    /* ---- 11. Crash Fix Scenario 2: Static Scratch Race / Reentrancy -- */
+    /* ---- 11. Concurrent Arena Reentrancy ----------------------------- */
     {
         build_label();
         stripes_vg(meta, sizeof(meta), 2, "striped");
@@ -448,7 +448,7 @@ int main(void) {
               strcmp(vg1.name, vg2.name) == 0 && vg1.seqno == vg2.seqno);
     }
 
-    /* ---- 12. Crash Fix Scenario 3: Unaligned Read Safety ------------- */
+    /* ---- 12. Unaligned Read Safety ----------------------------------- */
     {
         /* Feed unaligned arena buffer and unaligned text parse */
         uint8_t unaligned_arena_buf[64 * 1024 + 7];
@@ -470,7 +470,7 @@ int main(void) {
               st == LVMCORE_OK && vg.lv_count == 1);
     }
 
-    /* ---- 13. Crash Fix Scenario 4: MDA Ring Wrap-Around -------------- */
+    /* ---- 13. MDA Ring Wrap-Around ------------------------------------ */
     {
         /* Set up MDA so text spans across the 1 MiB ring boundary.
          * MDA starts at MDA_OFF = 4096, size = MDA_SIZE = 0x100000 (1 MiB).

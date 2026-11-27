@@ -1,1 +1,0 @@
-lvstr|vgstripe|striped|33554432

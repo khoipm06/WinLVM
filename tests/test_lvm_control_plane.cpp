@@ -516,7 +516,7 @@ TEST(lvm_control_plane_dual_mda_odd_geometry_commit) {
   out = run_cmd(exe, "vgck vgodd \"" + img.string() + "\"", status);
   CHECK_MSG(status == 0, out);
 
-  // Confirm original lvodd stream and all oracle windows still match corpus/expected/odd-geometry/lv-hashes.txt.
+  // Confirm original lvodd stream and all oracle windows still match generated odd-geometry/lv-hashes.txt.
   std::ifstream hf(fs::path(WINLVM_CORPUS_EXPECTED) / "odd-geometry" / "lv-hashes.txt");
   CHECK(hf.is_open());
   std::string line;

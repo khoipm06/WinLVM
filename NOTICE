@@ -8,7 +8,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 Third-Party Reference Notice:
 The third_party/ directory contains pointers to and reference source code from
-external upstream projects (such as Linux LVM2, cryptsetup, and WinBtrfs).
+external upstream projects (Linux LVM2 and WinBtrfs).
 These materials are included for architectural and format reference only.
 They are NOT built, linked, or redistributed as part of winlvm binaries.
 Each upstream component remains under its respective original license.

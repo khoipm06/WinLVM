@@ -1,1 +1,0 @@
-vgodd-lvodd: 0 32768 linear 7:7 2048

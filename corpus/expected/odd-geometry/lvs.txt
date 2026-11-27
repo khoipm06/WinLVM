@@ -1,1 +1,0 @@
-lvodd|vgodd|linear|16777216

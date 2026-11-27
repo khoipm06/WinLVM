@@ -477,12 +477,6 @@ std::optional<std::string> serialize_vg_to_text(const VolumeGroup& vg, std::stri
   return ss.str();
 }
 
-std::string serialize_vg_to_text(const VolumeGroup& vg) {
-  std::string err;
-  auto res = serialize_vg_to_text(vg, err);
-  return res.value_or(std::string{});
-}
-
 bool pvcreate_initialize(ByteSource& storage,
                          const PvCreateOptions& options,
                          std::string& generated_uuid,

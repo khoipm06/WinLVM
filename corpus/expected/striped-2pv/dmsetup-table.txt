@@ -1,1 +1,0 @@
-vgstripe-lvstr: 0 65536 striped 2 128 7:4 2048 7:5 2048

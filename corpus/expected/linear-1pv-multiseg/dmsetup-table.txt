@@ -1,5 +1,0 @@
-vgseg-lvA: 0 16384 linear 7:1 2048
-vgseg-lvA: 16384 32768 linear 7:1 34816
-vgseg-lvA: 49152 32768 linear 7:1 83968
-vgseg-lvB: 0 16384 linear 7:1 18432
-vgseg-lvC: 0 16384 linear 7:1 67584

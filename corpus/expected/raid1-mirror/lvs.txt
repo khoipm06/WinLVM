@@ -1,3 +1,0 @@
-lvraid1|vgraid|raid1|8388608
-lvmirror|vgraid|mirror|8388608
-lvmirlog|vgraid|mirror|4194304

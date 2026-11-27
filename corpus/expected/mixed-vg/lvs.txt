@@ -1,5 +1,0 @@
-lvplain|vgmix|snapshot-origin|16777216
-lvsnap|vgmix|snapshot|16777216
-lvthin|vgmix|thin|8388608
-lvraid|vgmix|raid1|8388608
-lvcache|vgmix|cache|8388608

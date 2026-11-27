@@ -1,3 +1,0 @@
-tpool|vgthin|thin-pool|33554432
-lvthin|vgthin|thin|8388608
-lvthinsnap|vgthin|thin|8388608

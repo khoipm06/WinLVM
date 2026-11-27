@@ -1,2 +1,0 @@
-/dev/loop2|4RzuVw-PPUz-GNBS-4Rfr-qjH9-apGL-EcPGSW|2048|31|1
-/dev/loop3|b96SVl-Ouof-DKF8-kbXn-YpV6-gqSX-fGNx0w|2048|31|1

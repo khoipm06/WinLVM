@@ -1,2 +1,0 @@
-format=LUKS2
-pbkdf=argon2id

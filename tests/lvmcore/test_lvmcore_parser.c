@@ -169,18 +169,18 @@ static int find_pv(const lvmcore_volume_group *vg, const char *key) {
 
 /* ---- VG identity verification vs lvs/vgs oracles ------------------- */
 
-/* vgs-oracle.txt line: "vg_name vg_id ..." — we check name presence. */
+/* vgs.txt line: "vg_name|vg_id|..." — we check name presence. */
 static int oracle_vg_name(const char *expected_dir, const char *case_name,
                           const char *vg_name) {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s/vgs-oracle.txt", expected_dir, case_name);
+    snprintf(path, sizeof(path), "%s/%s/vgs.txt", expected_dir, case_name);
     FILE *f = fopen(path, "r");
-    if (!f) return -1;  /* no oracle — skip silently */
+    if (!f) return 0;
     char line[512];
     int found = 0;
     while (fgets(line, sizeof(line), f)) {
         char n1[128];
-        if (sscanf(line, "%127s", n1) == 1 && strcmp(n1, vg_name) == 0) { found = 1; break; }
+        if (sscanf(line, "%127[^|\r\n]", n1) == 1 && strcmp(n1, vg_name) == 0) { found = 1; break; }
     }
     fclose(f);
     return found;

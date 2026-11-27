@@ -1,2 +1,0 @@
-/dev/loop8|hiJ69I-8Gcf-EtiL-roo3-DcaZ-SwuP-NgPp4o|2048|31|1
-/dev/loop9|buAmwe-jYLa-ACOo-KiLp-JGLq-bWgE-wX2Ozq|2048|31|1

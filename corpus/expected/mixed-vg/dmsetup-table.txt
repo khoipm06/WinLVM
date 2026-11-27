@@ -1,7 +1,0 @@
-vgmix-lvplain: 0 32768 snapshot-origin 252:15
-vgmix-lvplain-real: 0 32768 linear 7:8 2048
-vgmix-lvsnap: 0 32768 snapshot 252:15 252:16 P 8
-vgmix-lvsnap-cow: 0 8192 linear 7:8 133120
-vgmix-lvthin: 0 16384 thin 252:7 1
-vgmix-lvraid: 0 16384 raid raid1 3 0 region_size 4096 2 252:10 252:11 252:12 252:13
-vgmix-lvcache: 0 16384 cache 252:20 252:21 252:22 128 1 writethrough smq 0

@@ -1,3 +1,0 @@
-lvA|vgseg|linear|41943040
-lvB|vgseg|linear|8388608
-lvC|vgseg|linear|8388608

@@ -33,8 +33,7 @@ TEST(checked_arithmetic_refuses_to_wrap) {
 
 // The exact arithmetic the extent math does on untrusted disk numbers:
 // pe_start + stripe_offset*extent_size must refuse to wrap rather than
-// map a read at a rotated address. Mirrors src/driver/lvm_read.c's C++
-// counterpart in mapping.cpp (build_dm_table's checked_add/checked_mul).
+// map a read at a rotated address (matching mapping.cpp checked_add/checked_mul).
 TEST(overflow_paths_hit_by_extent_math_shapes) {
   // (2^32 extents) * (2^32 sectors) wraps uint64 — must be nullopt.
   CHECK(!checked_mul(1ull << 32, 1ull << 32).has_value());
@@ -66,8 +65,7 @@ TEST(lvm_crc32_edge_vectors) {
   const uint32_t chained = lvm_crc32("y", 1, lvm_crc32("x", 1, lvm_crc32("", 0)));
   CHECK_EQ(lvm_crc32(two, 2), chained);
   // Reflected poly 0xedb88320: crc of a single 0x01 differs from crc of a
-  // single 0x80 — guards against table-build regressions (the kernel-side
-  // build_crc_table had exactly this shape; see src/driver/lvm_read.c).
+  // single 0x80 — guards against CRC table-build regressions.
   CHECK(lvm_crc32("\x01", 1) != lvm_crc32("\x80", 1));
 }
 
